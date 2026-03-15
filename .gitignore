@@ -1,0 +1,33 @@
+
+# Virtual environment
+venv/
+
+# Data (too large for git)
+data/raw/
+data/processed/
+data/chat/
+
+# Checkpoints
+checkpoints/
+
+# Tokenizer model (generated)
+tokenizer/spakie.model
+tokenizer/spakie.vocab
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
