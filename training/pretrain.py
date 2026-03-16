@@ -67,69 +67,86 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     global_step = 0
     tokens_processed = 0
     start_time = time.time()
+    interrupted = False
 
     train_iter = iter(train_loader)
     pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain")
 
-    while global_step < config.pretrain_max_steps:
-        optimizer.zero_grad(set_to_none=True)
-        accum_loss = 0.0
+    try:
+        while global_step < config.pretrain_max_steps:
+            optimizer.zero_grad(set_to_none=True)
+            accum_loss = 0.0
 
-        for micro_step in range(config.pretrain_grad_accum_steps):
-            try:
-                x, y = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                x, y = next(train_iter)
+            for micro_step in range(config.pretrain_grad_accum_steps):
+                try:
+                    x, y = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    x, y = next(train_iter)
 
-            x, y = x.to(device), y.to(device)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                _, loss = model(x, y)
-                loss = loss / config.pretrain_grad_accum_steps
+                x, y = x.to(device), y.to(device)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _, loss = model(x, y)
+                    loss = loss / config.pretrain_grad_accum_steps
 
-            loss.backward()
-            accum_loss += loss.item()
-            tokens_processed += x.numel()
+                loss.backward()
+                accum_loss += loss.item()
+                tokens_processed += x.numel()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.pretrain_grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.pretrain_grad_clip)
 
-        # Update LR
-        lr = get_lr(global_step, config)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+            # Update LR
+            lr = get_lr(global_step, config)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
 
-        optimizer.step()
-        global_step += 1
-        pbar.update(1)
+            optimizer.step()
+            global_step += 1
+            pbar.update(1)
 
-        # Eval
-        if global_step % config.pretrain_eval_interval == 0:
-            val_loss = evaluate(model, val_loader, config, device)
-            elapsed = time.time() - start_time
-            tok_per_sec = tokens_processed / elapsed
-            pbar.write(
-                f"step {global_step} | train_loss {accum_loss:.4f} | val_loss {val_loss:.4f} | "
-                f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}"
-            )
+            # Eval
+            if global_step % config.pretrain_eval_interval == 0:
+                val_loss = evaluate(model, val_loader, config, device)
+                elapsed = time.time() - start_time
+                tok_per_sec = tokens_processed / elapsed
+                pbar.write(
+                    f"step {global_step} | train_loss {accum_loss:.4f} | val_loss {val_loss:.4f} | "
+                    f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}"
+                )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                ckpt_path = os.path.join(config.checkpoint_dir, "pretrain_best.pt")
-                torch.save({
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": global_step,
-                    "val_loss": val_loss,
-                    "config": config,
-                }, ckpt_path)
-                pbar.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
-            else:
-                patience_counter += 1
-                if patience_counter >= config.pretrain_patience:
-                    pbar.write(f"Early stopping at step {global_step}")
-                    break
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    ckpt_path = os.path.join(config.checkpoint_dir, "pretrain_best.pt")
+                    torch.save({
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "step": global_step,
+                        "val_loss": val_loss,
+                        "config": config,
+                    }, ckpt_path)
+                    pbar.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= config.pretrain_patience:
+                        pbar.write(f"Early stopping at step {global_step}")
+                        break
+    except KeyboardInterrupt:
+        interrupted = True
+        interrupt_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.pt")
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": global_step,
+            "best_val_loss": best_val_loss,
+            "config": config,
+        }, interrupt_path)
+        pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
+    finally:
+        pbar.close()
 
-    pbar.close()
-    print(f"Pretraining complete. Best val loss: {best_val_loss:.4f}")
+    if interrupted:
+        print(f"Pretraining stopped early. Best val loss so far: {best_val_loss:.4f}")
+    else:
+        print(f"Pretraining complete. Best val loss: {best_val_loss:.4f}")
     return best_val_loss

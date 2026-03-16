@@ -21,6 +21,13 @@ pip install -r requirements.txt
 ### 1. Add training data
 Drop `.md` files into `data/raw/`.
 
+You can also scrape open datasets directly:
+```bash
+python scripts/scrape_wiki.py
+python scripts/scrape_dictionary.py --max 5000
+python scripts/scrape_open_corpus.py
+```
+
 ### 2. Train tokenizer
 ```bash
 python tokenizer/train_tokenizer.py

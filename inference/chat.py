@@ -12,12 +12,14 @@ from tokenizer.train_tokenizer import SpakieTokenizer
 from inference.generate import generate, generate_json
 
 
-DEFAULT_SYSTEM = "You are Spakie, a helpful assistant."
+DEFAULT_SYSTEM = ""
 
 
 def build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg: str) -> list[int]:
     """Build token IDs from conversation history using chat template."""
-    ids = [tokenizer.system_id] + tokenizer.encode(system_msg) + [tokenizer.eos_id]
+    ids = []
+    if system_msg:
+        ids = [tokenizer.system_id] + tokenizer.encode(system_msg) + [tokenizer.eos_id]
 
     for msg in history:
         if msg["role"] == "user":
@@ -37,7 +39,10 @@ def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig
     """Interactive chat REPL."""
     history = []
     print(f"\nSpakie Chat (type '/quit' to exit, '/clear' to reset)")
-    print(f"System: {system_msg}\n")
+    if system_msg:
+        print(f"System: {system_msg}\n")
+    else:
+        print("System: (none)\n")
 
     while True:
         try:

@@ -23,8 +23,8 @@ def main():
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--json_mode", action="store_true", help="Enable JSON output mode")
-    parser.add_argument("--system", type=str, default="You are Spakie, a helpful assistant.",
-                        help="System message")
+    parser.add_argument("--system", type=str, default="",
+                        help="Optional system message")
     args = parser.parse_args()
 
     config = SpakieConfig()

@@ -22,9 +22,6 @@ from configs.default import SpakieConfig
 ALPACA_URL = "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json"
 HEADERS = {"User-Agent": "SpakieLLM/1.0 (educational language model project)"}
 
-SYSTEM_MSG = "You are Spakie, a helpful assistant."
-
-
 def download_alpaca() -> list[dict]:
     """Download the Alpaca 52k dataset."""
     print("Downloading Alpaca dataset (52k examples)...")
@@ -54,7 +51,6 @@ def convert_to_spakie_format(examples: list[dict]) -> list[dict]:
 
         converted.append({
             "messages": [
-                {"role": "system", "content": SYSTEM_MSG},
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": output},
             ]
