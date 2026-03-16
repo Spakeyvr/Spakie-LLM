@@ -1,260 +1,245 @@
-"""Wikipedia dump downloader + extractor.
+"""Wikipedia scraper: fetches a curated list of important articles via the API.
 
-Downloads the latest English Wikipedia articles-only dump (~22GB compressed),
-streams and extracts articles into .md files in data/raw/wikipedia/.
-Resumable — tracks progress so you can Ctrl+C and pick up where you left off.
+Saves .md files to data/raw/wikipedia/. Tracks progress so you can Ctrl+C and resume.
 
 Usage:
-    python scripts/scrape_wiki.py                  # download + extract
-    python scripts/scrape_wiki.py --max 10000      # stop after 10k articles
-    python scripts/scrape_wiki.py --reset           # start over
+    python scripts/scrape_wiki.py                  # scrape all curated articles
+    python scripts/scrape_wiki.py --max 50         # stop after 50
+    python scripts/scrape_wiki.py --reset          # start over
 """
 
 import argparse
-import bz2
 import json
 import os
 import re
 import sys
-import xml.etree.ElementTree as ET
+import time
 
 import requests
-from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 
-DUMP_INDEX = "https://dumps.wikimedia.org/enwiki/latest/"
-DUMP_FILE = "enwiki-latest-pages-articles.xml.bz2"
-DUMP_URL = DUMP_INDEX + DUMP_FILE
+WIKI_API = "https://en.wikipedia.org/w/api.php"
 HEADERS = {"User-Agent": "SpakieLLM/1.0 (educational language model project)"}
 
 OUTPUT_DIR = "data/raw/wikipedia"
-DUMP_PATH = "data/raw/wikipedia/.dump.xml.bz2"
-PROGRESS_FILE = "data/raw/wikipedia/.dump_progress.json"
+PROGRESS_FILE = "data/raw/wikipedia/.wiki_progress.json"
 
-# Namespaces to skip (only want namespace 0 = articles)
-SKIP_TITLE_PREFIXES = (
-    "Wikipedia:", "File:", "Template:", "Help:", "Category:", "Portal:",
-    "Draft:", "Module:", "MediaWiki:", "Talk:", "User:", "User talk:",
-    "Wikipedia talk:", "Template talk:", "Special:",
-)
+# ~500 important articles across major topics
+CURATED_ARTICLES = [
+    # Science
+    "Physics", "Chemistry", "Biology", "Mathematics", "Astronomy",
+    "Evolution", "Atom", "DNA", "Cell (biology)", "Quantum mechanics",
+    "General relativity", "Thermodynamics", "Electromagnetism", "Organic chemistry",
+    "Genetics", "Ecology", "Geology", "Periodic table", "Molecule", "Photosynthesis",
+    "Natural selection", "Big Bang", "Black hole", "Star", "Planet",
+    "Solar System", "Sun", "Moon", "Earth", "Mars",
+    "Speed of light", "Gravity", "Energy", "Force", "Wave",
+    "Electron", "Proton", "Neutron", "Nuclear fission", "Nuclear fusion",
+    "Vaccine", "Virus", "Bacteria", "Antibiotic", "Enzyme",
+    # Technology
+    "Computer", "Internet", "Artificial intelligence", "Machine learning",
+    "Algorithm", "Programming language", "Software", "Computer science",
+    "World Wide Web", "Operating system", "Database", "Encryption",
+    "Transistor", "Semiconductor", "Microprocessor", "Computer network",
+    "Python (programming language)", "JavaScript", "Linux", "Open-source software",
+    "Deep learning", "Neural network", "Natural language processing",
+    "Robotics", "Blockchain", "Cloud computing", "Cybersecurity",
+    "Smartphone", "Telephone", "Television", "Radio", "Electricity",
+    "Nuclear power", "Solar energy", "Renewable energy", "Steam engine",
+    "Printing press", "Automobile", "Airplane", "Rocket", "Satellite",
+    # Mathematics
+    "Calculus", "Algebra", "Geometry", "Statistics", "Probability",
+    "Number theory", "Set theory", "Logic", "Pi", "Prime number",
+    "Pythagorean theorem", "Linear algebra", "Differential equation",
+    "Graph theory", "Topology", "Complex number", "Infinity",
+    "Mathematical proof", "Euclidean geometry", "Trigonometry",
+    # History
+    "History of the world", "Ancient Egypt", "Ancient Greece", "Ancient Rome",
+    "Roman Empire", "Byzantine Empire", "Ottoman Empire", "British Empire",
+    "Middle Ages", "Renaissance", "Industrial Revolution", "Age of Enlightenment",
+    "French Revolution", "American Revolution", "Russian Revolution",
+    "World War I", "World War II", "Cold War", "Colonialism", "Imperialism",
+    "Slavery", "Civil rights movement", "Apartheid", "Decolonization",
+    "History of China", "History of India", "History of Japan",
+    "Mesopotamia", "Silk Road", "Mongol Empire", "Persian Empire",
+    "Alexander the Great", "Julius Caesar", "Genghis Khan", "Napoleon",
+    "Abraham Lincoln", "Mahatma Gandhi", "Martin Luther King Jr.",
+    "Nelson Mandela", "Winston Churchill", "Franklin D. Roosevelt",
+    # Geography
+    "Africa", "Asia", "Europe", "North America", "South America",
+    "Australia", "Antarctica", "Pacific Ocean", "Atlantic Ocean", "Indian Ocean",
+    "Amazon River", "Nile", "Sahara", "Himalayas", "Alps",
+    "United States", "United Kingdom", "China", "India", "Russia",
+    "Japan", "Germany", "France", "Brazil", "Canada",
+    "Mexico", "Australia", "South Africa", "Nigeria", "Egypt",
+    "Indonesia", "Turkey", "Italy", "Spain", "South Korea",
+    "New York City", "London", "Tokyo", "Paris", "Beijing",
+    "Rome", "Berlin", "Moscow", "Cairo", "Mumbai",
+    # Philosophy & Religion
+    "Philosophy", "Ethics", "Epistemology", "Metaphysics", "Aesthetics",
+    "Socrates", "Plato", "Aristotle", "Immanuel Kant", "Friedrich Nietzsche",
+    "Existentialism", "Utilitarianism", "Stoicism", "Rationalism", "Empiricism",
+    "Religion", "Christianity", "Islam", "Hinduism", "Buddhism",
+    "Judaism", "Atheism", "Mythology", "Theology", "Secularism",
+    "Bible", "Quran", "Jesus", "Muhammad", "Gautama Buddha",
+    # Arts & Literature
+    "Art", "Music", "Literature", "Poetry", "Theatre",
+    "Film", "Photography", "Architecture", "Sculpture", "Painting",
+    "William Shakespeare", "Homer", "Leo Tolstoy", "Charles Dickens",
+    "Mark Twain", "Jane Austen", "Franz Kafka", "Fyodor Dostoevsky",
+    "Novel", "Short story", "Essay", "Drama", "Comedy",
+    "Classical music", "Jazz", "Rock music", "Hip hop music", "Opera",
+    "Ludwig van Beethoven", "Wolfgang Amadeus Mozart", "Johann Sebastian Bach",
+    "Leonardo da Vinci", "Michelangelo", "Pablo Picasso", "Vincent van Gogh",
+    # Politics & Society
+    "Democracy", "Communism", "Capitalism", "Socialism", "Fascism",
+    "Human rights", "Constitution", "Law", "Government", "Politics",
+    "United Nations", "European Union", "NATO", "International law",
+    "Economics", "Inflation", "Gross domestic product", "Globalization",
+    "Poverty", "Education", "University", "Literacy", "Public health",
+    "Feminism", "Racism", "Immigration", "Climate change", "Sustainability",
+    "War", "Peace", "Diplomacy", "Terrorism", "Nuclear weapon",
+    # Language
+    "Language", "English language", "Spanish language", "Mandarin Chinese",
+    "Arabic", "French language", "Hindi", "Linguistics", "Grammar",
+    "Alphabet", "Writing system", "Translation", "Etymology", "Semantics",
+    # Medicine & Health
+    "Medicine", "Surgery", "Anatomy", "Physiology", "Neuroscience",
+    "Heart", "Brain", "Cancer", "Diabetes", "HIV/AIDS",
+    "Mental health", "Depression (mood)", "Nutrition", "Exercise",
+    "Pandemic", "Immune system", "Blood", "Organ (biology)", "Disease",
+    # Psychology
+    "Psychology", "Consciousness", "Memory", "Intelligence", "Emotion",
+    "Personality psychology", "Cognitive science", "Behaviorism",
+    "Sigmund Freud", "Carl Jung",
+    # Food & Agriculture
+    "Agriculture", "Food", "Water", "Wheat", "Rice",
+    "Cooking", "Fermentation", "Coffee", "Tea", "Beer",
+    # Sports
+    "Olympic Games", "Football", "Basketball", "Cricket", "Tennis",
+    "Baseball", "Swimming", "Athletics (sport)", "Chess", "Martial arts",
+    # Space
+    "Space exploration", "NASA", "International Space Station",
+    "Apollo program", "Hubble Space Telescope", "Milky Way",
+    "Galaxy", "Universe", "Asteroid", "Comet",
+    # Animals & Nature
+    "Mammal", "Bird", "Fish", "Insect", "Reptile",
+    "Dinosaur", "Dog", "Cat", "Horse", "Elephant",
+    "Whale", "Shark", "Lion", "Eagle", "Bee",
+    "Tree", "Flower", "Forest", "Ocean", "River",
+    "Climate", "Weather", "Earthquake", "Volcano", "Tsunami",
+    "Biodiversity", "Endangered species", "Conservation biology",
+    "Coral reef", "Rainforest",
+]
 
 
-def load_json(path: str, default):
+def load_json(path, default):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return default
 
 
-def save_json(path: str, data):
+def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
 
-def download_dump():
-    """Download the Wikipedia dump with resume support."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # Check if already downloaded
-    downloaded = 0
-    if os.path.exists(DUMP_PATH):
-        downloaded = os.path.getsize(DUMP_PATH)
-
-    # Get total size
-    resp = requests.head(DUMP_URL, headers=HEADERS, allow_redirects=True, timeout=30)
-    total_size = int(resp.headers.get("Content-Length", 0))
-
-    if downloaded >= total_size and total_size > 0:
-        print(f"Dump already downloaded ({total_size / 1e9:.1f} GB)")
-        return
-
-    print(f"Downloading Wikipedia dump ({total_size / 1e9:.1f} GB)...")
-    if downloaded > 0:
-        print(f"  Resuming from {downloaded / 1e9:.1f} GB")
-
-    resume_headers = {**HEADERS}
-    if downloaded > 0:
-        resume_headers["Range"] = f"bytes={downloaded}-"
-
-    resp = requests.get(DUMP_URL, headers=resume_headers, stream=True, timeout=30)
-
-    mode = "ab" if downloaded > 0 and resp.status_code == 206 else "wb"
-    if mode == "wb":
-        downloaded = 0
-
-    with open(DUMP_PATH, mode) as f:
-        pbar = tqdm(total=total_size, initial=downloaded, unit="B", unit_scale=True, desc="Download")
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-            f.write(chunk)
-            pbar.update(len(chunk))
-        pbar.close()
-
-    print("Download complete.")
-
-
-def strip_wikitext(text: str) -> str:
-    """Convert wikitext to plain text (best effort)."""
-    # Remove XML/HTML tags
-    text = re.sub(r"<[^>]+>", "", text)
-    # Remove {{ templates }}
-    depth = 0
-    result = []
-    i = 0
-    while i < len(text):
-        if text[i:i+2] == "{{":
-            depth += 1
-            i += 2
-        elif text[i:i+2] == "}}" and depth > 0:
-            depth -= 1
-            i += 2
-        elif depth == 0:
-            result.append(text[i])
-            i += 1
-        else:
-            i += 1
-    text = "".join(result)
-    # Convert [[links]]
-    text = re.sub(r"\[\[[^|\]]*\|([^\]]+)\]\]", r"\1", text)  # [[target|display]] -> display
-    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)             # [[article]] -> article
-    # Remove [external links]
-    text = re.sub(r"\[https?://[^\]]*\]", "", text)
-    # Remove bold/italic markup
-    text = re.sub(r"'{2,5}", "", text)
-    # Convert headers
-    text = re.sub(r"^={2,6}\s*(.+?)\s*={2,6}", r"## \1", text, flags=re.MULTILINE)
-    # Remove remaining {| table markup
-    text = re.sub(r"\{\|[\s\S]*?\|\}", "", text)
-    # Clean up whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+def fetch_article(title: str) -> str | None:
+    """Fetch article plain text via MediaWiki API."""
+    params = {
+        "action": "query",
+        "titles": title,
+        "prop": "extracts",
+        "explaintext": True,
+        "format": "json",
+    }
+    for attempt in range(3):
+        try:
+            resp = requests.get(WIKI_API, params=params, headers=HEADERS, timeout=30)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                wait = 2 ** attempt * 5
+                print(f"  Rate limited ({resp.status_code}), waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            pages = resp.json()["query"]["pages"]
+            for page in pages.values():
+                text = page.get("extract", "")
+                if text and len(text) > 200:
+                    return text
+        except Exception as e:
+            print(f"  Failed: {e}")
+            time.sleep(2)
+    return None
 
 
 def title_to_filename(title: str) -> str:
     name = title.replace("/", "_").replace("\\", "_").replace(":", "_")
     name = re.sub(r'[<>"|?*]', "", name)
-    name = name[:120]
-    return name + ".md"
+    return name[:120] + ".md"
 
 
-def extract_articles(max_articles: int = 0, reset: bool = False):
-    """Stream-parse the bz2 dump and extract articles to .md files."""
+def scrape(max_articles: int = 0, reset: bool = False):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     if reset and os.path.exists(PROGRESS_FILE):
         os.remove(PROGRESS_FILE)
         print("Progress cleared.")
 
-    progress = load_json(PROGRESS_FILE, {"count": 0, "bytes_read": 0})
-    start_count = progress["count"]
-    skip_until = start_count
+    progress = load_json(PROGRESS_FILE, {"done": []})
+    done = set(progress["done"])
 
-    print(f"\nExtracting articles from dump...")
-    if start_count > 0:
-        print(f"Skipping first {start_count} articles (already extracted)")
+    remaining = [t for t in CURATED_ARTICLES if t not in done]
+    total = len(CURATED_ARTICLES)
+
+    print(f"Curated list: {total} articles")
+    print(f"Already done:  {len(done)}")
+    print(f"Remaining:     {len(remaining)}")
     print("Press Ctrl+C to stop.\n")
 
     count = 0
-    extracted = 0
-
     try:
-        with open(DUMP_PATH, "rb") as f:
-            decompressor = bz2.BZ2Decompressor()
-            parser = ET.XMLPullParser(["end"])
-            leftover = b""
+        for title in remaining:
+            text = fetch_article(title)
+            if text is None:
+                print(f"  SKIP  {title} (not found)")
+                progress["done"].append(title)
+                done.add(title)
+                save_json(PROGRESS_FILE, progress)
+                continue
 
-            # MediaWiki XML namespace
-            ns = "{http://www.mediawiki.org/xml/export-0.11/}"
+            filepath = os.path.join(OUTPUT_DIR, title_to_filename(title))
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(f"# {title}\n\n{text}\n")
 
-            title = None
-            text = None
-            in_page = False
-            current_data = b""
+            progress["done"].append(title)
+            done.add(title)
+            count += 1
 
-            for raw_chunk in iter(lambda: f.read(1024 * 1024), b""):
-                try:
-                    data = decompressor.decompress(raw_chunk)
-                except EOFError:
-                    # Multi-stream bz2 — create a new decompressor
-                    decompressor = bz2.BZ2Decompressor()
-                    try:
-                        data = decompressor.decompress(raw_chunk)
-                    except EOFError:
-                        continue
+            print(f"[{len(done):>3}/{total}] {title} ({len(text):,} chars)")
+            save_json(PROGRESS_FILE, progress)
 
-                parser.feed(data)
+            if max_articles and count >= max_articles:
+                print(f"\nReached max ({max_articles}).")
+                break
 
-                for event, elem in parser.read_events():
-                    tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-
-                    if tag == "title":
-                        title = elem.text or ""
-                    elif tag == "text":
-                        text = elem.text or ""
-                    elif tag == "page":
-                        count += 1
-
-                        # Skip non-article pages
-                        if title and not any(title.startswith(p) for p in SKIP_TITLE_PREFIXES):
-                            if count <= skip_until:
-                                elem.clear()
-                                continue
-
-                            if text and len(text) > 500:
-                                # Skip redirects
-                                if text.strip().upper().startswith("#REDIRECT"):
-                                    elem.clear()
-                                    continue
-
-                                plain = strip_wikitext(text)
-                                if len(plain) > 200:
-                                    filename = title_to_filename(title)
-                                    filepath = os.path.join(OUTPUT_DIR, filename)
-                                    with open(filepath, "w", encoding="utf-8") as out:
-                                        out.write(f"# {title}\n\n{plain}\n")
-
-                                    extracted += 1
-                                    if extracted % 100 == 0:
-                                        print(f"  [{extracted + start_count:>7}] {title}")
-                                        progress["count"] = extracted + start_count
-                                        save_json(PROGRESS_FILE, progress)
-
-                                    if max_articles and (extracted + start_count) >= max_articles:
-                                        progress["count"] = extracted + start_count
-                                        save_json(PROGRESS_FILE, progress)
-                                        print(f"\nReached max ({max_articles}). Stopping.")
-                                        return
-
-                        title = None
-                        text = None
-                        elem.clear()
+            time.sleep(0.5)
 
     except KeyboardInterrupt:
-        pass
-
-    progress["count"] = extracted + start_count
-    save_json(PROGRESS_FILE, progress)
-    print(f"\nExtracted {extracted} articles this session.")
-    print(f"Total: {extracted + start_count}")
-    print("Run again to continue where you left off.")
+        save_json(PROGRESS_FILE, progress)
+        print(f"\n\nStopped. Got {count} this session, {len(done)}/{total} total.")
+        print("Run again to continue.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download and extract Wikipedia dump")
-    parser.add_argument("--max", type=int, default=0, help="Max articles to extract (0 = unlimited)")
-    parser.add_argument("--reset", action="store_true", help="Clear extraction progress")
-    parser.add_argument("--skip-download", action="store_true", help="Skip download (use existing dump)")
+    parser = argparse.ArgumentParser(description="Scrape curated Wikipedia articles")
+    parser.add_argument("--max", type=int, default=0, help="Max articles (0 = all)")
+    parser.add_argument("--reset", action="store_true", help="Start over")
     args = parser.parse_args()
-
-    if not args.skip_download:
-        download_dump()
-
-    if not os.path.exists(DUMP_PATH):
-        print(f"Error: dump not found at {DUMP_PATH}")
-        print("Run without --skip-download first.")
-        sys.exit(1)
-
-    extract_articles(max_articles=args.max, reset=args.reset)
+    scrape(max_articles=args.max, reset=args.reset)
 
 
 if __name__ == "__main__":

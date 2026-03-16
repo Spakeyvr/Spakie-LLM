@@ -77,16 +77,20 @@ class ChatSFTDataset(Dataset):
             input_ids.extend(turn_ids)
             labels.extend(turn_labels)
 
-        # Truncate
-        input_ids = input_ids[: self.max_seq_len]
-        labels = labels[: self.max_seq_len]
+        # Shift: input is all tokens except last, labels are all tokens except first
+        # This way input_ids[i] predicts labels[i] = token at position i+1
+        input_ids = input_ids[: self.max_seq_len + 1]
+        labels = labels[: self.max_seq_len + 1]
+
+        x = input_ids[:-1]
+        y = labels[1:]
 
         # Pad
-        pad_len = self.max_seq_len - len(input_ids)
-        input_ids = input_ids + [self.tokenizer.pad_id] * pad_len
-        labels = labels + [-100] * pad_len
+        pad_len = self.max_seq_len - len(x)
+        x = x + [self.tokenizer.pad_id] * pad_len
+        y = y + [-100] * pad_len
 
-        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
 def train_val_split(dataset: Dataset, val_fraction: float = 0.05):

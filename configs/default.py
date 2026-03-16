@@ -5,16 +5,16 @@ from dataclasses import dataclass
 class SpakieConfig:
     # Model
     vocab_size: int = 8192
-    n_layers: int = 8
-    n_heads: int = 8
-    d_model: int = 512
-    d_ff: int = 2048
+    n_layers: int = 12
+    n_heads: int = 12
+    d_model: int = 768
+    d_ff: int = 3072
     max_seq_len: int = 512
     dropout: float = 0.1
     bias: bool = False
 
     # Pretraining
-    pretrain_batch_size: int = 32
+    pretrain_batch_size: int = 16
     pretrain_grad_accum_steps: int = 4
     pretrain_lr: float = 3e-4
     pretrain_max_steps: int = 10_000
@@ -23,7 +23,7 @@ class SpakieConfig:
     pretrain_grad_clip: float = 1.0
     pretrain_eval_interval: int = 250
     pretrain_eval_batches: int = 20
-    pretrain_patience: int = 5
+    pretrain_patience: int = 20
 
     # SFT
     sft_batch_size: int = 8

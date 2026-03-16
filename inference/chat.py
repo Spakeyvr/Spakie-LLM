@@ -36,7 +36,7 @@ def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig
               json_mode: bool = False):
     """Interactive chat REPL."""
     history = []
-    print(f"\nSpakie Chat (type 'quit' to exit, 'clear' to reset)")
+    print(f"\nSpakie Chat (type '/quit' to exit, '/clear' to reset)")
     print(f"System: {system_msg}\n")
 
     while True:
@@ -48,10 +48,10 @@ def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig
 
         if not user_input:
             continue
-        if user_input.lower() == "quit":
+        if user_input.lower() == "/quit":
             print("Bye!")
             break
-        if user_input.lower() == "clear":
+        if user_input.lower() == "/clear":
             history.clear()
             print("(conversation cleared)\n")
             continue
