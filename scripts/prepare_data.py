@@ -148,6 +148,10 @@ def pick_token_dtype(tokenizer: SpakieTokenizer):
     return np.uint16 if tokenizer.vocab_size <= np.iinfo(np.uint16).max else np.uint32
 
 
+def min_doc_chars_for_source(config: SpakieConfig, source: str) -> int:
+    return config.source_min_doc_chars.get(source, config.min_doc_chars)
+
+
 class TokenShardWriter:
     def __init__(self, shard_dir: Path, shard_size: int, dtype):
         self.shard_dir = shard_dir
@@ -210,8 +214,8 @@ def merge_shards(shard_paths: list[Path], train_path: Path, val_path: Path, trai
     return split_idx, total_tokens - split_idx
 
 
-def should_keep_document(text: str, config: SpakieConfig) -> tuple[bool, str]:
-    if len(text) < config.min_doc_chars:
+def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[bool, str]:
+    if len(text) < min_doc_chars_for_source(config, source):
         return False, "too_short"
     if repeated_line_ratio(text) > config.max_repeated_line_ratio:
         return False, "repeated_lines"
@@ -293,7 +297,13 @@ def prepare_data(
         stats["raw_bytes"] += len(doc.text.encode("utf-8"))
 
         text = clean_text(doc.text)
-        keep, reason = should_keep_document(text, config)
+        source_cap = config.corpus_source_token_caps.get(doc.source, 0)
+        if source_cap and stats["tokens_kept"] >= source_cap:
+            stats["documents_dropped"] += 1
+            stats["drop_reasons"]["source_cap_reached"] += 1
+            continue
+
+        keep, reason = should_keep_document(text, config, doc.source)
         if not keep:
             stats["documents_dropped"] += 1
             stats["drop_reasons"][reason] += 1
@@ -311,11 +321,19 @@ def prepare_data(
         stats["chars_kept"] += len(text)
         estimated_tokens = max(1, int(len(text) / config.estimated_chars_per_token))
         if dry_run:
+            if source_cap and stats["tokens_kept"] + estimated_tokens > source_cap:
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"]["source_cap_reached"] += 1
+                continue
             stats["tokens_kept"] += estimated_tokens
             total_tokens += estimated_tokens
         else:
             token_ids = tokenizer.encode(text)
             token_ids.append(tokenizer.eos_id)
+            if source_cap and stats["tokens_kept"] + len(token_ids) > source_cap:
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"]["source_cap_reached"] += 1
+                continue
             stats["tokens_kept"] += len(token_ids)
             total_tokens += len(token_ids)
             writer.add(token_ids)

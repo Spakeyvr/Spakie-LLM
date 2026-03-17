@@ -24,7 +24,7 @@ class SpakieConfig:
     pretrain_grad_clip: float = 1.0
     pretrain_eval_interval: int = 250
     pretrain_eval_batches: int = 20
-    pretrain_patience: int = 20
+    pretrain_patience: int = 5
 
     # SFT
     sft_batch_size: int = 8
@@ -34,7 +34,7 @@ class SpakieConfig:
     sft_weight_decay: float = 0.1
     sft_grad_clip: float = 1.0
     sft_patience: int = 5
-    sft_download_max_examples: int = 26_000
+    sft_download_max_examples: int = 72_000
 
     # Generation
     temperature: float = 0.8
@@ -55,15 +55,22 @@ class SpakieConfig:
     token_shard_dir: str = "data/processed/shards"
     token_shard_size: int = 5_000_000
     min_doc_chars: int = 400
+    source_min_doc_chars: dict[str, int] = field(default_factory=lambda: {
+        "wikipedia": 200,
+        "arxiv": 220,
+        "stackexchange": 180,
+        "open_corpus": 180,
+        "dictionary": 80,
+    })
     max_repeated_line_ratio: float = 0.25
     max_noise_ratio: float = 0.35
     train_split_fraction: float = 0.95
     estimated_chars_per_token: float = 4.0
     corpus_source_mix: dict[str, float] = field(default_factory=lambda: {
-        "web": 0.75,
-        "books": 0.10,
-        "reference": 0.08,
-        "technical": 0.07,
+        "web": 0.45,
+        "books": 0.15,
+        "reference": 0.20,
+        "technical": 0.20,
     })
     corpus_raw_char_budgets: dict[str, int] = field(default_factory=lambda: {
         "fineweb-edu": 3_400_000_000,
@@ -80,9 +87,21 @@ class SpakieConfig:
         "arxiv": 0.95,
     })
     corpus_source_token_caps: dict[str, int] = field(default_factory=lambda: {
-        "fineweb-edu": 820_000_000,
-        "gutenberg": 160_000_000,
-        "wikipedia": 120_000_000,
-        "stackexchange": 70_000_000,
-        "arxiv": 40_000_000,
+        "fineweb-edu": 320_000_000,
+        "gutenberg": 90_000_000,
+        "wikipedia": 70_000_000,
+        "stackexchange": 55_000_000,
+        "arxiv": 25_000_000,
+        "open_corpus": 30_000_000,
+        "dictionary": 20_000_000,
+    })
+    sft_source_limits: dict[str, int] = field(default_factory=lambda: {
+        "alpaca": 16_000,
+        "dolly": 10_000,
+        "squad": 12_000,
+        "sciq": 8_000,
+        "boolq": 8_000,
+        "arc_easy": 8_000,
+        "arc_challenge": 5_000,
+        "openbookqa": 5_000,
     })

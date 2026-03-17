@@ -1,8 +1,9 @@
 """Train a SentencePiece BPE tokenizer and provide a wrapper class."""
 
-import glob
+import json
 import os
 import tempfile
+from pathlib import Path
 
 import sentencepiece as spm
 
@@ -12,22 +13,47 @@ from configs.default import SpakieConfig
 
 
 SPECIAL_TOKENS = ["<|user|>", "<|assistant|>", "<|system|>", "<|json|>"]
+SUPPORTED_EXTENSIONS = (".md", ".txt", ".jsonl")
+
+
+def iter_training_texts(raw_root: str):
+    root = Path(raw_root)
+    for ext in SUPPORTED_EXTENSIONS:
+        for path in root.rglob(f"*{ext}"):
+            if path.suffix.lower() == ".jsonl":
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        text = payload.get("text", "")
+                        if isinstance(text, str) and text.strip():
+                            yield text
+            else:
+                with path.open("r", encoding="utf-8") as handle:
+                    text = handle.read()
+                if text.strip():
+                    yield text
 
 
 def train_tokenizer(config: SpakieConfig | None = None):
     config = config or SpakieConfig()
 
-    md_files = glob.glob(os.path.join(config.raw_data_dir, "**", "*.md"), recursive=True)
-    if not md_files:
-        raise FileNotFoundError(f"No .md files found in {config.raw_data_dir}")
-
     # SentencePiece needs a single input file or comma-separated list
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
-        for path in md_files:
-            with open(path, "r", encoding="utf-8") as f:
-                tmp.write(f.read())
-                tmp.write("\n")
+        count = 0
+        for text in iter_training_texts(config.raw_data_dir):
+            tmp.write(text)
+            tmp.write("\n")
+            count += 1
         tmp_path = tmp.name
+
+    if count == 0:
+        raise FileNotFoundError(f"No supported training texts found in {config.raw_data_dir}")
 
     try:
         spm.SentencePieceTrainer.train(
