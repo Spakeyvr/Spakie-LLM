@@ -3,9 +3,13 @@
 Downloads the Stanford Alpaca dataset (52k instruction-response pairs)
 and converts it to data/chat/train.jsonl.
 
+By default, the downloader keeps only the first half of the dataset to
+make SFT runs lighter. Pass --max 0 to keep all examples.
+
 Usage:
     python scripts/download_sft_data.py
     python scripts/download_sft_data.py --max 5000    # limit to 5k examples
+    python scripts/download_sft_data.py --max 0       # keep all examples
 """
 
 import argparse
@@ -60,11 +64,16 @@ def convert_to_spakie_format(examples: list[dict]) -> list[dict]:
 
 
 def main():
+    config = SpakieConfig()
     parser = argparse.ArgumentParser(description="Download SFT training data")
-    parser.add_argument("--max", type=int, default=0, help="Max examples (0 = all)")
+    parser.add_argument(
+        "--max",
+        type=int,
+        default=config.sft_download_max_examples,
+        help=f"Max examples (0 = all, default: {config.sft_download_max_examples})",
+    )
     args = parser.parse_args()
 
-    config = SpakieConfig()
     os.makedirs(config.chat_data_dir, exist_ok=True)
 
     raw = download_alpaca()

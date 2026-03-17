@@ -1,6 +1,6 @@
 # Spakie-LLM
 
-A ~30M parameter GPT-style language model built from scratch in PyTorch. Designed to train on small `.md` datasets on a single GPU (e.g., RTX 4070 Ti).
+A GPT-style language model built from scratch in PyTorch. The repo still trains on local `train.npy` / `val.npy` files, but now includes a scalable corpus pipeline aimed at building a 1B-token pretraining dataset on a single machine.
 
 ## Setup
 
@@ -18,7 +18,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 1. Add training data
+### 1. Add or download training data
 Drop `.md` files into `data/raw/`.
 
 You can also scrape open datasets directly:
@@ -27,6 +27,14 @@ python scripts/scrape_wiki.py
 python scripts/scrape_dictionary.py --max 5000
 python scripts/scrape_open_corpus.py
 ```
+
+For the larger 1B-token pipeline, download resumable JSONL shards into `data/raw/large_corpus/`:
+```bash
+python scripts/download_pretrain_corpus.py --sources fineweb-edu,gutenberg,wikipedia,stackexchange,arxiv --resume --english_only
+python scripts/download_pretrain_corpus.py --sources fineweb-edu --target_tokens_estimate 1000000000 --resume --english_only
+```
+
+The downloader writes per-source progress and shard manifests so interrupted runs can continue safely.
 
 ### 2. Train tokenizer
 ```bash
@@ -37,6 +45,20 @@ python tokenizer/train_tokenizer.py
 ```bash
 python scripts/prepare_data.py
 ```
+
+Useful options:
+```bash
+python scripts/prepare_data.py --dry_run
+python scripts/prepare_data.py --target_tokens 1000000000 --report_path data/processed/corpus_report.json
+python scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_corpus/gutenberg --dedup
+```
+
+`prepare_data.py` now:
+- streams documents from `.md`, `.txt`, and JSONL shards
+- performs document-level near-exact dedup
+- filters short, noisy, repeated-line, and boilerplate-heavy documents
+- writes token shards first, then merges them into `data/processed/train.npy` and `data/processed/val.npy`
+- emits a corpus report with source mix and token totals
 
 ### 4. Pretrain
 ```bash
@@ -57,6 +79,8 @@ python scripts/finetune.py
 ### 6. Chat
 ```bash
 python scripts/chat.py
+python scripts/chat.py --model sft_best
+python scripts/chat.py --list-models
 python scripts/chat.py --json_mode
 python scripts/chat.py --temperature 0.5 --top_k 40
 ```
@@ -74,6 +98,13 @@ python scripts/chat.py --temperature 0.5 --top_k 40
 | dropout | 0.1 |
 
 Pre-norm Transformer with learned positional embeddings, weight-tied LM head, GELU activations, and `F.scaled_dot_product_attention` (FlashAttention when available).
+
+## Corpus Notes
+
+- The default corpus target is `1_000_000_000` processed tokens after cleaning and deduplication.
+- The current default training config consumes about `327,680,000` tokens total (`batch_size * grad_accum * seq_len * max_steps`).
+- That mismatch is intentional: the larger corpus reduces repetition, leaves room for longer runs, and avoids rebuilding the dataset when the training config scales up later.
+- Storage is expected to stay in the tens to low hundreds of GB range by filtering early and writing resumable shards instead of duplicate full copies.
 
 ## Chat Template
 

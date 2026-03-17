@@ -3,3 +3,4 @@ sentencepiece>=0.2.0
 tqdm
 numpy
 requests
+datasets>=2.19.0
