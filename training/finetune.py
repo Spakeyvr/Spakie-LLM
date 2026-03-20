@@ -16,7 +16,9 @@ from training.dataset import ChatSFTDataset, train_val_split
 
 
 def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
-             config: SpakieConfig, device: torch.device):
+             config: SpakieConfig, device: torch.device,
+             best_checkpoint_name: str = "sft_best.pt",
+             interrupt_checkpoint_name: str = "sft_interrupt.pt"):
     model.to(device)
     model.train()
 
@@ -92,7 +94,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                ckpt_path = os.path.join(config.checkpoint_dir, "sft_best.pt")
+                ckpt_path = os.path.join(config.checkpoint_dir, best_checkpoint_name)
                 torch.save({
                     "model": model.state_dict(),
                     "epoch": epoch + 1,
@@ -107,7 +109,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     break
     except KeyboardInterrupt:
         interrupted = True
-        interrupt_path = os.path.join(config.checkpoint_dir, "sft_interrupt.pt")
+        interrupt_path = os.path.join(config.checkpoint_dir, interrupt_checkpoint_name)
         torch.save({
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),

@@ -1,6 +1,6 @@
 # Spakie-LLM
 
-A GPT-style language model built from scratch in PyTorch. The repo still trains on local `train.npy` / `val.npy` files, but now includes a scalable corpus pipeline aimed at building a 1B-token pretraining dataset on a single machine.
+A GPT-style language model built from scratch in PyTorch. The repo still trains on local `train.npy` / `val.npy` files, but now includes a scalable corpus pipeline aimed at building a roughly 2B-train-token pretraining run from a single-machine corpus workflow.
 
 ## Setup
 
@@ -28,13 +28,19 @@ python scripts/scrape_dictionary.py --max 5000
 python scripts/scrape_open_corpus.py
 ```
 
-For the larger 1B-token pipeline, download resumable JSONL shards into `data/raw/large_corpus/`:
+For the larger 2B-token pipeline, download resumable JSONL shards into `data/raw/large_corpus/`:
 ```bash
-python scripts/download_pretrain_corpus.py --sources fineweb-edu,gutenberg,wikipedia,stackexchange,arxiv --resume --english_only
-python scripts/download_pretrain_corpus.py --sources fineweb-edu --target_tokens_estimate 1000000000 --resume --english_only
+python scripts/download_pretrain_corpus.py --sources all --resume --english_only
+python scripts/download_pretrain_corpus.py --sources fineweb-edu,refinedweb,wikipedia_snapshot,stackexchange,arxiv,gutenberg --target_tokens_estimate 2105263158 --resume --english_only
 ```
 
 The downloader writes per-source progress and shard manifests so interrupted runs can continue safely.
+`dolma` support remains in the script, but it is not part of the default `all` set because current Hugging Face `datasets` rejects its legacy script loader.
+
+Windows wrapper:
+```bash
+download_pretrain_corpus.bat --sources all --resume --english_only
+```
 
 ### 2. Train tokenizer
 ```bash
@@ -49,7 +55,8 @@ python scripts/prepare_data.py
 Useful options:
 ```bash
 python scripts/prepare_data.py --dry_run
-python scripts/prepare_data.py --target_tokens 1000000000 --report_path data/processed/corpus_report.json
+python scripts/prepare_data.py --target_train_tokens 2000000000 --report_path data/processed/corpus_report.json
+python scripts/prepare_data.py --target_tokens 2105263158 --report_path data/processed/corpus_report.json
 python scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_corpus/gutenberg --dedup
 ```
 
@@ -58,11 +65,11 @@ python scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_corp
 - performs document-level near-exact dedup
 - filters short, noisy, repeated-line, and boilerplate-heavy documents
 - writes token shards first, then merges them into `data/processed/train.npy` and `data/processed/val.npy`
-- emits a corpus report with source mix and token totals
+- emits a corpus report with per-source targets, train/val token totals, and remaining gap to target
 
 ### 4. Pretrain
 ```bash
-python scripts/train.py
+python scripts/train.py --preset 180m
 ```
 
 ### 5. Fine-tune (optional)
@@ -101,9 +108,10 @@ Pre-norm Transformer with learned positional embeddings, weight-tied LM head, GE
 
 ## Corpus Notes
 
-- The default corpus target is `1_000_000_000` processed tokens after cleaning and deduplication.
-- The current default training config consumes about `327,680,000` tokens total (`batch_size * grad_accum * seq_len * max_steps`).
-- That mismatch is intentional: the larger corpus reduces repetition, leaves room for longer runs, and avoids rebuilding the dataset when the training config scales up later.
+- The default train-token target is `2_000_000_000`.
+- With the default `0.95` train split, the derived processed-corpus target is `2,105,263,158` tokens.
+- The default `180m` pretraining path now derives its step budget from that token goal instead of using a fixed `10,000` steps.
+- Baseline from the existing checked-in corpus report before this change: `347,013,932` processed tokens, `535,723,151` estimated tokens from current raw text, and the old default `180m` run consumed `163,840,000` tokens total.
 - Storage is expected to stay in the tens to low hundreds of GB range by filtering early and writing resumable shards instead of duplicate full copies.
 
 ## Chat Template

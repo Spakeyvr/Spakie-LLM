@@ -25,7 +25,7 @@ import numpy as np
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
+from configs.default import SpakieConfig, normalize_corpus_source
 from tokenizer.train_tokenizer import SpakieTokenizer
 
 
@@ -60,13 +60,13 @@ def infer_source(root: Path, path: Path) -> str:
     try:
         rel = path.relative_to(root)
     except ValueError:
-        return path.parent.name or "unknown"
+        return normalize_corpus_source(path.parent.name or "unknown")
     parts = rel.parts
     if parts and parts[0] == "large_corpus" and len(parts) > 1:
-        return parts[1]
+        return normalize_corpus_source(parts[1])
     if parts:
-        return parts[0]
-    return "unknown"
+        return normalize_corpus_source(parts[0])
+    return normalize_corpus_source("unknown")
 
 
 def iter_input_files(raw_root: Path, source_glob: str | None, source_dirs: list[str] | None) -> list[Path]:
@@ -230,20 +230,23 @@ def build_report(
     config: SpakieConfig,
     files: list[Path],
     raw_bytes: int,
+    target_tokens: int,
     total_tokens: int,
+    source_plan: dict[str, dict[str, int | str | bool]],
     source_stats: dict[str, dict],
     dry_run: bool,
 ) -> dict:
     estimated_tokens = sum(int(stats["chars_kept"] / config.estimated_chars_per_token) for stats in source_stats.values())
     return {
-        "target_processed_tokens": config.target_processed_tokens,
+        "target_train_tokens": config.target_train_tokens,
+        "target_processed_tokens": target_tokens,
         "discovered_files": len(files),
         "discovered_raw_bytes": raw_bytes,
         "processed_tokens": total_tokens,
         "estimated_tokens_from_chars": estimated_tokens,
-        "gap_to_target": max(config.target_processed_tokens - total_tokens, 0),
+        "gap_to_target": max(target_tokens - total_tokens, 0),
         "dry_run": dry_run,
-        "source_mix_targets": config.corpus_source_mix,
+        "source_targets": source_plan,
         "source_stats": source_stats,
     }
 
@@ -252,6 +255,7 @@ def prepare_data(
     config: SpakieConfig | None = None,
     *,
     target_tokens: int | None = None,
+    target_train_tokens: int | None = None,
     dedup: bool = True,
     report_path: str | None = None,
     source_glob: str | None = None,
@@ -259,7 +263,12 @@ def prepare_data(
     dry_run: bool = False,
 ) -> dict:
     config = config or SpakieConfig()
+    if target_train_tokens and target_train_tokens > 0:
+        config.target_train_tokens = target_train_tokens
+        config.pretrain_target_tokens = target_train_tokens
+        config.refresh_derived_fields()
     target_tokens = target_tokens or config.target_processed_tokens
+    source_plan = config.scaled_corpus_source_plan(target_processed_tokens=target_tokens)
     tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
     token_dtype = pick_token_dtype(tokenizer)
 
@@ -297,7 +306,7 @@ def prepare_data(
         stats["raw_bytes"] += len(doc.text.encode("utf-8"))
 
         text = clean_text(doc.text)
-        source_cap = config.corpus_source_token_caps.get(doc.source, 0)
+        source_cap = int(source_plan.get(doc.source, {}).get("target_tokens", 0))
         if source_cap and stats["tokens_kept"] >= source_cap:
             stats["documents_dropped"] += 1
             stats["drop_reasons"]["source_cap_reached"] += 1
@@ -347,6 +356,8 @@ def prepare_data(
 
     normalized_source_stats = {}
     for source, stats in source_stats.items():
+        source_target = source_plan.get(source, {})
+        target_tokens_for_source = int(source_target.get("target_tokens", 0))
         normalized_source_stats[source] = {
             "documents_seen": stats["documents_seen"],
             "documents_kept": stats["documents_kept"],
@@ -355,9 +366,41 @@ def prepare_data(
             "chars_kept": stats["chars_kept"],
             "raw_bytes": stats["raw_bytes"],
             "tokens_kept": stats["tokens_kept"],
+            "target_tokens": target_tokens_for_source,
+            "target_raw_chars": int(source_target.get("target_raw_chars", 0)),
+            "kind": str(source_target.get("kind", "unplanned")),
+            "completion_ratio": (
+                stats["tokens_kept"] / target_tokens_for_source
+                if target_tokens_for_source
+                else 0.0
+            ),
         }
 
-    report = build_report(config, files, raw_bytes, total_tokens, normalized_source_stats, dry_run=dry_run)
+    for source, source_target in source_plan.items():
+        normalized_source_stats.setdefault(source, {
+            "documents_seen": 0,
+            "documents_kept": 0,
+            "documents_dropped": 0,
+            "drop_reasons": {},
+            "chars_kept": 0,
+            "raw_bytes": 0,
+            "tokens_kept": 0,
+            "target_tokens": int(source_target.get("target_tokens", 0)),
+            "target_raw_chars": int(source_target.get("target_raw_chars", 0)),
+            "kind": str(source_target.get("kind", "unknown")),
+            "completion_ratio": 0.0,
+        })
+
+    report = build_report(
+        config,
+        files,
+        raw_bytes,
+        target_tokens,
+        total_tokens,
+        source_plan,
+        normalized_source_stats,
+        dry_run=dry_run,
+    )
     report["target_tokens_requested"] = target_tokens
 
     processed_dir = Path(config.processed_data_dir)
@@ -398,6 +441,7 @@ def prepare_data(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare a large text corpus for pretraining")
     parser.add_argument("--target_tokens", type=int, default=0, help="Stop once this many processed tokens are reached")
+    parser.add_argument("--target_train_tokens", type=int, default=0, help="Derived processed target from desired train tokens")
     parser.add_argument("--dedup", dest="dedup", action="store_true", help="Enable document-level deduplication")
     parser.add_argument("--no-dedup", dest="dedup", action="store_false", help="Disable document-level deduplication")
     parser.set_defaults(dedup=True)
@@ -413,6 +457,7 @@ def main() -> None:
     source_dirs = [part.strip() for part in args.source_dirs.split(",") if part.strip()] or None
     prepare_data(
         target_tokens=args.target_tokens or None,
+        target_train_tokens=args.target_train_tokens or None,
         dedup=args.dedup,
         report_path=args.report_path or None,
         source_glob=args.source_glob or None,

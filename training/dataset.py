@@ -93,9 +93,12 @@ class ChatSFTDataset(Dataset):
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
-def train_val_split(dataset: Dataset, val_fraction: float = 0.05):
-    """Sequential 95/5 split."""
+def train_val_split(dataset: Dataset, val_fraction: float = 0.05, seed: int = 42):
+    """Deterministic random 95/5 split."""
     n = len(dataset)
     n_val = max(1, int(n * val_fraction))
-    n_train = n - n_val
-    return torch.utils.data.Subset(dataset, range(n_train)), torch.utils.data.Subset(dataset, range(n_train, n))
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(n, generator=generator).tolist()
+    val_indices = indices[:n_val]
+    train_indices = indices[n_val:]
+    return torch.utils.data.Subset(dataset, train_indices), torch.utils.data.Subset(dataset, val_indices)

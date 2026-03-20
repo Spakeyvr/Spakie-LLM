@@ -1,9 +1,12 @@
-"""Pretraining loop with cosine LR, gradient accumulation, early stopping."""
+"""Pretraining loop with cosine LR, gradient accumulation, and token budgets."""
 
 import math
 import os
+import random
+import signal
 import time
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -13,6 +16,122 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from model.utils import count_parameters
+
+
+class ResumableBatchSampler:
+    """Deterministic shuffled sampler that can resume at an exact batch boundary."""
+
+    def __init__(
+        self,
+        dataset_size: int,
+        batch_size: int,
+        *,
+        drop_last: bool = True,
+        generator_state=None,
+        indices: torch.Tensor | None = None,
+        position: int = 0,
+    ):
+        self.dataset_size = dataset_size
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.generator = torch.Generator()
+        if generator_state is not None:
+            self.generator.set_state(generator_state)
+        self.indices = indices.clone() if indices is not None else torch.empty(0, dtype=torch.int64)
+        self.position = position
+        if self.indices.numel() == 0:
+            self._refresh_indices()
+
+    def _refresh_indices(self) -> None:
+        self.indices = torch.randperm(self.dataset_size, generator=self.generator, dtype=torch.int64)
+        self.position = 0
+
+    def __iter__(self):
+        while True:
+            remaining = self.indices.numel() - self.position
+            if remaining < self.batch_size:
+                if not self.drop_last and remaining > 0:
+                    batch = self.indices[self.position :].tolist()
+                    self._refresh_indices()
+                    yield batch
+                else:
+                    self._refresh_indices()
+                continue
+
+            next_position = self.position + self.batch_size
+            batch = self.indices[self.position : next_position].tolist()
+            self.position = next_position
+            yield batch
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "generator_state": self.generator.get_state(),
+            "indices": self.indices.clone(),
+            "position": self.position,
+            "dataset_size": self.dataset_size,
+            "batch_size": self.batch_size,
+            "drop_last": self.drop_last,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, object]):
+        return cls(
+            dataset_size=int(state["dataset_size"]),
+            batch_size=int(state["batch_size"]),
+            drop_last=bool(state.get("drop_last", True)),
+            generator_state=state.get("generator_state"),
+            indices=state.get("indices"),
+            position=int(state.get("position", 0)),
+        )
+
+
+def capture_rng_state() -> dict[str, object]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state: dict[str, object] | None) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_training_checkpoint(
+    path: str,
+    *,
+    model: SpakieGPT,
+    optimizer: torch.optim.Optimizer,
+    config: SpakieConfig,
+    global_step: int,
+    tokens_processed: int,
+    best_val_loss: float,
+    val_loss: float | None,
+    elapsed_time: float,
+    train_sampler: ResumableBatchSampler,
+) -> None:
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": global_step,
+        "tokens_processed": tokens_processed,
+        "best_val_loss": best_val_loss,
+        "val_loss": val_loss,
+        "elapsed_time": elapsed_time,
+        "train_sampler": train_sampler.state_dict(),
+        "rng_state": capture_rng_state(),
+        "config": config,
+    }, path)
 
 
 def get_lr(step: int, config: SpakieConfig) -> float:
@@ -34,7 +153,12 @@ def configure_optimizer(model: SpakieGPT, config: SpakieConfig) -> torch.optim.A
         {"params": decay_params, "weight_decay": config.pretrain_weight_decay},
         {"params": nodecay_params, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=config.pretrain_lr, betas=(0.9, 0.95), fused=True)
+    return torch.optim.AdamW(
+        groups,
+        lr=config.pretrain_lr,
+        betas=(0.9, 0.95),
+        fused=torch.cuda.is_available(),
+    )
 
 
 @torch.no_grad()
@@ -55,25 +179,55 @@ def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, dev
 
 
 def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
-             config: SpakieConfig, device: torch.device):
+             config: SpakieConfig, device: torch.device,
+             resume_state: dict[str, object] | None = None):
     model.to(device)
     model.train()
     optimizer = configure_optimizer(model, config)
-    scaler = torch.amp.GradScaler("cuda", enabled=False)  # bfloat16 doesn't need scaling
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
+    train_sampler = getattr(train_loader, "batch_sampler", None)
+    if not isinstance(train_sampler, ResumableBatchSampler):
+        raise TypeError("Pretraining requires a ResumableBatchSampler for exact resume support.")
+
     best_val_loss = float("inf")
     patience_counter = 0
     global_step = 0
     tokens_processed = 0
-    start_time = time.time()
+    target_tokens = config.pretrain_target_tokens
+    elapsed_before_resume = 0.0
     interrupted = False
+    last_val_loss = None
+    stop_requested = False
 
+    if resume_state:
+        model.load_state_dict(resume_state["model"])
+        if "optimizer" in resume_state:
+            optimizer.load_state_dict(resume_state["optimizer"])
+        best_val_loss = float(resume_state.get("best_val_loss", resume_state.get("val_loss", best_val_loss)))
+        global_step = int(resume_state.get("step", 0))
+        tokens_processed = int(resume_state.get("tokens_processed", 0))
+        elapsed_before_resume = float(resume_state.get("elapsed_time", 0.0))
+        last_val_loss = resume_state.get("val_loss")
+        restore_rng_state(resume_state.get("rng_state"))
+
+    start_time = time.time() - elapsed_before_resume
     train_iter = iter(train_loader)
-    pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain")
+    pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain", initial=global_step)
+
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def handle_sigint(signum, frame):
+        nonlocal stop_requested
+        if stop_requested:
+            raise KeyboardInterrupt
+        stop_requested = True
+        pbar.write("\nStop requested. Finishing the current optimizer step before saving resume state...")
+
+    signal.signal(signal.SIGINT, handle_sigint)
 
     try:
-        while global_step < config.pretrain_max_steps:
+        while global_step < config.pretrain_max_steps and (target_tokens <= 0 or tokens_processed < target_tokens):
             optimizer.zero_grad(set_to_none=True)
             accum_loss = 0.0
 
@@ -104,29 +258,57 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             global_step += 1
             pbar.update(1)
 
+            if stop_requested:
+                interrupted = True
+                interrupt_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.pt")
+                save_training_checkpoint(
+                    interrupt_path,
+                    model=model,
+                    optimizer=optimizer,
+                    config=config,
+                    global_step=global_step,
+                    tokens_processed=tokens_processed,
+                    best_val_loss=best_val_loss,
+                    val_loss=last_val_loss,
+                    elapsed_time=time.time() - start_time,
+                    train_sampler=train_sampler,
+                )
+                pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
+                break
+
             # Eval
             if global_step % config.pretrain_eval_interval == 0:
                 val_loss = evaluate(model, val_loader, config, device)
+                last_val_loss = val_loss
                 elapsed = time.time() - start_time
                 tok_per_sec = tokens_processed / elapsed
+                token_progress = ""
+                if target_tokens > 0:
+                    progress_pct = min(tokens_processed / target_tokens * 100.0, 100.0)
+                    token_progress = f" | tokens {tokens_processed:,}/{target_tokens:,} ({progress_pct:.1f}%)"
                 pbar.write(
                     f"step {global_step} | train_loss {accum_loss:.4f} | val_loss {val_loss:.4f} | "
-                    f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}"
+                    f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}{token_progress}"
                 )
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
                     ckpt_path = os.path.join(config.checkpoint_dir, "pretrain_best.pt")
-                    torch.save({
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "step": global_step,
-                        "val_loss": val_loss,
-                        "config": config,
-                    }, ckpt_path)
+                    save_training_checkpoint(
+                        ckpt_path,
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        global_step=global_step,
+                        tokens_processed=tokens_processed,
+                        best_val_loss=best_val_loss,
+                        val_loss=val_loss,
+                        elapsed_time=elapsed,
+                        train_sampler=train_sampler,
+                    )
                     pbar.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
-                else:
+                elif config.should_use_pretrain_early_stopping():
                     patience_counter += 1
                     if patience_counter >= config.pretrain_patience:
                         pbar.write(f"Early stopping at step {global_step}")
@@ -134,19 +316,25 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     except KeyboardInterrupt:
         interrupted = True
         interrupt_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.pt")
-        torch.save({
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "step": global_step,
-            "best_val_loss": best_val_loss,
-            "config": config,
-        }, interrupt_path)
+        save_training_checkpoint(
+            interrupt_path,
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            global_step=global_step,
+            tokens_processed=tokens_processed,
+            best_val_loss=best_val_loss,
+            val_loss=last_val_loss,
+            elapsed_time=time.time() - start_time,
+            train_sampler=train_sampler,
+        )
         pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
     finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
         pbar.close()
 
     if interrupted:
-        print(f"Pretraining stopped early. Best val loss so far: {best_val_loss:.4f}")
+        print(f"Pretraining stopped early at {tokens_processed:,} tokens. Best val loss so far: {best_val_loss:.4f}")
     else:
-        print(f"Pretraining complete. Best val loss: {best_val_loss:.4f}")
+        print(f"Pretraining complete at {tokens_processed:,} tokens. Best val loss: {best_val_loss:.4f}")
     return best_val_loss

@@ -7,43 +7,62 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 
-from configs.default import SpakieConfig
+from configs.default import checkpoint_search_dirs, get_preset_config, inherit_model_shape
 from model.transformer import SpakieGPT
 from tokenizer.train_tokenizer import SpakieTokenizer
 from inference.chat import chat_loop
 
 
-def list_available_checkpoints(checkpoint_dir: str) -> list[str]:
+def list_available_checkpoints(checkpoint_dirs: list[str]) -> list[str]:
     """Return available checkpoint paths ordered with chat-tuned models first."""
-    if not os.path.isdir(checkpoint_dir):
-        return []
-
-    checkpoint_names = [
-        name for name in os.listdir(checkpoint_dir)
-        if name.endswith(".pt") and os.path.isfile(os.path.join(checkpoint_dir, name))
-    ]
+    checkpoint_paths: list[str] = []
+    seen_names = set()
+    for checkpoint_dir in checkpoint_dirs:
+        if not os.path.isdir(checkpoint_dir):
+            continue
+        for name in os.listdir(checkpoint_dir):
+            path = os.path.join(checkpoint_dir, name)
+            if name.endswith(".pt") and os.path.isfile(path) and name not in seen_names:
+                checkpoint_paths.append(path)
+                seen_names.add(name)
 
     preferred_order = {
-        "sft_best.pt": 0,
-        "sft_interrupt.pt": 1,
-        "pretrain_best.pt": 2,
-        "pretrain_interrupt.pt": 3,
+        "sft_targeted_best.pt": 0,
+        "sft_targeted_interrupt.pt": 1,
+        "sft_mixed_best.pt": 2,
+        "sft_mixed_interrupt.pt": 3,
+        "sft_best.pt": 4,
+        "sft_interrupt.pt": 5,
+        "pretrain_best.pt": 6,
+        "pretrain_interrupt.pt": 7,
     }
-    checkpoint_names.sort(key=lambda name: (preferred_order.get(name, 99), name.lower()))
-    return [os.path.join(checkpoint_dir, name) for name in checkpoint_names]
+    checkpoint_paths.sort(
+        key=lambda path: (
+            preferred_order.get(os.path.basename(path), 99),
+            os.path.basename(path).lower(),
+            path.lower(),
+        )
+    )
+    return checkpoint_paths
 
 
 def resolve_checkpoint_path(
-    checkpoint_dir: str,
+    checkpoint_dirs: list[str],
     checkpoint_arg: str | None,
     model_arg: str | None,
     interactive: bool,
 ) -> str | None:
     """Resolve the checkpoint path from explicit args or an interactive selection."""
     if checkpoint_arg:
+        if os.path.isabs(checkpoint_arg) or os.path.dirname(checkpoint_arg):
+            return checkpoint_arg
+        for directory in checkpoint_dirs:
+            candidate = os.path.join(directory, checkpoint_arg)
+            if os.path.exists(candidate):
+                return candidate
         return checkpoint_arg
 
-    available_paths = list_available_checkpoints(checkpoint_dir)
+    available_paths = list_available_checkpoints(checkpoint_dirs)
     if not available_paths:
         return None
 
@@ -87,6 +106,8 @@ def resolve_checkpoint_path(
 
 def main():
     parser = argparse.ArgumentParser(description="Spakie Chat")
+    parser.add_argument("--preset", type=str, default="92m",
+                        help="Model preset to use (92m or 180m)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to checkpoint (default: checkpoints/sft_best.pt or pretrain_best.pt)")
     parser.add_argument("--model", type=str, default=None,
@@ -97,7 +118,7 @@ def main():
                         help="Skip the interactive model picker and use the default checkpoint")
     parser.add_argument("--tokenizer", type=str, default=None,
                         help="Path to tokenizer model (default: tokenizer/spakie.model)")
-    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--json_mode", action="store_true", help="Enable JSON output mode")
@@ -105,10 +126,11 @@ def main():
                         help="Optional system message")
     args = parser.parse_args()
 
-    config = SpakieConfig()
+    config = get_preset_config(args.preset)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_dirs = checkpoint_search_dirs(config)
 
-    available_paths = list_available_checkpoints(config.checkpoint_dir)
+    available_paths = list_available_checkpoints(checkpoint_dirs)
     if args.list_models:
         if not available_paths:
             print("Error: no checkpoint found. Train a model first.")
@@ -120,7 +142,7 @@ def main():
 
     try:
         ckpt_path = resolve_checkpoint_path(
-            checkpoint_dir=config.checkpoint_dir,
+            checkpoint_dirs=checkpoint_dirs,
             checkpoint_arg=args.checkpoint,
             model_arg=args.model,
             interactive=not args.no_model_prompt,
@@ -136,6 +158,8 @@ def main():
     # Load
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if "config" in ckpt:
+        config = inherit_model_shape(config, ckpt["config"])
     model = SpakieGPT(config)
     model.load_state_dict(ckpt["model"])
     model.to(device)
@@ -145,6 +169,7 @@ def main():
     tokenizer = SpakieTokenizer(tok_path)
 
     print(f"Device: {device}")
+    print(f"Preset: {config.preset_name}")
     print(f"JSON mode: {args.json_mode}")
 
     chat_loop(

@@ -6,6 +6,7 @@ venv/
 data/raw/
 data/processed/
 data/chat/
+data/eval/
 
 # Checkpoints
 checkpoints/

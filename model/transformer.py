@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -103,7 +104,10 @@ class SpakieGPT(nn.Module):
         x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
 
         for block in self.blocks:
-            x = block(x)
+            if self.training and self.config.activation_checkpointing:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)

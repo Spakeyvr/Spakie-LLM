@@ -231,6 +231,12 @@ def main() -> None:
         help=f"Max total examples (0 = all, default: {config.sft_download_max_examples})",
     )
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed")
+    parser.add_argument(
+        "--output-name",
+        type=str,
+        default="train_mixed.jsonl",
+        help="Output filename inside data/chat/",
+    )
     args = parser.parse_args()
 
     os.makedirs(config.chat_data_dir, exist_ok=True)
@@ -264,7 +270,7 @@ def main() -> None:
     if args.max > 0:
         all_examples = all_examples[:args.max]
 
-    out_path = os.path.join(config.chat_data_dir, "train.jsonl")
+    out_path = os.path.join(config.chat_data_dir, args.output_name)
     with open(out_path, "w", encoding="utf-8") as handle:
         for example in all_examples:
             handle.write(json.dumps(example, ensure_ascii=False) + "\n")
