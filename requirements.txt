@@ -4,3 +4,4 @@ tqdm
 numpy
 requests
 datasets>=2.19.0
+mlx>=0.20 ; sys_platform == "darwin" and platform_machine == "arm64"
