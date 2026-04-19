@@ -17,6 +17,7 @@ from configs.default import checkpoint_search_dirs, get_preset_config, inherit_m
 from inference.chat import build_prompt_ids
 from inference.generate import generate
 from model.transformer import SpakieGPT
+from runtime import DEVICE_CHOICES, PRECISION_CHOICES, resolve_runtime_settings
 from tokenizer.train_tokenizer import SpakieTokenizer
 
 
@@ -60,7 +61,7 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def answer_question(model, tokenizer, config, device, prompt: str) -> str:
+def answer_question(model, tokenizer, config, runtime, prompt: str) -> str:
     prompt_ids = build_prompt_ids(tokenizer, [{"role": "user", "content": prompt}], "")
     response_ids = generate(
         model,
@@ -70,7 +71,7 @@ def answer_question(model, tokenizer, config, device, prompt: str) -> str:
         temperature=EVAL_TEMPERATURE,
         top_k=EVAL_TOP_K,
         top_p=EVAL_TOP_P,
-        device=device,
+        runtime=runtime,
     )
     return tokenizer.decode(response_ids).strip()
 
@@ -119,11 +120,19 @@ def main() -> None:
     parser.add_argument("--preset", type=str, default="92m", help="Model preset to use (92m or 180m)")
     parser.add_argument("--checkpoint", type=str, default="", help="Checkpoint filename or path")
     parser.add_argument("--output", type=str, default="", help="Optional JSON output path")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device")
+    parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
+    parser.add_argument("--num-workers", type=int, default=2, help="Reserved for backend-aligned eval loading")
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
     checkpoint_path = resolve_checkpoint(config, args.checkpoint or None)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    runtime = resolve_runtime_settings(args.device, args.precision)
+    device = runtime.device
+    print(f"Device: {device.type}")
+    print(f"Precision: {runtime.precision}")
+    print(f"Preset: {config.preset_name}")
+    print(f"Eval workers: {args.num_workers} (unused in prompt loop)")
 
     qa_path = os.path.join(config.eval_data_dir, "basic_qa.jsonl")
     refusal_path = os.path.join(config.eval_data_dir, "refusal.jsonl")
@@ -144,13 +153,13 @@ def main() -> None:
     refusal_results = []
 
     for row in qa_rows:
-        answer = answer_question(model, tokenizer, config, device, row["question"])
+        answer = answer_question(model, tokenizer, config, runtime, row["question"])
         result = qa_result(row["question"], answer, row["accept_any"], row["reject_any"])
         result["reference_answer"] = row["reference_answer"]
         qa_results.append(result)
 
     for row in refusal_rows:
-        answer = answer_question(model, tokenizer, config, device, row["prompt"])
+        answer = answer_question(model, tokenizer, config, runtime, row["prompt"])
         refusal_results.append(refusal_result(row["prompt"], answer, row["reject_any"]))
 
     qa_passed = sum(1 for row in qa_results if row["keyword_pass"] and not row["reject_token_hit"])

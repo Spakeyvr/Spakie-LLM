@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from dataclasses import field
 
 
-DEFAULT_PRESET = "92m"
-SUPPORTED_PRESETS = ("92m", "180m")
+DEFAULT_PRESET = "300m"
+SUPPORTED_PRESETS = ("92m", "180m", "300m")
 DEFAULT_TARGET_TRAIN_TOKENS = 2_000_000_000
 CORPUS_SOURCE_ALIASES = {
     "wikipedia": "wikipedia_snapshot",
@@ -94,9 +94,9 @@ class SpakieConfig:
     activation_checkpointing: bool = False
 
     # Pretraining
-    pretrain_batch_size: int = 16
-    pretrain_grad_accum_steps: int = 4
-    pretrain_lr: float = 3e-4
+    pretrain_batch_size: int = 128
+    pretrain_grad_accum_steps: int = 2
+    pretrain_lr: float = 6e-4  # scaled for 8x larger effective batch vs original 16×4
     pretrain_target_tokens: int = 0
     pretrain_max_steps: int = 0
     pretrain_warmup_steps: int = 200
@@ -257,6 +257,19 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
         config.pretrain_grad_accum_steps = 16
         config.sft_batch_size = 2
         config.sft_grad_accum_steps = 4
+        config.refresh_derived_fields()
+
+    elif preset == "300m":
+        config.n_layers = 24
+        config.d_model = 1024
+        config.n_heads = 16
+        config.d_ff = 4096
+        config.activation_checkpointing = False  # 128GB unified memory, not needed
+        config.pretrain_batch_size = 32
+        config.pretrain_grad_accum_steps = 4
+        config.pretrain_lr = 6e-4  # scaled for 4x larger effective batch
+        config.sft_batch_size = 16
+        config.sft_grad_accum_steps = 2
         config.refresh_derived_fields()
 
     return config

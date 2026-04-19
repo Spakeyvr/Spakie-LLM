@@ -8,6 +8,7 @@ import torch
 
 from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
+from runtime import RuntimeSettings
 from tokenizer.train_tokenizer import SpakieTokenizer
 from inference.generate import generate, generate_json
 
@@ -17,23 +18,11 @@ DEFAULT_SYSTEM = ""
 
 def build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg: str) -> list[int]:
     """Build token IDs from conversation history using chat template."""
-    ids = []
-    if system_msg:
-        ids = [tokenizer.system_id] + tokenizer.encode(system_msg) + [tokenizer.eos_id]
-
-    for msg in history:
-        if msg["role"] == "user":
-            ids += [tokenizer.user_id] + tokenizer.encode(msg["content"]) + [tokenizer.eos_id]
-        elif msg["role"] == "assistant":
-            ids += [tokenizer.assistant_id] + tokenizer.encode(msg["content"]) + [tokenizer.eos_id]
-
-    # Prompt for assistant response
-    ids.append(tokenizer.assistant_id)
-    return ids
+    return tokenizer.apply_chat_template(history, system_msg=system_msg, add_assistant_prompt=True)
 
 
 def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig,
-              device: torch.device, system_msg: str = DEFAULT_SYSTEM,
+              runtime: RuntimeSettings, system_msg: str = DEFAULT_SYSTEM,
               temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9,
               json_mode: bool = False):
     """Interactive chat REPL."""
@@ -72,14 +61,14 @@ def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig
         if json_mode:
             response_text = generate_json(
                 model, tokenizer, prompt_ids,
-                temperature=temperature, top_k=top_k, top_p=top_p, device=device,
+                temperature=temperature, top_k=top_k, top_p=top_p, runtime=runtime,
             )
             if response_text is None:
                 response_text = "(failed to generate valid JSON)"
         else:
             response_ids = generate(
                 model, tokenizer, prompt_ids,
-                temperature=temperature, top_k=top_k, top_p=top_p, device=device,
+                temperature=temperature, top_k=top_k, top_p=top_p, runtime=runtime,
             )
             response_text = tokenizer.decode(response_ids)
 

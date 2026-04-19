@@ -9,6 +9,7 @@ import torch
 
 from configs.default import checkpoint_search_dirs, get_preset_config, inherit_model_shape
 from model.transformer import SpakieGPT
+from runtime import DEVICE_CHOICES, PRECISION_CHOICES, resolve_runtime_settings
 from tokenizer.train_tokenizer import SpakieTokenizer
 from inference.chat import chat_loop
 
@@ -124,13 +125,19 @@ def main():
     parser.add_argument("--json_mode", action="store_true", help="Enable JSON output mode")
     parser.add_argument("--system", type=str, default="",
                         help="Optional system message")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device")
+    parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    runtime = resolve_runtime_settings(args.device, args.precision)
+    device = runtime.device
     checkpoint_dirs = checkpoint_search_dirs(config)
 
     available_paths = list_available_checkpoints(checkpoint_dirs)
+    print(f"Device: {device.type}")
+    print(f"Precision: {runtime.precision}")
+    print(f"Preset: {config.preset_name}")
     if args.list_models:
         if not available_paths:
             print("Error: no checkpoint found. Train a model first.")
@@ -168,12 +175,10 @@ def main():
     tok_path = args.tokenizer or (config.tokenizer_prefix + ".model")
     tokenizer = SpakieTokenizer(tok_path)
 
-    print(f"Device: {device}")
-    print(f"Preset: {config.preset_name}")
     print(f"JSON mode: {args.json_mode}")
 
     chat_loop(
-        model, tokenizer, config, device,
+        model, tokenizer, config, runtime,
         system_msg=args.system,
         temperature=args.temperature,
         top_k=args.top_k,

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from model.utils import count_parameters
+from runtime import RuntimeSettings, autocast_context, optimizer_kwargs
 
 
 class ResumableBatchSampler:
@@ -145,7 +146,7 @@ def get_lr(step: int, config: SpakieConfig) -> float:
     return min_lr + 0.5 * (config.pretrain_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def configure_optimizer(model: SpakieGPT, config: SpakieConfig) -> torch.optim.AdamW:
+def configure_optimizer(model: SpakieGPT, config: SpakieConfig, runtime: RuntimeSettings) -> torch.optim.AdamW:
     """AdamW with weight decay only on 2D params (not biases, norms, embeddings)."""
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
     nodecay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
@@ -157,20 +158,20 @@ def configure_optimizer(model: SpakieGPT, config: SpakieConfig) -> torch.optim.A
         groups,
         lr=config.pretrain_lr,
         betas=(0.9, 0.95),
-        fused=torch.cuda.is_available(),
+        **optimizer_kwargs(runtime),
     )
 
 
 @torch.no_grad()
-def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, device: torch.device) -> float:
+def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, runtime: RuntimeSettings) -> float:
     model.eval()
     total_loss = 0.0
     count = 0
     for i, (x, y) in enumerate(val_loader):
         if i >= config.pretrain_eval_batches:
             break
-        x, y = x.to(device), y.to(device)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        x, y = x.to(runtime.device), y.to(runtime.device)
+        with autocast_context(runtime):
             _, loss = model(x, y)
         total_loss += loss.item()
         count += 1
@@ -179,11 +180,11 @@ def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, dev
 
 
 def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
-             config: SpakieConfig, device: torch.device,
+             config: SpakieConfig, runtime: RuntimeSettings,
              resume_state: dict[str, object] | None = None):
-    model.to(device)
+    model.to(runtime.device)
     model.train()
-    optimizer = configure_optimizer(model, config)
+    optimizer = configure_optimizer(model, config, runtime)
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     train_sampler = getattr(train_loader, "batch_sampler", None)
@@ -229,7 +230,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     try:
         while global_step < config.pretrain_max_steps and (target_tokens <= 0 or tokens_processed < target_tokens):
             optimizer.zero_grad(set_to_none=True)
-            accum_loss = 0.0
+            accum_loss_tensor = None
 
             for micro_step in range(config.pretrain_grad_accum_steps):
                 try:
@@ -238,14 +239,17 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     train_iter = iter(train_loader)
                     x, y = next(train_iter)
 
-                x, y = x.to(device), y.to(device)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                x, y = x.to(runtime.device), y.to(runtime.device)
+                with autocast_context(runtime):
                     _, loss = model(x, y)
                     loss = loss / config.pretrain_grad_accum_steps
 
                 loss.backward()
-                accum_loss += loss.item()
+                detached = loss.detach()
+                accum_loss_tensor = detached if accum_loss_tensor is None else accum_loss_tensor + detached
                 tokens_processed += x.numel()
+
+            accum_loss = accum_loss_tensor.item()  # single GPU→CPU sync per optimizer step
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.pretrain_grad_clip)
 
@@ -253,6 +257,13 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             lr = get_lr(global_step, config)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
+
+            # MPS bug: addcmul_/addcdiv_ silently fails on non-contiguous tensors (AdamW internals),
+            # causing weights to stop updating. Force contiguous before the step.
+            if runtime.device.type == "mps":
+                for p in model.parameters():
+                    if p.grad is not None and not p.grad.is_contiguous():
+                        p.grad = p.grad.contiguous()
 
             optimizer.step()
             global_step += 1
@@ -278,7 +289,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
 
             # Eval
             if global_step % config.pretrain_eval_interval == 0:
-                val_loss = evaluate(model, val_loader, config, device)
+                val_loss = evaluate(model, val_loader, config, runtime)
                 last_val_loss = val_loss
                 elapsed = time.time() - start_time
                 tok_per_sec = tokens_processed / elapsed

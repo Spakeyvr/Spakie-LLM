@@ -9,6 +9,7 @@ import torch
 
 from configs.default import checkpoint_search_dirs, get_preset_config, inherit_model_shape
 from model.transformer import SpakieGPT
+from runtime import DEVICE_CHOICES, PRECISION_CHOICES, resolve_runtime_settings
 from tokenizer.train_tokenizer import SpakieTokenizer
 from training.dataset import ChatSFTDataset, train_val_split
 from training.finetune import finetune
@@ -51,6 +52,9 @@ def main():
     parser.add_argument("--output-name", type=str, default="", help="Filename for the best SFT checkpoint")
     parser.add_argument("--smoke", action="store_true", help="Run a one-epoch subset smoke test")
     parser.add_argument("--max-examples", type=int, default=0, help="Optional cap on loaded SFT examples")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device")
+    parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes")
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
@@ -58,10 +62,13 @@ def main():
     if args.smoke:
         config.sft_epochs = 1
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    runtime = resolve_runtime_settings(args.device, args.precision)
+    device = runtime.device
+    print(f"Device: {device.type}")
+    print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
+    print(f"DataLoader workers: {args.num_workers}")
 
     default_jsonl = os.path.join(config.chat_data_dir, "train_mixed.jsonl")
     if not os.path.exists(default_jsonl):
@@ -107,7 +114,8 @@ def main():
         train_ds,
         val_ds,
         config,
-        device,
+        runtime,
+        num_workers=args.num_workers,
         best_checkpoint_name=output_name,
         interrupt_checkpoint_name=interrupt_name_for(output_name),
     )

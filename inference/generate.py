@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model.transformer import SpakieGPT
+from runtime import RuntimeSettings, autocast_context
 from tokenizer.train_tokenizer import SpakieTokenizer
 
 
@@ -39,10 +40,14 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
              max_new_tokens: int = 256, temperature: float = 0.8,
              top_k: int = 50, top_p: float = 0.9,
              repetition_penalty: float = 1.2,
-             device: torch.device | str = "cuda") -> list[int]:
+             runtime: RuntimeSettings | None = None,
+             device: torch.device | str | None = None) -> list[int]:
     """Autoregressive generation. Returns generated token IDs (excluding prompt)."""
     model.eval()
-    idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    if runtime is None:
+        runtime_device = torch.device(device) if device is not None else next(model.parameters()).device
+        runtime = RuntimeSettings(device=runtime_device, precision="fp32")
+    idx = torch.tensor([prompt_ids], dtype=torch.long, device=runtime.device)
     generated = []
 
     # Stop tokens: EOS + all chat role tokens
@@ -57,7 +62,7 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
         # Crop to max_seq_len
         idx_cond = idx[:, -model.config.max_seq_len:]
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with autocast_context(runtime):
             logits, _ = model(idx_cond)
 
         next_logits = logits[:, -1, :].clone()
@@ -93,13 +98,25 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
 def generate_json(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int],
                   max_new_tokens: int = 512, temperature: float = 0.5,
                   top_k: int = 50, top_p: float = 0.9,
-                  device: torch.device | str = "cuda", max_retries: int = 3) -> str | None:
+                  runtime: RuntimeSettings | None = None,
+                  device: torch.device | str | None = None,
+                  max_retries: int = 3) -> str | None:
     """Generate and validate JSON output. Retries up to max_retries times."""
     # Prepend <|json|> token
     json_prompt = [tokenizer.json_id] + prompt_ids
 
     for attempt in range(max_retries):
-        ids = generate(model, tokenizer, json_prompt, max_new_tokens, temperature, top_k, top_p, device=device)
+        ids = generate(
+            model,
+            tokenizer,
+            json_prompt,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            runtime=runtime,
+            device=device,
+        )
         text = tokenizer.decode(ids).strip()
         try:
             json.loads(text)

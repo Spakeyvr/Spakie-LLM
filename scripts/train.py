@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from configs.default import get_preset_config
 from model.transformer import SpakieGPT
 from model.utils import print_model_summary
+from runtime import DEVICE_CHOICES, PRECISION_CHOICES, dataloader_kwargs, resolve_runtime_settings
 from training.dataset import PretrainDataset
 from training.pretrain import ResumableBatchSampler
 
@@ -30,6 +31,9 @@ def main():
     parser.add_argument("--max-steps", type=int, default=0, help="Override max training steps")
     parser.add_argument("--resume", action="store_true", help="Resume from the latest interrupt checkpoint")
     parser.add_argument("--resume-from", type=str, default="", help="Resume from a specific checkpoint path")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device")
+    parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes")
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
@@ -72,13 +76,16 @@ def main():
                     config.pretrain_tokens_per_step() * args.max_steps,
                 )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    runtime = resolve_runtime_settings(args.device, args.precision)
+    device = runtime.device
+    print(f"Device: {device.type}")
+    print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
     print(f"Max steps: {config.pretrain_max_steps:,}")
+    print(f"DataLoader workers: {args.num_workers}")
 
     # Model
     model = SpakieGPT(config)
@@ -95,8 +102,14 @@ def main():
         train_sampler = ResumableBatchSampler.from_state_dict(sampler_state)
     else:
         train_sampler = ResumableBatchSampler(len(train_ds), config.pretrain_batch_size, drop_last=True)
-    train_loader = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=config.pretrain_batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    loader_options = dataloader_kwargs(runtime, args.num_workers)
+    train_loader = DataLoader(train_ds, batch_sampler=train_sampler, **loader_options)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config.pretrain_batch_size,
+        shuffle=False,
+        **loader_options,
+    )
 
     # Train
     from training.pretrain import pretrain
@@ -104,7 +117,7 @@ def main():
         print(f"Resuming from: {resume_path}")
         print(f"Resume step: {resume_state.get('step', 0):,}")
         print(f"Resume tokens: {resume_state.get('tokens_processed', 0):,}")
-    pretrain(model, train_loader, val_loader, config, device, resume_state=resume_state)
+    pretrain(model, train_loader, val_loader, config, runtime, resume_state=resume_state)
 
 
 if __name__ == "__main__":

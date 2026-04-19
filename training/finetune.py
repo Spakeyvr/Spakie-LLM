@@ -12,18 +12,32 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
+from runtime import RuntimeSettings, autocast_context, dataloader_kwargs, optimizer_kwargs
 from training.dataset import ChatSFTDataset, train_val_split
 
 
 def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
-             config: SpakieConfig, device: torch.device,
+             config: SpakieConfig, runtime: RuntimeSettings,
+             num_workers: int = 2,
              best_checkpoint_name: str = "sft_best.pt",
              interrupt_checkpoint_name: str = "sft_interrupt.pt"):
-    model.to(device)
+    model.to(runtime.device)
     model.train()
 
-    train_loader = DataLoader(train_dataset, batch_size=config.sft_batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=config.sft_batch_size, shuffle=False)
+    loader_options = dataloader_kwargs(runtime, num_workers)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.sft_batch_size,
+        shuffle=True,
+        drop_last=True,
+        **loader_options,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.sft_batch_size,
+        shuffle=False,
+        **loader_options,
+    )
 
     # Optimizer: weight decay on 2D params only
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -31,7 +45,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
     optimizer = torch.optim.AdamW([
         {"params": decay_params, "weight_decay": config.sft_weight_decay},
         {"params": nodecay_params, "weight_decay": 0.0},
-    ], lr=config.sft_lr, betas=(0.9, 0.95))
+    ], lr=config.sft_lr, betas=(0.9, 0.95), **optimizer_kwargs(runtime))
 
     total_steps = len(train_loader) * config.sft_epochs // config.sft_grad_accum_steps
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -50,8 +64,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             pbar = tqdm(train_loader, desc=f"SFT Epoch {epoch + 1}/{config.sft_epochs}")
             try:
                 for batch_idx, (x, y) in enumerate(pbar):
-                    x, y = x.to(device), y.to(device)
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    x, y = x.to(runtime.device), y.to(runtime.device)
+                    with autocast_context(runtime):
                         _, loss = model(x, y)
                         loss = loss / config.sft_grad_accum_steps
 
@@ -82,8 +96,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             val_count = 0
             with torch.no_grad():
                 for x, y in val_loader:
-                    x, y = x.to(device), y.to(device)
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    x, y = x.to(runtime.device), y.to(runtime.device)
+                    with autocast_context(runtime):
                         _, loss = model(x, y)
                     val_loss += loss.item()
                     val_count += 1

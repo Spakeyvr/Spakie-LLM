@@ -5,16 +5,42 @@ A GPT-style language model built from scratch in PyTorch. The repo still trains 
 ## Setup
 
 ```bash
-setup_env.bat
-```
-
-Or manually:
-```bash
-python -m venv venv
-venv\Scripts\activate.bat
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Install PyTorch using the official selector for your platform:
+- Apple Silicon / Mac: install a recent `torch` build with MPS support
+- NVIDIA CUDA: install the matching CUDA wheel for your toolkit
+- CPU-only: install the default CPU wheel
+
+If you prefer, you can install PyTorch first and then install the rest:
+```bash
+pip install torch
+pip install -r requirements.txt
+```
+
+## Runtime Selection
+
+All runtime entrypoints support backend-aware device and precision flags:
+```bash
+--device {auto,cuda,mps,cpu}
+--precision {auto,fp32,fp16,bf16}
+```
+
+Default behavior is Mac-friendly:
+- `--device auto` prefers `cuda`, then `mps`, then `cpu`
+- `--precision auto` resolves to `bf16` on CUDA, `fp16` on MPS, and `fp32` on CPU
+
+Recommended Apple Silicon usage:
+```bash
+python3 scripts/train.py --smoke --device auto --precision auto
+python3 scripts/finetune.py --smoke --device auto --precision auto
+python3 scripts/chat.py --device auto --precision auto
+```
+
+The scripts print the resolved device and precision at startup so you can confirm that Mac runs are using `mps` rather than silently falling back to CPU.
 
 ## Usage
 
@@ -23,41 +49,36 @@ Drop `.md` files into `data/raw/`.
 
 You can also scrape open datasets directly:
 ```bash
-python scripts/scrape_wiki.py
-python scripts/scrape_dictionary.py --max 5000
-python scripts/scrape_open_corpus.py
+python3 scripts/scrape_wiki.py
+python3 scripts/scrape_dictionary.py --max 5000
+python3 scripts/scrape_open_corpus.py
 ```
 
 For the larger 2B-token pipeline, download resumable JSONL shards into `data/raw/large_corpus/`:
 ```bash
-python scripts/download_pretrain_corpus.py --sources all --resume --english_only
-python scripts/download_pretrain_corpus.py --sources fineweb-edu,refinedweb,wikipedia_snapshot,stackexchange,arxiv,gutenberg --target_tokens_estimate 2105263158 --resume --english_only
+python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
+python3 scripts/download_pretrain_corpus.py --sources fineweb-edu,refinedweb,wikipedia_snapshot,stackexchange,arxiv,gutenberg --target_tokens_estimate 2105263158 --resume --english_only
 ```
 
 The downloader writes per-source progress and shard manifests so interrupted runs can continue safely.
 `dolma` support remains in the script, but it is not part of the default `all` set because current Hugging Face `datasets` rejects its legacy script loader.
 
-Windows wrapper:
-```bash
-download_pretrain_corpus.bat --sources all --resume --english_only
-```
-
 ### 2. Train tokenizer
 ```bash
-python tokenizer/train_tokenizer.py
+python3 tokenizer/train_tokenizer.py
 ```
 
 ### 3. Prepare data
 ```bash
-python scripts/prepare_data.py
+python3 scripts/prepare_data.py
 ```
 
 Useful options:
 ```bash
-python scripts/prepare_data.py --dry_run
-python scripts/prepare_data.py --target_train_tokens 2000000000 --report_path data/processed/corpus_report.json
-python scripts/prepare_data.py --target_tokens 2105263158 --report_path data/processed/corpus_report.json
-python scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_corpus/gutenberg --dedup
+python3 scripts/prepare_data.py --dry_run
+python3 scripts/prepare_data.py --target_train_tokens 2000000000 --report_path data/processed/corpus_report.json
+python3 scripts/prepare_data.py --target_tokens 2105263158 --report_path data/processed/corpus_report.json
+python3 scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_corpus/gutenberg --dedup
 ```
 
 `prepare_data.py` now:
@@ -69,7 +90,7 @@ python scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_corp
 
 ### 4. Pretrain
 ```bash
-python scripts/train.py --preset 180m
+python3 scripts/train.py --preset 180m --device auto --precision auto
 ```
 
 ### 5. Fine-tune (optional)
@@ -80,17 +101,28 @@ Add chat data to `data/chat/train.jsonl` in the format:
 
 Then run:
 ```bash
-python scripts/finetune.py
+python3 scripts/finetune.py --device auto --precision auto
 ```
 
 ### 6. Chat
 ```bash
-python scripts/chat.py
-python scripts/chat.py --model sft_best
-python scripts/chat.py --list-models
-python scripts/chat.py --json_mode
-python scripts/chat.py --temperature 0.5 --top_k 40
+python3 scripts/chat.py --device auto --precision auto
+python3 scripts/chat.py --model sft_best --device auto --precision auto
+python3 scripts/chat.py --list-models --device auto --precision auto
+python3 scripts/chat.py --json_mode --device auto --precision auto
+python3 scripts/chat.py --temperature 0.5 --top_k 40 --device auto --precision auto
 ```
+
+## Mac Troubleshooting
+
+If you hit MPS backend limitations or memory pressure on macOS, try these optional environment variables before running a script:
+
+```bash
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+```
+
+These are not set automatically by the repo. Use them only when you need to trade strict MPS execution or allocator limits for stability.
 
 ## Architecture
 
