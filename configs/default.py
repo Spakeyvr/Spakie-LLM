@@ -277,6 +277,14 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
 
 def checkpoint_search_dirs(config: SpakieConfig) -> list[str]:
     dirs = [config.checkpoint_dir]
+    # Smoke-run outputs live under subdirs of the main checkpoint dir. Include
+    # them as fallbacks so chat.py can still find *something* when the only
+    # checkpoints around are from a --smoke run (placed after real dirs so real
+    # checkpoints with the same filename always win).
+    for subdir in ("smoke_pretrain", "smoke_sft"):
+        smoke_dir = os.path.join(config.checkpoint_dir, subdir)
+        if smoke_dir not in dirs:
+            dirs.append(smoke_dir)
     if config.preset_name == DEFAULT_PRESET:
         legacy_dir = config.checkpoint_root_dir
         if legacy_dir not in dirs:
