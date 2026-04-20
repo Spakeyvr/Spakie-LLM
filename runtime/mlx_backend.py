@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 
 MLX_PRECISION_CHOICES = ("auto", "fp32", "fp16", "bf16")
@@ -41,6 +41,29 @@ def resolve_mlx_runtime(precision_name: str = "auto") -> MLXRuntimeSettings:
     if requested == "auto":
         requested = "bf16" if mx.metal.is_available() else "fp32"
     return MLXRuntimeSettings(precision=requested, dtype=_DTYPE_MAP[requested])
+
+
+def configure_metal_limits(
+    max_gb: float | None = None, wired_gb: float | None = None
+) -> dict[str, int]:
+    """Optionally raise Metal memory/wired limits on Apple Silicon.
+
+    Defaults (None) preserve MLX's built-in behavior. On a 128 GB machine,
+    values like max_gb=96, wired_gb=64 let the 300m preset run comfortably.
+    Returns a dict of whatever was actually applied (in bytes).
+    """
+    applied: dict[str, int] = {}
+    if not mx.metal.is_available():
+        return applied
+    if max_gb is not None and max_gb > 0:
+        limit = int(max_gb * (1024 ** 3))
+        mx.metal.set_memory_limit(limit)
+        applied["memory_limit"] = limit
+    if wired_gb is not None and wired_gb > 0:
+        limit = int(wired_gb * (1024 ** 3))
+        mx.metal.set_wired_limit(limit)
+        applied["wired_limit"] = limit
+    return applied
 
 
 def flatten_tree(tree: Any) -> dict[str, mx.array]:
@@ -93,14 +116,11 @@ def clip_grads(grads: Any, max_norm: float) -> tuple[Any, mx.array]:
             return None
         return (x.astype(mx.float32) * scale).astype(x.dtype)
 
-    from mlx.utils import tree_map
-
     return tree_map(_scale, grads), norm
 
 
 def add_grad_trees(a: Any, b: Any) -> Any:
     """Sum two grad PyTrees elementwise. Skips Nones."""
-    from mlx.utils import tree_map
 
     def _add(x, y):
         if x is None:
@@ -113,8 +133,6 @@ def add_grad_trees(a: Any, b: Any) -> Any:
 
 
 def scale_grad_tree(grads: Any, factor: float) -> Any:
-    from mlx.utils import tree_map
-
     def _mul(x):
         if x is None:
             return None

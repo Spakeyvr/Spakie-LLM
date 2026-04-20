@@ -264,10 +264,15 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
         config.d_model = 1024
         config.n_heads = 16
         config.d_ff = 4096
-        config.activation_checkpointing = False  # 128GB unified memory, not needed
-        config.pretrain_batch_size = 32
-        config.pretrain_grad_accum_steps = 4
-        config.pretrain_lr = 6e-4  # scaled for 4x larger effective batch
+        # Activation checkpointing trades a small amount of recompute for ~30%
+        # activation memory, which lets us double pretrain_batch_size and halve
+        # grad-accum while holding tokens/step constant (64 * 2 * 512 = 65_536,
+        # identical to the previous 32 * 4 * 512). Halving the accum loop halves
+        # per-step Python overhead, which compounds with mx.compile wins.
+        config.activation_checkpointing = True
+        config.pretrain_batch_size = 64
+        config.pretrain_grad_accum_steps = 2
+        config.pretrain_lr = 6e-4
         config.sft_batch_size = 16
         config.sft_grad_accum_steps = 2
         config.refresh_derived_fields()

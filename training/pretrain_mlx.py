@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import math
+import operator
 import os
 import random
 import signal
 import sys
+import threading
 import time
+from functools import partial
 
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -25,14 +28,13 @@ from runtime.mlx_backend import (
     load_meta_json,
     load_safetensors,
     save_meta_json,
-    save_safetensors,
-    flatten_tree,
 )
 from training.dataset_mlx import (
     PretrainDatasetMLX,
     ResumableBatchSamplerMLX,
     stack_batch,
 )
+from training.prefetch_mlx import BatchPrefetcher
 
 
 def _split_decay_grads(grads):
@@ -108,13 +110,35 @@ def _build_loss_and_grad(model: SpakieGPTMLX, accum_scale: float):
     return nn.value_and_grad(model, loss_fn)
 
 
+def _build_microbatch_step(model: SpakieGPTMLX, accum_scale: float, *, compile_step: bool):
+    """Return a callable `step(x, y) -> (loss, grads)`.
+
+    With `compile_step=True`, the forward+backward is wrapped in `mx.compile`
+    with model state + global RNG state captured so dropout stays stochastic
+    and parameter updates are observed across calls. Keeping `accum_scale` as
+    a Python float means it becomes a compile-time constant — no recompile
+    per step.
+    """
+    value_and_grad = _build_loss_and_grad(model, accum_scale)
+
+    if not compile_step:
+        def step(x, y):
+            return value_and_grad(model, x, y)
+        return step
+
+    state = [model.state, mx.random.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(x, y):
+        return value_and_grad(model, x, y)
+
+    return step
+
+
 def _accum_grads(acc, new):
     if acc is None:
         return new
-    flat_acc = dict(tree_flatten(acc))
-    flat_new = dict(tree_flatten(new))
-    summed = {k: flat_acc[k] + flat_new[k] for k in flat_acc}
-    return tree_unflatten(list(summed.items()))
+    return tree_map(operator.add, acc, new)
 
 
 def _capture_rng() -> dict:
@@ -134,6 +158,100 @@ def _restore_rng(state: dict | None) -> None:
         np.random.set_state(state["numpy"])
 
 
+class AsyncCheckpointWriter:
+    """Serializes safetensors writes onto a worker thread.
+
+    The producer (training loop) calls `submit(path, flat, meta, meta_path)`
+    after having eval'd the array dict on the main thread, so the arrays are
+    materialized and safe to hand off. Only one write is in flight at a time;
+    submitting a second one blocks until the first finishes. `join()` waits
+    on the current write and is invoked before interpreter shutdown.
+    """
+
+    def __init__(self) -> None:
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+
+    def submit(self, path: str, flat: dict[str, mx.array], meta: dict, meta_path: str) -> None:
+        self.join()
+        if self._error is not None:
+            raise self._error
+
+        def _work() -> None:
+            try:
+                mx.save_safetensors(path, flat, metadata={})
+                save_meta_json(meta_path, meta)
+            except BaseException as exc:  # noqa: BLE001
+                self._error = exc
+
+        thread = threading.Thread(target=_work, daemon=False)
+        self._thread = thread
+        thread.start()
+
+    def write_sync(self, path: str, flat: dict[str, mx.array], meta: dict, meta_path: str) -> None:
+        self.join()
+        if flat:
+            mx.eval(*flat.values())
+        mx.save_safetensors(path, flat, metadata={})
+        save_meta_json(meta_path, meta)
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+
+def _build_checkpoint_payload(
+    *,
+    model: SpakieGPTMLX,
+    optimizer: DualAdamW,
+    config: SpakieConfig,
+    global_step: int,
+    tokens_processed: int,
+    best_val_loss: float,
+    val_loss: float | None,
+    elapsed_time: float,
+    train_sampler: ResumableBatchSamplerMLX,
+) -> tuple[dict[str, mx.array], dict]:
+    model_flat = dict(tree_flatten(model.parameters()))
+    opt_decay_flat = dict(tree_flatten(optimizer.decay.state))
+    opt_nodecay_flat = dict(tree_flatten(optimizer.nodecay.state))
+
+    flat: dict[str, mx.array] = {}
+    for k, v in model_flat.items():
+        flat[f"model.{k}"] = v
+    for k, v in opt_decay_flat.items():
+        if isinstance(v, mx.array):
+            flat[f"optimizer.decay.{k}"] = v
+    for k, v in opt_nodecay_flat.items():
+        if isinstance(v, mx.array):
+            flat[f"optimizer.nodecay.{k}"] = v
+
+    sampler_state = train_sampler.state_dict()
+    rng_snapshot = _capture_rng()
+    meta = {
+        "step": global_step,
+        "tokens_processed": tokens_processed,
+        "best_val_loss": best_val_loss,
+        "val_loss": val_loss,
+        "elapsed_time": elapsed_time,
+        "rng_state": {
+            "python": list(rng_snapshot["python"][1]),
+            "python_version": rng_snapshot["python"][0],
+        },
+        "sampler": {
+            "rng_state": _json_safe(sampler_state["rng_state"]),
+            "indices": sampler_state["indices"],
+            "position": sampler_state["position"],
+            "dataset_size": sampler_state["dataset_size"],
+            "batch_size": sampler_state["batch_size"],
+            "drop_last": sampler_state["drop_last"],
+        },
+        "preset_name": config.preset_name,
+    }
+    return flat, meta
+
+
 def save_training_checkpoint_mlx(
     base_path: str,
     *,
@@ -146,46 +264,41 @@ def save_training_checkpoint_mlx(
     val_loss: float | None,
     elapsed_time: float,
     train_sampler: ResumableBatchSamplerMLX,
+    writer: AsyncCheckpointWriter | None = None,
+    sync: bool = False,
 ) -> None:
-    """Write a .safetensors weights file plus a sibling .meta.json."""
-    weights = {"model": dict(tree_flatten(model.parameters()))}
-    weights["optimizer"] = {
-        "decay": dict(tree_flatten(optimizer.decay.state)),
-        "nodecay": dict(tree_flatten(optimizer.nodecay.state)),
-    }
-    # Flatten all array leaves into a single dict for safetensors.
-    flat: dict[str, mx.array] = {}
-    for k, v in weights["model"].items():
-        flat[f"model.{k}"] = v
-    for group_name, group in weights["optimizer"].items():
-        for k, v in group.items():
-            if isinstance(v, mx.array):
-                flat[f"optimizer.{group_name}.{k}"] = v
+    """Write a .safetensors weights file plus a sibling .meta.json.
 
+    When `writer` is provided and `sync=False`, the actual I/O happens on a
+    worker thread; the caller is responsible for keeping the writer alive and
+    joining it before exit. When `sync=True` (or no writer given) the save is
+    synchronous — used for interrupt/final saves where we want the file
+    flushed before returning.
+    """
+    flat, meta = _build_checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        config=config,
+        global_step=global_step,
+        tokens_processed=tokens_processed,
+        best_val_loss=best_val_loss,
+        val_loss=val_loss,
+        elapsed_time=elapsed_time,
+        train_sampler=train_sampler,
+    )
+    meta_path = base_path + ".meta.json"
+
+    if writer is not None and not sync:
+        # Materialize on the main thread so the worker only does I/O.
+        if flat:
+            mx.eval(*flat.values())
+        writer.submit(base_path, flat, meta, meta_path)
+        return
+
+    if flat:
+        mx.eval(*flat.values())
     mx.save_safetensors(base_path, flat, metadata={})
-
-    sampler_state = train_sampler.state_dict()
-    meta = {
-        "step": global_step,
-        "tokens_processed": tokens_processed,
-        "best_val_loss": best_val_loss,
-        "val_loss": val_loss,
-        "elapsed_time": elapsed_time,
-        "rng_state": {
-            "python": list(_capture_rng()["python"][1]),
-            "python_version": _capture_rng()["python"][0],
-        },
-        "sampler": {
-            "rng_state": _json_safe(sampler_state["rng_state"]),
-            "indices": sampler_state["indices"],
-            "position": sampler_state["position"],
-            "dataset_size": sampler_state["dataset_size"],
-            "batch_size": sampler_state["batch_size"],
-            "drop_last": sampler_state["drop_last"],
-        },
-        "preset_name": config.preset_name,
-    }
-    save_meta_json(base_path + ".meta.json", meta)
+    save_meta_json(meta_path, meta)
 
 
 def _json_safe(obj):
@@ -278,6 +391,9 @@ def pretrain_mlx(
     config: SpakieConfig,
     runtime: MLXRuntimeSettings,
     resume_state: dict | None = None,
+    *,
+    use_compile: bool = True,
+    use_prefetch: bool = True,
 ) -> float:
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)
@@ -316,7 +432,9 @@ def pretrain_mlx(
     )
 
     accum_scale = 1.0 / config.pretrain_grad_accum_steps
-    loss_and_grad = _build_loss_and_grad(model, accum_scale)
+    microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
+
+    ckpt_writer = AsyncCheckpointWriter()
 
     start_time = time.time() - elapsed_before_resume
     pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain[mlx]", initial=global_step)
@@ -332,7 +450,23 @@ def pretrain_mlx(
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    train_iter = iter(train_sampler)
+    prefetcher: BatchPrefetcher | None = None
+    train_iter = None
+    if use_prefetch:
+        prefetcher = BatchPrefetcher(train_dataset, train_sampler)
+    else:
+        train_iter = iter(train_sampler)
+
+    def next_batch() -> tuple[np.ndarray, np.ndarray]:
+        nonlocal train_iter
+        if prefetcher is not None:
+            return next(prefetcher)
+        try:
+            batch_indices = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_sampler)
+            batch_indices = next(train_iter)
+        return stack_batch(train_dataset, batch_indices)
 
     try:
         while global_step < config.pretrain_max_steps and (
@@ -342,18 +476,12 @@ def pretrain_mlx(
             accum_loss = mx.array(0.0, dtype=mx.float32)
 
             for _ in range(config.pretrain_grad_accum_steps):
-                try:
-                    batch_indices = next(train_iter)
-                except StopIteration:
-                    train_iter = iter(train_sampler)
-                    batch_indices = next(train_iter)
-
-                x_np, y_np = stack_batch(train_dataset, batch_indices)
+                x_np, y_np = next_batch()
                 x = mx.array(x_np)
                 y = mx.array(y_np)
 
                 # Loss-fn has accum_scale baked in, so grads and loss are pre-scaled.
-                loss, grads = loss_and_grad(model, x, y)
+                loss, grads = microbatch_step(x, y)
                 accum_grads = _accum_grads(accum_grads, grads)
                 accum_loss = accum_loss + loss.astype(mx.float32)
                 # Materialize per microbatch: without this, the lazy graph grows
@@ -389,6 +517,8 @@ def pretrain_mlx(
                     val_loss=last_val_loss,
                     elapsed_time=time.time() - start_time,
                     train_sampler=train_sampler,
+                    writer=ckpt_writer,
+                    sync=True,
                 )
                 pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
                 break
@@ -424,6 +554,7 @@ def pretrain_mlx(
                         val_loss=val_loss,
                         elapsed_time=elapsed,
                         train_sampler=train_sampler,
+                        writer=ckpt_writer,
                     )
                     pbar.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
                 elif config.should_use_pretrain_early_stopping():
@@ -446,11 +577,16 @@ def pretrain_mlx(
             val_loss=last_val_loss,
             elapsed_time=time.time() - start_time,
             train_sampler=train_sampler,
+            writer=ckpt_writer,
+            sync=True,
         )
         pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
         pbar.close()
+        if prefetcher is not None:
+            prefetcher.close()
+        ckpt_writer.join()
 
     if interrupted:
         print(

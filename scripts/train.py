@@ -88,7 +88,7 @@ def run_torch_pretrain(args, config):
 def run_mlx_pretrain(args, config):
     from model.transformer_mlx import SpakieGPTMLX
     from model.utils import print_model_summary
-    from runtime.mlx_backend import resolve_mlx_runtime
+    from runtime.mlx_backend import configure_metal_limits, resolve_mlx_runtime
     from training.dataset_mlx import PretrainDatasetMLX, ResumableBatchSamplerMLX
     from training.pretrain_mlx import (
         load_training_checkpoint_mlx,
@@ -119,6 +119,10 @@ def run_mlx_pretrain(args, config):
                 )
 
     runtime = resolve_mlx_runtime(args.precision)
+    applied_limits = configure_metal_limits(
+        max_gb=args.mlx_memory_gb if args.mlx_memory_gb > 0 else None,
+        wired_gb=args.mlx_wired_gb if args.mlx_wired_gb > 0 else None,
+    )
     print(f"Backend: mlx")
     print(f"Device: metal (mlx)")
     print(f"Precision: {runtime.precision}")
@@ -127,6 +131,12 @@ def run_mlx_pretrain(args, config):
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
     print(f"Max steps: {config.pretrain_max_steps:,}")
+    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch}")
+    if applied_limits:
+        human_limits = ", ".join(
+            f"{k}={v / (1024 ** 3):.1f}GB" for k, v in applied_limits.items()
+        )
+        print(f"Metal limits: {human_limits}")
 
     model = SpakieGPTMLX(config)
 
@@ -152,7 +162,17 @@ def run_mlx_pretrain(args, config):
         print(f"Resume step: {resume_state['meta'].get('step', 0):,}")
         print(f"Resume tokens: {resume_state['meta'].get('tokens_processed', 0):,}")
 
-    pretrain_mlx(model, train_ds, val_ds, train_sampler, config, runtime, resume_state=resume_state)
+    pretrain_mlx(
+        model,
+        train_ds,
+        val_ds,
+        train_sampler,
+        config,
+        runtime,
+        resume_state=resume_state,
+        use_compile=args.mlx_compile,
+        use_prefetch=args.mlx_prefetch,
+    )
 
 
 def main():
@@ -175,6 +195,34 @@ def main():
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes (torch backend)")
+    parser.add_argument(
+        "--mlx-compile",
+        dest="mlx_compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wrap the microbatch forward+backward in mx.compile (mlx backend)",
+    )
+    parser.add_argument(
+        "--mlx-prefetch",
+        dest="mlx_prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stage the next batch on a worker thread (mlx backend)",
+    )
+    parser.add_argument(
+        "--mlx-memory-gb",
+        dest="mlx_memory_gb",
+        type=float,
+        default=0.0,
+        help="Set the MLX Metal memory limit in GB (0 = leave default)",
+    )
+    parser.add_argument(
+        "--mlx-wired-gb",
+        dest="mlx_wired_gb",
+        type=float,
+        default=0.0,
+        help="Set the MLX Metal wired-memory limit in GB (0 = leave default)",
+    )
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)

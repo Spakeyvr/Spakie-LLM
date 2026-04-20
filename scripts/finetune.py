@@ -113,17 +113,27 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     from mlx.utils import tree_unflatten
 
     from model.transformer_mlx import SpakieGPTMLX
-    from runtime.mlx_backend import load_safetensors, resolve_mlx_runtime
+    from runtime.mlx_backend import configure_metal_limits, load_safetensors, resolve_mlx_runtime
     from tokenizer.train_tokenizer import SpakieTokenizer
     from training.dataset_mlx import ChatSFTDatasetMLX, SubsetView, train_val_split_mlx
     from training.finetune_mlx import finetune_mlx
 
     runtime = resolve_mlx_runtime(args.precision)
+    applied_limits = configure_metal_limits(
+        max_gb=args.mlx_memory_gb if args.mlx_memory_gb > 0 else None,
+        wired_gb=args.mlx_wired_gb if args.mlx_wired_gb > 0 else None,
+    )
     print(f"Backend: mlx")
     print(f"Device: metal (mlx)")
     print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
+    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch}")
+    if applied_limits:
+        human_limits = ", ".join(
+            f"{k}={v / (1024 ** 3):.1f}GB" for k, v in applied_limits.items()
+        )
+        print(f"Metal limits: {human_limits}")
 
     ckpt_path = resolve_named_checkpoint(
         config, args.source_checkpoint or None, _default_source_checkpoint_name("mlx")
@@ -168,6 +178,8 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         runtime,
         best_checkpoint_name=output_name,
         interrupt_checkpoint_name=interrupt_name_for(output_name),
+        use_compile=args.mlx_compile,
+        use_prefetch=args.mlx_prefetch,
     )
 
 
@@ -184,6 +196,34 @@ def main():
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes (torch backend)")
+    parser.add_argument(
+        "--mlx-compile",
+        dest="mlx_compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wrap the microbatch forward+backward in mx.compile (mlx backend)",
+    )
+    parser.add_argument(
+        "--mlx-prefetch",
+        dest="mlx_prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stage the next batch on a worker thread (mlx backend)",
+    )
+    parser.add_argument(
+        "--mlx-memory-gb",
+        dest="mlx_memory_gb",
+        type=float,
+        default=0.0,
+        help="Set the MLX Metal memory limit in GB (0 = leave default)",
+    )
+    parser.add_argument(
+        "--mlx-wired-gb",
+        dest="mlx_wired_gb",
+        type=float,
+        default=0.0,
+        help="Set the MLX Metal wired-memory limit in GB (0 = leave default)",
+    )
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
