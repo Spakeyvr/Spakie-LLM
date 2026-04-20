@@ -174,8 +174,6 @@ class AsyncCheckpointWriter:
 
     def submit(self, path: str, flat: dict[str, mx.array], meta: dict, meta_path: str) -> None:
         self.join()
-        if self._error is not None:
-            raise self._error
 
         def _work() -> None:
             try:
@@ -199,6 +197,9 @@ class AsyncCheckpointWriter:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+        if self._error is not None:
+            err, self._error = self._error, None
+            raise err
 
 
 def _build_checkpoint_payload(
@@ -472,6 +473,10 @@ def pretrain_mlx(
         while global_step < config.pretrain_max_steps and (
             target_tokens <= 0 or tokens_processed < target_tokens
         ):
+            # Ensure any in-flight async checkpoint write finishes before we
+            # issue new Metal ops — mx.save_safetensors on the writer thread
+            # races with the main-thread Metal scheduler otherwise (segfault).
+            ckpt_writer.join()
             accum_grads = None
             accum_loss = mx.array(0.0, dtype=mx.float32)
 
