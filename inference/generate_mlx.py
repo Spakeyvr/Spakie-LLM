@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import Counter
 
 import numpy as np
 import mlx.core as mx
@@ -64,7 +65,7 @@ def generate(
 ) -> list[int]:
     model.eval()
     generated: list[int] = []
-    seen: set[int] = set(prompt_ids)
+    token_counts: Counter[int] = Counter(prompt_ids)
     stop_tokens = {
         tokenizer.eos_id,
         tokenizer.user_id,
@@ -91,9 +92,10 @@ def generate(
         last = np.asarray(logits[0, -1, :].astype(mx.float32))
 
         if repetition_penalty != 1.0:
-            for tok in seen:
+            for tok, count in token_counts.items():
+                penalty = repetition_penalty ** count
                 v = last[tok]
-                last[tok] = v / repetition_penalty if v > 0 else v * repetition_penalty
+                last[tok] = v / penalty if v > 0 else v * penalty
 
         for tok in banned:
             last[tok] = -np.inf
@@ -103,7 +105,7 @@ def generate(
         if token in stop_tokens:
             break
         generated.append(token)
-        seen.add(token)
+        token_counts[token] += 1
 
         if cache_offset + 1 > model.config.max_seq_len:
             break
