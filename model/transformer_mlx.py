@@ -49,7 +49,7 @@ class CausalSelfAttentionMLX(nn.Module):
             # to the full cached k/v is inherently causal for decoding, so no mask.
             y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         else:
-            new_cache = None
+            new_cache = (k, v)
             y = mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=self.scale, mask="causal"
             )

@@ -13,7 +13,7 @@ from model.transformer_mlx import SpakieGPTMLX
 from tokenizer.train_tokenizer import SpakieTokenizer
 
 
-DEFAULT_SYSTEM = ""
+DEFAULT_SYSTEM = "Answer clearly and factually. Keep explanations simple, direct, and truthful."
 
 
 def _build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg: str) -> list[int]:

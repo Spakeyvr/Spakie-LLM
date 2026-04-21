@@ -14,15 +14,12 @@ import random
 import sys
 from collections import Counter
 
-import requests
 from datasets import load_dataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 
 
-ALPACA_URL = "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json"
-HEADERS = {"User-Agent": "SpakieLLM/1.0 (educational language model project)"}
 SYSTEM_PROMPT = "Answer clearly and factually. Keep explanations simple, direct, and truthful."
 
 
@@ -51,12 +48,9 @@ def take_rows(dataset, limit: int, seed: int):
 
 
 def download_alpaca(limit: int, seed: int) -> list[dict]:
-    print("Downloading Alpaca...")
-    resp = requests.get(ALPACA_URL, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
-    rows = resp.json()
-    random.Random(seed).shuffle(rows)
-
+    print("Loading Alpaca Clean...")
+    dataset = load_dataset("yahma/alpaca-cleaned", split="train")
+    rows = take_rows(dataset, limit, seed)
     examples = []
     for row in rows:
         instruction = trim(row.get("instruction", ""))
@@ -68,8 +62,6 @@ def download_alpaca(limit: int, seed: int) -> list[dict]:
         example = make_example(user_text, output)
         if example is not None:
             examples.append(example)
-        if limit > 0 and len(examples) >= limit:
-            break
     return examples
 
 
@@ -243,13 +235,13 @@ def main() -> None:
 
     source_builders = [
         ("alpaca", lambda limit: download_alpaca(limit, args.seed)),
-        ("dolly", lambda limit: load_dolly(limit, args.seed)),
-        ("squad", lambda limit: load_squad(limit, args.seed)),
-        ("sciq", lambda limit: load_sciq(limit, args.seed)),
-        ("boolq", lambda limit: load_boolq(limit, args.seed)),
-        ("arc_easy", lambda limit: load_arc("ARC-Easy", limit, args.seed, "Easy")),
-        ("arc_challenge", lambda limit: load_arc("ARC-Challenge", limit, args.seed, "Challenge")),
-        ("openbookqa", lambda limit: load_openbookqa(limit, args.seed)),
+        # ("dolly", lambda limit: load_dolly(limit, args.seed)),
+        # ("squad", lambda limit: load_squad(limit, args.seed)),
+        # ("sciq", lambda limit: load_sciq(limit, args.seed)),
+        # ("boolq", lambda limit: load_boolq(limit, args.seed)),
+        # ("arc_easy", lambda limit: load_arc("ARC-Easy", limit, args.seed, "Easy")),
+        # ("arc_challenge", lambda limit: load_arc("ARC-Challenge", limit, args.seed, "Challenge")),
+        # ("openbookqa", lambda limit: load_openbookqa(limit, args.seed)),
     ]
 
     all_examples = []
