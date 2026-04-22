@@ -21,6 +21,8 @@ pip install torch
 pip install -r requirements.txt
 ```
 
+MLX support in this repo targets Apple Silicon and is validated against `mlx>=0.31.1`.
+
 ## Runtime Selection
 
 All runtime entrypoints support backend-aware device and precision flags:
@@ -41,6 +43,12 @@ python3 scripts/chat.py --device auto --precision auto
 ```
 
 The scripts print the resolved device and precision at startup so you can confirm that Mac runs are using `mps` rather than silently falling back to CPU.
+
+For the MLX backend specifically, you can enable rolling timing buckets at existing report boundaries:
+```bash
+python3 scripts/train.py --backend mlx --mlx-profile
+python3 scripts/finetune.py --backend mlx --mlx-profile
+```
 
 ## Usage
 
@@ -91,6 +99,7 @@ python3 scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_cor
 ### 4. Pretrain
 ```bash
 python3 scripts/train.py --preset 180m --device auto --precision auto
+python3 scripts/train.py --backend mlx --preset 92m --precision auto --mlx-profile
 ```
 
 ### 5. Fine-tune (optional)
@@ -102,7 +111,18 @@ Add chat data to `data/chat/train.jsonl` in the format:
 Then run:
 ```bash
 python3 scripts/finetune.py --device auto --precision auto
+python3 scripts/finetune.py --backend mlx --precision auto --mlx-profile
 ```
+
+### 5b. Benchmark MLX training
+Use the benchmark harness to compare MLX step throughput without checkpoint writes:
+```bash
+python3 scripts/benchmark_mlx_training.py --task pretrain --preset 92m --steps 10 --precision auto
+python3 scripts/benchmark_mlx_training.py --task pretrain --preset 300m --steps 10 --real-data --precision auto
+python3 scripts/benchmark_mlx_training.py --task sft --preset 92m --steps 10 --synthetic --no-prefetch
+```
+
+If local training data is missing, the benchmark script falls back to synthetic batches automatically.
 
 ### 6. Chat
 ```bash

@@ -31,6 +31,8 @@ class CausalSelfAttentionMLX(nn.Module):
         self,
         x: mx.array,
         cache: tuple[mx.array, mx.array] | None = None,
+        *,
+        return_cache: bool = False,
     ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
         B, T, C = x.shape
         qkv = self.qkv(x)
@@ -44,12 +46,12 @@ class CausalSelfAttentionMLX(nn.Module):
             k_prev, v_prev = cache
             k = mx.concatenate([k_prev, k], axis=2)
             v = mx.concatenate([v_prev, v], axis=2)
-            new_cache = (k, v)
+            new_cache = (k, v) if return_cache else None
             # When using cache the incremental q has length T (usually 1). Attending
             # to the full cached k/v is inherently causal for decoding, so no mask.
             y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         else:
-            new_cache = (k, v)
+            new_cache = (k, v) if return_cache else None
             y = mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=self.scale, mask="causal"
             )
@@ -81,8 +83,10 @@ class TransformerBlockMLX(nn.Module):
         self,
         x: mx.array,
         cache: tuple[mx.array, mx.array] | None = None,
+        *,
+        return_cache: bool = False,
     ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
-        attn_out, new_cache = self.attn(self.ln1(x), cache=cache)
+        attn_out, new_cache = self.attn(self.ln1(x), cache=cache, return_cache=return_cache)
         x = x + attn_out
         x = x + self.mlp(self.ln2(x))
         return x, new_cache
@@ -96,6 +100,7 @@ class SpakieGPTMLX(nn.Module):
         self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = [TransformerBlockMLX(config) for _ in range(config.n_layers)]
+        self._checkpoint_blocks = [nn_utils.checkpoint(block) for block in self.blocks]
         self.ln_f = nn.LayerNorm(config.d_model, bias=config.bias)
 
         # lm_head shares weights with tok_emb — we don't allocate a separate matrix;
@@ -154,6 +159,7 @@ class SpakieGPTMLX(nn.Module):
         cache: list[tuple[mx.array, mx.array]] | None = None,
         *,
         cache_offset: int = 0,
+        return_cache: bool = False,
     ):
         B, T = idx.shape
         assert T + cache_offset <= self.config.max_seq_len, (
@@ -163,16 +169,17 @@ class SpakieGPTMLX(nn.Module):
         pos = mx.arange(cache_offset, cache_offset + T)
         x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
 
-        new_caches: list[tuple[mx.array, mx.array] | None] = []
+        use_cache = cache is not None
+        new_caches: list[tuple[mx.array, mx.array] | None] | None = [] if return_cache else None
         for i, block in enumerate(self.blocks):
-            block_cache = cache[i] if cache is not None else None
-            if self.training and self.config.activation_checkpointing and cache is None:
+            block_cache = cache[i] if use_cache else None
+            if self.training and self.config.activation_checkpointing and not use_cache and not return_cache:
                 # Activation checkpointing path — only used during training (no KV cache).
-                x = nn_utils.checkpoint(block)(x, None)[0]
-                new_caches.append(None)
+                x = self._checkpoint_blocks[i](x, None, return_cache=False)[0]
             else:
-                x, nc = block(x, cache=block_cache)
-                new_caches.append(nc)
+                x, nc = block(x, cache=block_cache, return_cache=return_cache)
+                if return_cache and new_caches is not None:
+                    new_caches.append(nc)
 
         x = self.ln_f(x)
         # Tied lm_head: project with tok_emb.weight^T.

@@ -5,8 +5,119 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from configs.default import checkpoint_search_dirs, get_preset_config, inherit_model_shape
+from configs.default import SUPPORTED_PRESETS, checkpoint_search_dirs, get_preset_config, inherit_model_shape
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
+
+
+_TORCH_EXTS = (".pt",)
+_MLX_EXTS = (".safetensors",)
+
+
+def list_available_checkpoints(checkpoint_dirs: list[str], backend: str) -> list[str]:
+    exts = _MLX_EXTS if backend == "mlx" else _TORCH_EXTS
+    checkpoint_paths: list[str] = []
+    seen_names = set()
+    for checkpoint_dir in checkpoint_dirs:
+        if not os.path.isdir(checkpoint_dir):
+            continue
+        for name in os.listdir(checkpoint_dir):
+            path = os.path.join(checkpoint_dir, name)
+            if name.endswith(exts) and os.path.isfile(path) and name not in seen_names:
+                checkpoint_paths.append(path)
+                seen_names.add(name)
+
+    preferred_names = (
+        "pretrain_best",
+        "pretrain_interrupt",
+        "sft_targeted_best",
+        "sft_targeted_interrupt",
+        "sft_mixed_best",
+        "sft_mixed_interrupt",
+        "sft_best",
+        "sft_interrupt",
+    )
+    preferred_order = {f"{name}{ext}": i for i, name in enumerate(preferred_names) for ext in exts}
+    checkpoint_paths.sort(
+        key=lambda path: (
+            preferred_order.get(os.path.basename(path), 99),
+            os.path.basename(path).lower(),
+            path.lower(),
+        )
+    )
+    return checkpoint_paths
+
+
+def list_available_models(backend: str, preset_name: str | None = None) -> list[tuple[str, str]]:
+    preset_names = [preset_name] if preset_name else list(SUPPORTED_PRESETS)
+    available_models: list[tuple[str, str]] = []
+    for current_preset in preset_names:
+        config = get_preset_config(current_preset)
+        checkpoint_dirs = checkpoint_search_dirs(config)
+        available_models.extend(
+            (current_preset, path)
+            for path in list_available_checkpoints(checkpoint_dirs, backend)
+        )
+    return available_models
+
+
+def resolve_source_checkpoint(
+    available_models: list[tuple[str, str]],
+    requested: str | None,
+    interactive: bool,
+    preset_name: str | None,
+    default_name: str,
+) -> tuple[str | None, str]:
+    candidate = requested or default_name
+    if os.path.isabs(candidate) or os.path.dirname(candidate):
+        if preset_name:
+            return preset_name, candidate
+        for discovered_preset, path in available_models:
+            if os.path.abspath(path) == os.path.abspath(candidate):
+                return discovered_preset, candidate
+        return None, candidate
+
+    alias_to_model = {
+        os.path.splitext(os.path.basename(path))[0].lower(): (discovered_preset, path)
+        for discovered_preset, path in available_models
+    }
+
+    if requested:
+        if candidate.lower() in alias_to_model:
+            return alias_to_model[candidate.lower()]
+        for discovered_preset, path in available_models:
+            if os.path.basename(path) == candidate:
+                return discovered_preset, path
+        if preset_name:
+            config = get_preset_config(preset_name)
+            for directory in checkpoint_search_dirs(config):
+                path = os.path.join(directory, candidate)
+                if os.path.exists(path):
+                    return preset_name, path
+        return None, candidate
+
+    if not available_models:
+        return preset_name, candidate
+
+    if interactive and len(available_models) > 1 and sys.stdin.isatty():
+        print("Available source models:")
+        for idx, (discovered_preset, path) in enumerate(available_models, start=1):
+            model_name = os.path.splitext(os.path.basename(path))[0]
+            print(f"  {idx}. [{discovered_preset}] {model_name}")
+
+        while True:
+            selection = input("Select source model [Enter for default 1]: ").strip()
+            if not selection:
+                return available_models[0]
+            if selection.isdigit():
+                index = int(selection) - 1
+                if 0 <= index < len(available_models):
+                    return available_models[index]
+            selected_model = alias_to_model.get(selection.lower())
+            if selected_model is not None:
+                return selected_model
+            print("Invalid selection. Enter a number or model name from the list above.")
+
+    return available_models[0]
 
 
 def resolve_named_checkpoint(config, requested: str | None, default_name: str) -> str:
@@ -128,7 +239,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
-    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch}")
+    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | Profile: {args.mlx_profile}")
     if applied_limits:
         human_limits = ", ".join(
             f"{k}={v / (1024 ** 3):.1f}GB" for k, v in applied_limits.items()
@@ -180,16 +291,21 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         interrupt_checkpoint_name=interrupt_name_for(output_name),
         use_compile=args.mlx_compile,
         use_prefetch=args.mlx_prefetch,
+        profile=args.mlx_profile,
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="CLI entry point for SFT fine-tuning")
-    parser.add_argument("--preset", type=str, default="92m", help="Model preset to use (92m or 180m)")
+    parser.add_argument("--preset", type=str, default=None, help="Model preset to use (default: infer from selected source checkpoint)")
     parser.add_argument("--backend", choices=("torch", "mlx"), default="mlx",
                         help="Training backend")
     parser.add_argument("--train-jsonl", type=str, default="", help="Path to SFT JSONL file")
     parser.add_argument("--source-checkpoint", type=str, default="", help="Checkpoint filename or path to fine-tune from")
+    parser.add_argument("--list-models", action="store_true",
+                        help="List available source checkpoints and exit")
+    parser.add_argument("--no-model-prompt", action="store_true",
+                        help="Skip the interactive source model picker and use the default checkpoint")
     parser.add_argument("--output-name", type=str, default="", help="Filename for the best SFT checkpoint")
     parser.add_argument("--smoke", action="store_true", help="Run a one-epoch subset smoke test")
     parser.add_argument("--max-examples", type=int, default=0, help="Optional cap on loaded SFT examples")
@@ -218,6 +334,12 @@ def main():
         help="Set the MLX Metal memory limit in GB (0 = leave default)",
     )
     parser.add_argument(
+        "--mlx-profile",
+        dest="mlx_profile",
+        action="store_true",
+        help="Collect rolling MLX timing buckets and print them at epoch boundaries",
+    )
+    parser.add_argument(
         "--mlx-wired-gb",
         dest="mlx_wired_gb",
         type=float,
@@ -226,7 +348,30 @@ def main():
     )
     args = parser.parse_args()
 
-    config = get_preset_config(args.preset)
+    available_models = list_available_models(args.backend, args.preset)
+    if args.list_models:
+        if not available_models:
+            print(f"Error: no {args.backend} checkpoint found. Train a model first.")
+            sys.exit(1)
+        print("Available source models:")
+        for idx, (preset_name, path) in enumerate(available_models, start=1):
+            print(f"{idx}. [{preset_name}] {os.path.splitext(os.path.basename(path))[0]}  ({path})")
+        sys.exit(0)
+
+    selected_preset, resolved_source_checkpoint = resolve_source_checkpoint(
+        available_models=available_models,
+        requested=args.source_checkpoint or None,
+        interactive=not args.no_model_prompt,
+        preset_name=args.preset,
+        default_name=_default_source_checkpoint_name(args.backend),
+    )
+    if selected_preset is None:
+        print(f"Error: pretrained checkpoint not found at {resolved_source_checkpoint}")
+        print(f"Run pretraining first: python scripts/train.py{' --backend mlx' if args.backend == 'mlx' else ''}")
+        sys.exit(1)
+
+    config = get_preset_config(selected_preset)
+    args.source_checkpoint = resolved_source_checkpoint
     output_checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_sft") if args.smoke else config.checkpoint_dir
     if args.smoke:
         config.sft_epochs = 1

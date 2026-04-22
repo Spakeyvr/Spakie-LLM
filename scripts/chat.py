@@ -5,12 +5,26 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from configs.default import checkpoint_search_dirs, get_preset_config, inherit_model_shape
+from configs.default import SUPPORTED_PRESETS, checkpoint_search_dirs, get_preset_config, inherit_model_shape
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 
 
 _TORCH_EXTS = (".pt",)
 _MLX_EXTS = (".safetensors",)
+
+
+def list_available_models(backend: str, preset_name: str | None = None) -> list[tuple[str, str]]:
+    """Return (preset, checkpoint_path) pairs for runnable models."""
+    preset_names = [preset_name] if preset_name else list(SUPPORTED_PRESETS)
+    available_models: list[tuple[str, str]] = []
+    for current_preset in preset_names:
+        config = get_preset_config(current_preset)
+        checkpoint_dirs = checkpoint_search_dirs(config)
+        available_models.extend(
+            (current_preset, path)
+            for path in list_available_checkpoints(checkpoint_dirs, backend)
+        )
+    return available_models
 
 
 def list_available_checkpoints(checkpoint_dirs: list[str], backend: str) -> list[str]:
@@ -49,61 +63,71 @@ def list_available_checkpoints(checkpoint_dirs: list[str], backend: str) -> list
 
 
 def resolve_checkpoint_path(
-    checkpoint_dirs: list[str],
+    available_models: list[tuple[str, str]],
     checkpoint_arg: str | None,
     model_arg: str | None,
     interactive: bool,
-    backend: str,
-) -> str | None:
+    preset_name: str | None,
+) -> tuple[str, str] | None:
     if checkpoint_arg:
         if os.path.isabs(checkpoint_arg) or os.path.dirname(checkpoint_arg):
-            return checkpoint_arg
-        for directory in checkpoint_dirs:
-            candidate = os.path.join(directory, checkpoint_arg)
-            if os.path.exists(candidate):
-                return candidate
-        return checkpoint_arg
+            if preset_name:
+                return preset_name, checkpoint_arg
+            for discovered_preset, path in available_models:
+                if os.path.abspath(path) == os.path.abspath(checkpoint_arg):
+                    return discovered_preset, checkpoint_arg
+            return None, checkpoint_arg
+        for discovered_preset, path in available_models:
+            if os.path.basename(path) == checkpoint_arg:
+                return discovered_preset, path
+        if preset_name:
+            config = get_preset_config(preset_name)
+            for directory in checkpoint_search_dirs(config):
+                candidate = os.path.join(directory, checkpoint_arg)
+                if os.path.exists(candidate):
+                    return preset_name, candidate
+        return None, checkpoint_arg
 
-    available_paths = list_available_checkpoints(checkpoint_dirs, backend)
-    if not available_paths:
+    if not available_models:
         return None
 
-    alias_to_path = {
-        os.path.splitext(os.path.basename(path))[0].lower(): path
-        for path in available_paths
+    alias_to_model = {
+        os.path.splitext(os.path.basename(path))[0].lower(): (discovered_preset, path)
+        for discovered_preset, path in available_models
     }
 
     if model_arg:
         requested = model_arg.lower()
         if requested.isdigit():
             index = int(requested) - 1
-            if 0 <= index < len(available_paths):
-                return available_paths[index]
-        if requested in alias_to_path:
-            return alias_to_path[requested]
+            if 0 <= index < len(available_models):
+                return available_models[index]
+        if requested in alias_to_model:
+            return alias_to_model[requested]
         raise ValueError(
             f"Unknown model '{model_arg}'. Use --list-models to see available choices."
         )
 
-    if interactive and len(available_paths) > 1 and sys.stdin.isatty():
+    if interactive and len(available_models) > 1 and sys.stdin.isatty():
         print("Available models:")
-        for idx, path in enumerate(available_paths, start=1):
-            print(f"  {idx}. {os.path.splitext(os.path.basename(path))[0]}")
+        for idx, (discovered_preset, path) in enumerate(available_models, start=1):
+            model_name = os.path.splitext(os.path.basename(path))[0]
+            print(f"  {idx}. [{discovered_preset}] {model_name}")
 
         while True:
             selection = input("Select model [Enter for default 1]: ").strip()
             if not selection:
-                return available_paths[0]
+                return available_models[0]
             if selection.isdigit():
                 index = int(selection) - 1
-                if 0 <= index < len(available_paths):
-                    return available_paths[index]
-            selected_path = alias_to_path.get(selection.lower())
-            if selected_path is not None:
-                return selected_path
+                if 0 <= index < len(available_models):
+                    return available_models[index]
+            selected_model = alias_to_model.get(selection.lower())
+            if selected_model is not None:
+                return selected_model
             print("Invalid selection. Enter a number or model name from the list above.")
 
-    return available_paths[0]
+    return available_models[0]
 
 
 def run_torch_chat(args, config, ckpt_path):
@@ -184,8 +208,8 @@ def run_mlx_chat(args, config, ckpt_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Spakie Chat")
-    parser.add_argument("--preset", type=str, default="92m",
-                        help="Model preset to use (92m or 180m)")
+    parser.add_argument("--preset", type=str, default=None,
+                        help="Model preset to use (default: search all presets with checkpoints)")
     parser.add_argument("--backend", choices=("torch", "mlx"), default="mlx",
                         help="Inference backend")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -208,34 +232,39 @@ def main():
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     args = parser.parse_args()
 
-    config = get_preset_config(args.preset)
-    checkpoint_dirs = checkpoint_search_dirs(config)
-    available_paths = list_available_checkpoints(checkpoint_dirs, args.backend)
-    print(f"Preset: {config.preset_name}")
+    available_models = list_available_models(args.backend, args.preset)
     if args.list_models:
-        if not available_paths:
+        if not available_models:
             print(f"Error: no {args.backend} checkpoint found. Train a model first.")
             sys.exit(1)
         print("Available models:")
-        for idx, path in enumerate(available_paths, start=1):
-            print(f"{idx}. {os.path.splitext(os.path.basename(path))[0]}  ({path})")
+        for idx, (preset_name, path) in enumerate(available_models, start=1):
+            print(f"{idx}. [{preset_name}] {os.path.splitext(os.path.basename(path))[0]}  ({path})")
         sys.exit(0)
 
     try:
-        ckpt_path = resolve_checkpoint_path(
-            checkpoint_dirs=checkpoint_dirs,
+        selected_model = resolve_checkpoint_path(
+            available_models=available_models,
             checkpoint_arg=args.checkpoint,
             model_arg=args.model,
             interactive=not args.no_model_prompt,
-            backend=args.backend,
+            preset_name=args.preset,
         )
     except ValueError as exc:
         print(f"Error: {exc}")
         sys.exit(1)
 
-    if ckpt_path is None:
+    if selected_model is None:
         print(f"Error: no {args.backend} checkpoint found. Train a model first.")
         sys.exit(1)
+
+    selected_preset, ckpt_path = selected_model
+    if selected_preset is None:
+        print("Error: could not determine the preset for the selected checkpoint. Pass --preset explicitly.")
+        sys.exit(1)
+
+    config = get_preset_config(selected_preset)
+    print(f"Preset: {config.preset_name}")
 
     if args.backend == "mlx":
         run_mlx_chat(args, config, ckpt_path)

@@ -131,7 +131,7 @@ def run_mlx_pretrain(args, config):
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
     print(f"Max steps: {config.pretrain_max_steps:,}")
-    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch}")
+    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | Profile: {args.mlx_profile}")
     if applied_limits:
         human_limits = ", ".join(
             f"{k}={v / (1024 ** 3):.1f}GB" for k, v in applied_limits.items()
@@ -172,6 +172,7 @@ def run_mlx_pretrain(args, config):
         resume_state=resume_state,
         use_compile=args.mlx_compile,
         use_prefetch=args.mlx_prefetch,
+        profile=args.mlx_profile,
     )
 
 
@@ -215,6 +216,12 @@ def main():
         type=float,
         default=0.0,
         help="Set the MLX Metal memory limit in GB (0 = leave default)",
+    )
+    parser.add_argument(
+        "--mlx-profile",
+        dest="mlx_profile",
+        action="store_true",
+        help="Collect rolling MLX timing buckets and print them at eval boundaries",
     )
     parser.add_argument(
         "--mlx-wired-gb",

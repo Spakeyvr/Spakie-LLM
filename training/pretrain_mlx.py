@@ -34,6 +34,7 @@ from training.dataset_mlx import (
     ResumableBatchSamplerMLX,
     stack_batch,
 )
+from training.mlx_profile import MLXProfile, now
 from training.prefetch_mlx import BatchPrefetcher
 
 
@@ -104,7 +105,7 @@ def _build_loss_and_grad(model: SpakieGPTMLX, accum_scale: float):
     graph small.
     """
     def loss_fn(model, x, y):
-        _, loss, _ = model(x, y)
+        _, loss, _ = model(x, y, return_cache=False)
         return loss * accum_scale
 
     return nn.value_and_grad(model, loss_fn)
@@ -139,6 +140,21 @@ def _accum_grads(acc, new):
     if acc is None:
         return new
     return tree_map(operator.add, acc, new)
+
+
+def _arrays_to_mx(
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    profiler: MLXProfile,
+) -> tuple[mx.array, mx.array]:
+    if not profiler.enabled:
+        return mx.array(x_np), mx.array(y_np)
+    start = now()
+    x = mx.array(x_np)
+    y = mx.array(y_np)
+    mx.eval(x, y)
+    profiler.add("numpy_to_mlx", now() - start)
+    return x, y
 
 
 def _capture_rng() -> dict:
@@ -374,7 +390,7 @@ def evaluate(
             x_np, y_np = stack_batch(val_dataset, batch_indices)
             x = mx.array(x_np)
             y = mx.array(y_np)
-            _, loss, _ = model(x, y)
+            _, loss, _ = model(x, y, return_cache=False)
             mx.eval(loss)
             total += float(loss.item())
             count += 1
@@ -395,6 +411,7 @@ def pretrain_mlx(
     *,
     use_compile: bool = True,
     use_prefetch: bool = True,
+    profile: bool = False,
 ) -> float:
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)
@@ -436,6 +453,8 @@ def pretrain_mlx(
     microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
 
     ckpt_writer = AsyncCheckpointWriter()
+    profiler = MLXProfile(enabled=profile)
+    window_steps = 0
 
     start_time = time.time() - elapsed_before_resume
     pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain[mlx]", initial=global_step)
@@ -476,17 +495,30 @@ def pretrain_mlx(
             # Ensure any in-flight async checkpoint write finishes before we
             # issue new Metal ops — mx.save_safetensors on the writer thread
             # races with the main-thread Metal scheduler otherwise (segfault).
-            ckpt_writer.join()
+            if profiler.enabled:
+                checkpoint_start = now()
+                ckpt_writer.join()
+                profiler.add("checkpoint", now() - checkpoint_start)
+            else:
+                ckpt_writer.join()
             accum_grads = None
             accum_loss = mx.array(0.0, dtype=mx.float32)
 
             for _ in range(config.pretrain_grad_accum_steps):
-                x_np, y_np = next_batch()
-                x = mx.array(x_np)
-                y = mx.array(y_np)
+                if profiler.enabled:
+                    batch_start = now()
+                    x_np, y_np = next_batch()
+                    profiler.add("batch_fetch", now() - batch_start)
+                else:
+                    x_np, y_np = next_batch()
+                x, y = _arrays_to_mx(x_np, y_np, profiler)
 
                 # Loss-fn has accum_scale baked in, so grads and loss are pre-scaled.
-                loss, grads = microbatch_step(x, y)
+                if profiler.enabled:
+                    step_start = now()
+                    loss, grads = microbatch_step(x, y)
+                else:
+                    loss, grads = microbatch_step(x, y)
                 accum_grads = _accum_grads(accum_grads, grads)
                 accum_loss = accum_loss + loss.astype(mx.float32)
                 # Materialize per microbatch: without this, the lazy graph grows
@@ -494,46 +526,81 @@ def pretrain_mlx(
                 # overhead dominates — that's the MLX equivalent of forgetting
                 # to call .backward() on each microbatch.
                 mx.eval(accum_grads, accum_loss)
+                if profiler.enabled:
+                    profiler.add("forward_backward", now() - step_start)
                 tokens_processed += x.size
 
-            clipped_grads, _ = clip_grads(accum_grads, config.pretrain_grad_clip)
+            if profiler.enabled:
+                opt_start = now()
+                clipped_grads, _ = clip_grads(accum_grads, config.pretrain_grad_clip)
+            else:
+                clipped_grads, _ = clip_grads(accum_grads, config.pretrain_grad_clip)
 
             lr = get_lr(global_step, config)
             optimizer.set_lr(lr)
             optimizer.update(model, clipped_grads)
 
-            mx.eval(model.parameters(), optimizer.decay.state, optimizer.nodecay.state, accum_loss)
-            accum_loss_val = float(accum_loss.item())
+            mx.eval(model.parameters(), optimizer.decay.state, optimizer.nodecay.state)
+            accum_loss_val = None
+            if profiler.enabled:
+                profiler.add("opt_step", now() - opt_start)
 
             global_step += 1
+            window_steps += 1
             pbar.update(1)
 
             if stop_requested:
                 interrupted = True
                 interrupt_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.safetensors")
-                save_training_checkpoint_mlx(
-                    interrupt_path,
-                    model=model,
-                    optimizer=optimizer,
-                    config=config,
-                    global_step=global_step,
-                    tokens_processed=tokens_processed,
-                    best_val_loss=best_val_loss,
-                    val_loss=last_val_loss,
-                    elapsed_time=time.time() - start_time,
-                    train_sampler=train_sampler,
-                    writer=ckpt_writer,
-                    sync=True,
-                )
+                if profiler.enabled:
+                    checkpoint_start = now()
+                    save_training_checkpoint_mlx(
+                        interrupt_path,
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        global_step=global_step,
+                        tokens_processed=tokens_processed,
+                        best_val_loss=best_val_loss,
+                        val_loss=last_val_loss,
+                        elapsed_time=time.time() - start_time,
+                        train_sampler=train_sampler,
+                        writer=ckpt_writer,
+                        sync=True,
+                    )
+                    profiler.add("checkpoint", now() - checkpoint_start)
+                else:
+                    save_training_checkpoint_mlx(
+                        interrupt_path,
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        global_step=global_step,
+                        tokens_processed=tokens_processed,
+                        best_val_loss=best_val_loss,
+                        val_loss=last_val_loss,
+                        elapsed_time=time.time() - start_time,
+                        train_sampler=train_sampler,
+                        writer=ckpt_writer,
+                        sync=True,
+                    )
                 pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
                 break
 
             if global_step % config.pretrain_eval_interval == 0:
-                val_loss = evaluate(model, val_dataset, val_sampler, config)
+                if profiler.enabled:
+                    eval_start = now()
+                    val_loss = evaluate(model, val_dataset, val_sampler, config)
+                    profiler.add("eval", now() - eval_start)
+                else:
+                    val_loss = evaluate(model, val_dataset, val_sampler, config)
+                mx.eval(accum_loss)
+                accum_loss_val = float(accum_loss.item())
                 last_val_loss = val_loss
                 elapsed = time.time() - start_time
                 tok_per_sec = tokens_processed / elapsed if elapsed > 0 else 0.0
                 token_progress = ""
+                should_stop = False
                 if target_tokens > 0:
                     progress_pct = min(tokens_processed / target_tokens * 100.0, 100.0)
                     token_progress = (
@@ -548,50 +615,100 @@ def pretrain_mlx(
                     best_val_loss = val_loss
                     patience_counter = 0
                     ckpt_path = os.path.join(config.checkpoint_dir, "pretrain_best.safetensors")
-                    save_training_checkpoint_mlx(
-                        ckpt_path,
-                        model=model,
-                        optimizer=optimizer,
-                        config=config,
-                        global_step=global_step,
-                        tokens_processed=tokens_processed,
-                        best_val_loss=best_val_loss,
-                        val_loss=val_loss,
-                        elapsed_time=elapsed,
-                        train_sampler=train_sampler,
-                        writer=ckpt_writer,
-                    )
+                    if profiler.enabled:
+                        checkpoint_start = now()
+                        save_training_checkpoint_mlx(
+                            ckpt_path,
+                            model=model,
+                            optimizer=optimizer,
+                            config=config,
+                            global_step=global_step,
+                            tokens_processed=tokens_processed,
+                            best_val_loss=best_val_loss,
+                            val_loss=val_loss,
+                            elapsed_time=elapsed,
+                            train_sampler=train_sampler,
+                            writer=ckpt_writer,
+                        )
+                        profiler.add("checkpoint", now() - checkpoint_start)
+                    else:
+                        save_training_checkpoint_mlx(
+                            ckpt_path,
+                            model=model,
+                            optimizer=optimizer,
+                            config=config,
+                            global_step=global_step,
+                            tokens_processed=tokens_processed,
+                            best_val_loss=best_val_loss,
+                            val_loss=val_loss,
+                            elapsed_time=elapsed,
+                            train_sampler=train_sampler,
+                            writer=ckpt_writer,
+                        )
                     pbar.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
                 elif config.should_use_pretrain_early_stopping():
                     patience_counter += 1
                     if patience_counter >= config.pretrain_patience:
                         pbar.write(f"Early stopping at step {global_step}")
-                        break
+                        should_stop = True
+                if profiler.enabled:
+                    pbar.write(
+                        profiler.format_report(
+                            window_label=f"last {window_steps} optimizer steps"
+                        )
+                    )
+                    profiler.reset()
+                    window_steps = 0
+                if should_stop:
+                    break
 
     except KeyboardInterrupt:
         interrupted = True
         interrupt_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.safetensors")
-        save_training_checkpoint_mlx(
-            interrupt_path,
-            model=model,
-            optimizer=optimizer,
-            config=config,
-            global_step=global_step,
-            tokens_processed=tokens_processed,
-            best_val_loss=best_val_loss,
-            val_loss=last_val_loss,
-            elapsed_time=time.time() - start_time,
-            train_sampler=train_sampler,
-            writer=ckpt_writer,
-            sync=True,
-        )
+        if profiler.enabled:
+            checkpoint_start = now()
+            save_training_checkpoint_mlx(
+                interrupt_path,
+                model=model,
+                optimizer=optimizer,
+                config=config,
+                global_step=global_step,
+                tokens_processed=tokens_processed,
+                best_val_loss=best_val_loss,
+                val_loss=last_val_loss,
+                elapsed_time=time.time() - start_time,
+                train_sampler=train_sampler,
+                writer=ckpt_writer,
+                sync=True,
+            )
+            profiler.add("checkpoint", now() - checkpoint_start)
+        else:
+            save_training_checkpoint_mlx(
+                interrupt_path,
+                model=model,
+                optimizer=optimizer,
+                config=config,
+                global_step=global_step,
+                tokens_processed=tokens_processed,
+                best_val_loss=best_val_loss,
+                val_loss=last_val_loss,
+                elapsed_time=time.time() - start_time,
+                train_sampler=train_sampler,
+                writer=ckpt_writer,
+                sync=True,
+            )
         pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
         pbar.close()
         if prefetcher is not None:
             prefetcher.close()
-        ckpt_writer.join()
+        if profiler.enabled:
+            checkpoint_start = now()
+            ckpt_writer.join()
+            profiler.add("checkpoint", now() - checkpoint_start)
+        else:
+            ckpt_writer.join()
 
     if interrupted:
         print(

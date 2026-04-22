@@ -21,7 +21,8 @@ from runtime.mlx_backend import (
     save_meta_json,
 )
 from training.dataset_mlx import ResumableBatchSamplerMLX, stack_batch
-from training.pretrain_mlx import DualAdamW, _accum_grads, _build_microbatch_step
+from training.mlx_profile import MLXProfile, now
+from training.pretrain_mlx import DualAdamW, _accum_grads, _arrays_to_mx, _build_microbatch_step
 from training.prefetch_mlx import BatchPrefetcher
 
 
@@ -43,6 +44,7 @@ def finetune_mlx(
     *,
     use_compile: bool = True,
     use_prefetch: bool = True,
+    profile: bool = False,
 ) -> float:
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)
@@ -70,6 +72,7 @@ def finetune_mlx(
     interrupted = False
     accum_scale = 1.0 / config.sft_grad_accum_steps
     microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
+    profiler = MLXProfile(enabled=profile)
 
     try:
         for epoch in range(config.sft_epochs):
@@ -101,22 +104,36 @@ def finetune_mlx(
 
             try:
                 for _ in pbar:
-                    x_np, y_np = next_batch()
-                    x = mx.array(x_np)
-                    y = mx.array(y_np)
+                    if profiler.enabled:
+                        batch_start = now()
+                        x_np, y_np = next_batch()
+                        profiler.add("batch_fetch", now() - batch_start)
+                    else:
+                        x_np, y_np = next_batch()
+                    x, y = _arrays_to_mx(x_np, y_np, profiler)
 
                     # Loss-fn has accum_scale baked in.
-                    loss, grads = microbatch_step(x, y)
+                    if profiler.enabled:
+                        step_start = now()
+                        loss, grads = microbatch_step(x, y)
+                    else:
+                        loss, grads = microbatch_step(x, y)
                     accum_grads = _accum_grads(accum_grads, grads)
                     # Flush lazy graph per microbatch (prevents unbounded trace growth).
                     mx.eval(accum_grads)
+                    if profiler.enabled:
+                        profiler.add("forward_backward", now() - step_start)
                     # loss is pre-scaled by accum_scale; recover unscaled for display.
                     epoch_loss += float(loss.item()) * config.sft_grad_accum_steps
                     n_micro += 1
                     micro_in_step += 1
 
                     if micro_in_step == config.sft_grad_accum_steps:
-                        clipped, _ = clip_grads(accum_grads, config.sft_grad_clip)
+                        if profiler.enabled:
+                            opt_start = now()
+                            clipped, _ = clip_grads(accum_grads, config.sft_grad_clip)
+                        else:
+                            clipped, _ = clip_grads(accum_grads, config.sft_grad_clip)
 
                         progress = global_step / max(total_steps, 1)
                         lr = config.sft_lr * 0.1 + 0.5 * config.sft_lr * 0.9 * (
@@ -125,6 +142,8 @@ def finetune_mlx(
                         optimizer.set_lr(lr)
                         optimizer.update(model, clipped)
                         mx.eval(model.parameters(), optimizer.decay.state, optimizer.nodecay.state)
+                        if profiler.enabled:
+                            profiler.add("opt_step", now() - opt_start)
 
                         accum_grads = None
                         micro_in_step = 0
@@ -137,24 +156,46 @@ def finetune_mlx(
                 pbar.close()
 
             # Validation
-            model.eval()
-            val_loss = 0.0
-            val_count = 0
-            val_iter = iter(val_sampler)
-            for _ in range(max(1, len(val_dataset) // config.sft_batch_size)):
-                try:
-                    batch_indices = next(val_iter)
-                except StopIteration:
-                    break
-                x_np, y_np = stack_batch(val_dataset, batch_indices)
-                x = mx.array(x_np)
-                y = mx.array(y_np)
-                _, loss, _ = model(x, y)
-                mx.eval(loss)
-                val_loss += float(loss.item())
-                val_count += 1
-            val_loss = val_loss / max(val_count, 1)
-            model.train()
+            if profiler.enabled:
+                eval_start = now()
+                model.eval()
+                val_loss = 0.0
+                val_count = 0
+                val_iter = iter(val_sampler)
+                for _ in range(max(1, len(val_dataset) // config.sft_batch_size)):
+                    try:
+                        batch_indices = next(val_iter)
+                    except StopIteration:
+                        break
+                    x_np, y_np = stack_batch(val_dataset, batch_indices)
+                    x = mx.array(x_np)
+                    y = mx.array(y_np)
+                    _, loss, _ = model(x, y, return_cache=False)
+                    mx.eval(loss)
+                    val_loss += float(loss.item())
+                    val_count += 1
+                val_loss = val_loss / max(val_count, 1)
+                model.train()
+                profiler.add("eval", now() - eval_start)
+            else:
+                model.eval()
+                val_loss = 0.0
+                val_count = 0
+                val_iter = iter(val_sampler)
+                for _ in range(max(1, len(val_dataset) // config.sft_batch_size)):
+                    try:
+                        batch_indices = next(val_iter)
+                    except StopIteration:
+                        break
+                    x_np, y_np = stack_batch(val_dataset, batch_indices)
+                    x = mx.array(x_np)
+                    y = mx.array(y_np)
+                    _, loss, _ = model(x, y, return_cache=False)
+                    mx.eval(loss)
+                    val_loss += float(loss.item())
+                    val_count += 1
+                val_loss = val_loss / max(val_count, 1)
+                model.train()
 
             print(
                 f"Epoch {epoch + 1} | train_loss {epoch_loss / max(n_micro, 1):.4f} | "
@@ -165,29 +206,57 @@ def finetune_mlx(
                 best_val_loss = val_loss
                 patience_counter = 0
                 ckpt_path = os.path.join(config.checkpoint_dir, best_checkpoint_name)
-                _save_sft_checkpoint(
-                    ckpt_path,
-                    model,
-                    meta={
-                        "epoch": epoch + 1,
-                        "val_loss": val_loss,
-                        "preset_name": config.preset_name,
-                    },
-                )
+                if profiler.enabled:
+                    checkpoint_start = now()
+                    _save_sft_checkpoint(
+                        ckpt_path,
+                        model,
+                        meta={
+                            "epoch": epoch + 1,
+                            "val_loss": val_loss,
+                            "preset_name": config.preset_name,
+                        },
+                    )
+                    profiler.add("checkpoint", now() - checkpoint_start)
+                else:
+                    _save_sft_checkpoint(
+                        ckpt_path,
+                        model,
+                        meta={
+                            "epoch": epoch + 1,
+                            "val_loss": val_loss,
+                            "preset_name": config.preset_name,
+                        },
+                    )
                 print(f"  -> saved best SFT checkpoint (val_loss={val_loss:.4f})")
             else:
                 patience_counter += 1
                 if patience_counter >= config.sft_patience:
                     print(f"Early stopping at epoch {epoch + 1}")
+                    if profiler.enabled:
+                        print(profiler.format_report(window_label=f"epoch {epoch + 1}"))
+                        profiler.reset()
                     break
+            if profiler.enabled:
+                print(profiler.format_report(window_label=f"epoch {epoch + 1}"))
+                profiler.reset()
     except KeyboardInterrupt:
         interrupted = True
         interrupt_path = os.path.join(config.checkpoint_dir, interrupt_checkpoint_name)
-        _save_sft_checkpoint(
-            interrupt_path,
-            model,
-            meta={"step": global_step, "best_val_loss": best_val_loss, "preset_name": config.preset_name},
-        )
+        if profiler.enabled:
+            checkpoint_start = now()
+            _save_sft_checkpoint(
+                interrupt_path,
+                model,
+                meta={"step": global_step, "best_val_loss": best_val_loss, "preset_name": config.preset_name},
+            )
+            profiler.add("checkpoint", now() - checkpoint_start)
+        else:
+            _save_sft_checkpoint(
+                interrupt_path,
+                model,
+                meta={"step": global_step, "best_val_loss": best_val_loss, "preset_name": config.preset_name},
+            )
         print(f"\nInterrupted during fine-tuning. Saved checkpoint to {interrupt_path}")
 
     if interrupted:

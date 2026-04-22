@@ -83,7 +83,7 @@ def generate(
     # Warm the KV cache with the prompt (truncated to max_seq_len).
     truncated = prompt_ids[-model.config.max_seq_len :]
     idx = mx.array([truncated], dtype=mx.int32)
-    logits, _, cache = model(idx, cache=None, cache_offset=0)
+    logits, _, cache = model(idx, cache=None, cache_offset=0, return_cache=True)
     mx.eval(logits)
     cache_offset = idx.shape[1]
 
@@ -111,7 +111,7 @@ def generate(
             break
 
         idx = mx.array([[token]], dtype=mx.int32)
-        logits, _, cache = model(idx, cache=cache, cache_offset=cache_offset)
+        logits, _, cache = model(idx, cache=cache, cache_offset=cache_offset, return_cache=True)
         cache_offset += 1
 
     return generated
