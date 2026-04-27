@@ -69,6 +69,28 @@ HF_DATASETS: dict[str, dict] = {
         "license": "Research dataset",
         "kind": "web",
     },
+    "fineweb_sample": {
+        "variants": [
+            {"path": "HuggingFaceFW/fineweb", "name": "sample-10BT", "split": "train"},
+        ],
+        "text_fields": ("text",),
+        "id_fields": ("id", "url"),
+        "url_fields": ("url",),
+        "title_fields": ("title",),
+        "license": "ODC-By 1.0 / Common Crawl terms",
+        "kind": "web",
+    },
+    "c4_en": {
+        "variants": [
+            {"path": "allenai/c4", "name": "en", "split": "train"},
+        ],
+        "text_fields": ("text",),
+        "id_fields": ("url",),
+        "url_fields": ("url",),
+        "title_fields": ("title",),
+        "license": "ODC-By 1.0 / Common Crawl terms",
+        "kind": "web",
+    },
     "wikipedia_snapshot": {
         "variants": [
             {"path": "wikimedia/wikipedia", "name": "20231101.en", "split": "train"},
@@ -80,6 +102,28 @@ HF_DATASETS: dict[str, dict] = {
         "title_fields": ("title",),
         "license": "CC BY-SA 4.0",
         "kind": "reference",
+    },
+    "openwebmath": {
+        "variants": [
+            {"path": "open-web-math/open-web-math", "name": None, "split": "train"},
+        ],
+        "text_fields": ("text",),
+        "id_fields": ("url",),
+        "url_fields": ("url",),
+        "title_fields": ("title",),
+        "license": "ODC-By 1.0 / Common Crawl terms",
+        "kind": "technical",
+    },
+    "cosmopedia_v2": {
+        "variants": [
+            {"path": "HuggingFaceTB/smollm-corpus", "name": "cosmopedia-v2", "split": "train"},
+        ],
+        "text_fields": ("text",),
+        "id_fields": ("prompt",),
+        "url_fields": (),
+        "title_fields": ("format", "audience"),
+        "license": "ODC-By",
+        "kind": "synthetic_education",
     },
 }
 

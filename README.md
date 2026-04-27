@@ -65,11 +65,12 @@ python3 scripts/scrape_open_corpus.py
 For the larger 2B-token pipeline, download resumable JSONL shards into `data/raw/large_corpus/`:
 ```bash
 python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
-python3 scripts/download_pretrain_corpus.py --sources fineweb-edu,refinedweb,wikipedia_snapshot,stackexchange,arxiv,gutenberg --target_tokens_estimate 2105263158 --resume --english_only
+python3 scripts/download_pretrain_corpus.py --sources fineweb-edu,refinedweb,fineweb,c4,wikipedia_snapshot,stackexchange,open-web-math,arxiv,gutenberg,cosmopedia-v2 --target_tokens_estimate 2105263158 --resume --english_only
 ```
 
 The downloader writes per-source progress and shard manifests so interrupted runs can continue safely.
 `dolma` support remains in the script, but it is not part of the default `all` set because current Hugging Face `datasets` rejects its legacy script loader.
+The default source plan now includes supplemental streamable corpora (`fineweb`, `c4`, `open-web-math`, and `cosmopedia-v2`) so a 300m-preset corpus can reach the processed-token target without depending only on slower APIs such as Stack Exchange and arXiv.
 
 ### 2. Train tokenizer
 ```bash

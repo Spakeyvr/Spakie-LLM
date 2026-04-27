@@ -8,6 +8,13 @@ DEFAULT_PRESET = "300m"
 SUPPORTED_PRESETS = ("92m", "180m", "300m")
 DEFAULT_TARGET_TRAIN_TOKENS = 2_000_000_000
 CORPUS_SOURCE_ALIASES = {
+    "c4": "c4_en",
+    "cosmopedia": "cosmopedia_v2",
+    "cosmopedia-v2": "cosmopedia_v2",
+    "fineweb": "fineweb_sample",
+    "fineweb-sample": "fineweb_sample",
+    "open-web-math": "openwebmath",
+    "open_web_math": "openwebmath",
     "wikipedia": "wikipedia_snapshot",
 }
 
@@ -32,6 +39,18 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
             "target_raw_chars": 1_200_000_000,
             "enabled": True,
         },
+        "fineweb_sample": {
+            "kind": "web",
+            "target_tokens": 300_000_000,
+            "target_raw_chars": 1_200_000_000,
+            "enabled": True,
+        },
+        "c4_en": {
+            "kind": "web",
+            "target_tokens": 250_000_000,
+            "target_raw_chars": 1_000_000_000,
+            "enabled": True,
+        },
         "gutenberg": {
             "kind": "books",
             "target_tokens": 200_000_000,
@@ -50,10 +69,22 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
             "target_raw_chars": 800_000_000,
             "enabled": True,
         },
+        "openwebmath": {
+            "kind": "technical",
+            "target_tokens": 175_000_000,
+            "target_raw_chars": 700_000_000,
+            "enabled": True,
+        },
         "arxiv": {
             "kind": "technical",
             "target_tokens": 55_263_158,
             "target_raw_chars": 221_052_632,
+            "enabled": True,
+        },
+        "cosmopedia_v2": {
+            "kind": "synthetic_education",
+            "target_tokens": 250_000_000,
+            "target_raw_chars": 1_000_000_000,
             "enabled": True,
         },
     }
@@ -143,6 +174,7 @@ class SpakieConfig:
         "wikipedia": 200,
         "arxiv": 220,
         "stackexchange": 180,
+        "openwebmath": 180,
         "open_corpus": 180,
         "dictionary": 80,
     })
@@ -247,7 +279,12 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
     preset = normalize_preset_name(preset_name)
     config = SpakieConfig(preset_name=preset)
 
-    if preset == "180m":
+    if preset == "92m":
+        config.pretrain_batch_size = 64
+        config.pretrain_grad_accum_steps = 1
+        config.refresh_derived_fields()
+
+    elif preset == "180m":
         config.n_layers = 16
         config.d_model = 896
         config.n_heads = 14
