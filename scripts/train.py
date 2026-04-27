@@ -151,6 +151,12 @@ def run_mlx_pretrain(args, config):
         from training.pretrain_mlx import _json_restore
         sampler_state = dict(sampler_state)
         sampler_state["rng_state"] = _json_restore(sampler_state["rng_state"])
+        if sampler_state.get("resume_exact") is False:
+            print(
+                "Sampler indices were omitted from the checkpoint because the "
+                "dataset is too large for one MLX array; resuming with a fresh "
+                "deterministic shuffle."
+            )
         train_sampler = ResumableBatchSamplerMLX.from_state_dict(sampler_state)
     else:
         train_sampler = ResumableBatchSamplerMLX(

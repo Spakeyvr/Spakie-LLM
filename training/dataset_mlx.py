@@ -116,7 +116,7 @@ class ResumableBatchSamplerMLX:
         drop_last: bool = True,
         seed: int = 0,
         rng_state: dict | None = None,
-        indices: list[int] | None = None,
+        indices: list[int] | np.ndarray | None = None,
         position: int = 0,
     ):
         self.dataset_size = dataset_size
@@ -125,13 +125,15 @@ class ResumableBatchSamplerMLX:
         self.rng = np.random.default_rng(seed)
         if rng_state is not None:
             self.rng.bit_generator.state = rng_state
-        self.indices = list(indices) if indices is not None else []
+        self.indices = (
+            np.asarray(indices, dtype=np.int64) if indices is not None else np.empty(0, dtype=np.int64)
+        )
         self.position = position
-        if not self.indices:
+        if self.indices.size == 0:
             self._refresh_indices()
 
     def _refresh_indices(self) -> None:
-        self.indices = self.rng.permutation(self.dataset_size).tolist()
+        self.indices = self.rng.permutation(self.dataset_size).astype(np.int64, copy=False)
         self.position = 0
 
     def __iter__(self):
@@ -150,10 +152,10 @@ class ResumableBatchSamplerMLX:
             self.position = next_position
             yield batch
 
-    def state_dict(self) -> dict:
+    def state_dict(self, *, copy_indices: bool = True) -> dict:
         return {
             "rng_state": self.rng.bit_generator.state,
-            "indices": self.indices,
+            "indices": self.indices.copy() if copy_indices else self.indices,
             "position": self.position,
             "dataset_size": self.dataset_size,
             "batch_size": self.batch_size,
@@ -172,7 +174,7 @@ class ResumableBatchSamplerMLX:
         )
 
 
-def stack_batch(dataset, indices: list[int]) -> tuple[np.ndarray, np.ndarray]:
+def stack_batch(dataset, indices: list[int] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     xs = []
     ys = []
     for idx in indices:

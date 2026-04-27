@@ -244,7 +244,23 @@ def _build_checkpoint_payload(
         if isinstance(v, mx.array):
             flat[f"optimizer.nodecay.{k}"] = v
 
-    sampler_state = train_sampler.state_dict()
+    sampler_state = train_sampler.state_dict(copy_indices=False)
+    # Keep the large permutation out of JSON; dumping millions of ints as text
+    # makes Ctrl+C checkpointing look like it is hanging after the final step.
+    #
+    # MLX array dimensions are int-limited, so multi-billion-sequence corpora
+    # cannot store the sampler permutation as one tensor. In that case the
+    # checkpoint remains resumable, but the sampler restarts with a new
+    # deterministic shuffle instead of an exact in-epoch position.
+    sampler_indices = np.asarray(sampler_state["indices"], dtype=np.int64)
+    sampler_indices_format = "safetensors:sampler.indices"
+    sampler_resume_exact = True
+    max_mlx_dim = np.iinfo(np.int32).max
+    if sampler_indices.size <= max_mlx_dim:
+        flat["sampler.indices"] = mx.array(sampler_indices)
+    else:
+        sampler_indices_format = "omitted:too_large_for_mlx_array"
+        sampler_resume_exact = False
     rng_snapshot = _capture_rng()
     meta = {
         "step": global_step,
@@ -258,11 +274,12 @@ def _build_checkpoint_payload(
         },
         "sampler": {
             "rng_state": _json_safe(sampler_state["rng_state"]),
-            "indices": sampler_state["indices"],
             "position": sampler_state["position"],
             "dataset_size": sampler_state["dataset_size"],
             "batch_size": sampler_state["batch_size"],
             "drop_last": sampler_state["drop_last"],
+            "indices_format": sampler_indices_format,
+            "resume_exact": sampler_resume_exact,
         },
         "preset_name": config.preset_name,
     }
@@ -352,6 +369,7 @@ def load_training_checkpoint_mlx(base_path: str) -> dict:
     model_flat: dict[str, mx.array] = {}
     opt_decay_flat: dict[str, mx.array] = {}
     opt_nodecay_flat: dict[str, mx.array] = {}
+    sampler_indices = None
     for key, arr in flat.items():
         if key.startswith("model."):
             model_flat[key[len("model.") :]] = arr
@@ -359,6 +377,13 @@ def load_training_checkpoint_mlx(base_path: str) -> dict:
             opt_decay_flat[key[len("optimizer.decay.") :]] = arr
         elif key.startswith("optimizer.nodecay."):
             opt_nodecay_flat[key[len("optimizer.nodecay.") :]] = arr
+        elif key == "sampler.indices":
+            sampler_indices = np.asarray(arr, dtype=np.int64)
+
+    # New checkpoints store sampler indices in safetensors. Older checkpoints
+    # still have them in meta["sampler"]["indices"], which remains supported.
+    if sampler_indices is not None:
+        meta.setdefault("sampler", {})["indices"] = sampler_indices
 
     return {
         "model": tree_unflatten(list(model_flat.items())),
