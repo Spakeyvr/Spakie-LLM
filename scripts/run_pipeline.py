@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import os
 import re
 import signal
@@ -19,6 +20,15 @@ from configs.default import SUPPORTED_PRESETS, get_preset_config
 
 
 BEST_LOSS_RE = re.compile(r"Best val loss(?: so far)?:\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+
+
+def _extract_best_loss(text: str, current_best: float | None) -> float | None:
+    best_loss = current_best
+    for part in re.split(r"[\r\n]+", text):
+        match = BEST_LOSS_RE.search(part)
+        if match:
+            best_loss = float(match.group(1))
+    return best_loss
 
 
 def repo_root() -> Path:
@@ -154,6 +164,18 @@ def run_step(name: str, command: list[str], log_handle) -> tuple[int, float | No
     log_handle.flush()
 
     best_loss = None
+    if os.name == "posix" and sys.stdout.isatty():
+        return run_step_pty(command, log_handle, best_loss)
+
+    return run_step_pipe(name, command, log_handle, best_loss)
+
+
+def run_step_pipe(
+    name: str,
+    command: list[str],
+    log_handle,
+    best_loss: float | None,
+) -> tuple[int, float | None]:
     process = subprocess.Popen(
         command,
         cwd=repo_root(),
@@ -169,9 +191,7 @@ def run_step(name: str, command: list[str], log_handle) -> tuple[int, float | No
             print(line, end="")
             log_handle.write(line)
             log_handle.flush()
-            match = BEST_LOSS_RE.search(line)
-            if match:
-                best_loss = float(match.group(1))
+            best_loss = _extract_best_loss(line, best_loss)
         return_code = process.wait()
     except KeyboardInterrupt:
         print(f"\nCtrl+C received. Forwarding interrupt to {name}...")
@@ -183,6 +203,55 @@ def run_step(name: str, command: list[str], log_handle) -> tuple[int, float | No
             process.terminate()
             return_code = process.wait()
         return return_code or 130, best_loss
+
+    return return_code, best_loss
+
+
+def run_step_pty(
+    command: list[str],
+    log_handle,
+    best_loss: float | None,
+) -> tuple[int, float | None]:
+    master_fd, slave_fd = os.openpty()
+    process = subprocess.Popen(
+        command,
+        cwd=repo_root(),
+        stdin=subprocess.DEVNULL,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    try:
+        while True:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            text = chunk.decode(errors="replace")
+            log_handle.write(text)
+            log_handle.flush()
+            best_loss = _extract_best_loss(text, best_loss)
+        return_code = process.wait()
+    except KeyboardInterrupt:
+        print("\nCtrl+C received. Forwarding interrupt to child process...")
+        process.send_signal(signal.SIGINT)
+        try:
+            return_code = process.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            print("Child process did not stop after 5 minutes; terminating it.")
+            process.terminate()
+            return_code = process.wait()
+        return return_code or 130, best_loss
+    finally:
+        os.close(master_fd)
 
     return return_code, best_loss
 

@@ -3,10 +3,7 @@
 venv/
 
 # Data (too large for git)
-data/raw/
-data/processed/
-data/chat/
-data/eval/
+data/
 
 # Checkpoints
 checkpoints/
