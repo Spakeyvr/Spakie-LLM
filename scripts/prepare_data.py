@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -108,12 +109,14 @@ def iter_input_files(raw_root: Path, source_glob: str | None, source_dirs: list[
     return [Path(path) for path in unique_files]
 
 
-def iter_documents(raw_root: Path, files: list[Path]) -> Iterable[DocumentRecord]:
+def iter_documents(raw_root: Path, files: list[Path], progress: tqdm | None = None) -> Iterable[DocumentRecord]:
     for path in files:
         source = infer_source(raw_root, path)
         if path.suffix.lower() == ".jsonl":
             with path.open("r", encoding="utf-8") as handle:
                 for line_number, line in enumerate(handle, start=1):
+                    if progress is not None:
+                        progress.update(len(line.encode("utf-8")))
                     line = line.strip()
                     if not line:
                         continue
@@ -129,7 +132,10 @@ def iter_documents(raw_root: Path, files: list[Path]) -> Iterable[DocumentRecord
                     yield DocumentRecord(source=source, path=str(path), text=text, metadata=metadata)
         else:
             with path.open("r", encoding="utf-8") as handle:
-                yield DocumentRecord(source=source, path=str(path), text=handle.read(), metadata={})
+                text = handle.read()
+            if progress is not None:
+                progress.update(path.stat().st_size)
+            yield DocumentRecord(source=source, path=str(path), text=text, metadata={})
 
 
 def repeated_line_ratio(text: str) -> float:
@@ -174,15 +180,45 @@ def recommended_tokenizer_threads(cpu_count: int | None = None) -> int:
     return max(1, min(MAX_RECOMMENDED_TOKENIZER_THREADS, cores - 2))
 
 
+def token_shard_index(path: Path) -> int:
+    match = re.fullmatch(r"tokens-(\d+)\.npy", path.name)
+    if not match:
+        raise ValueError(f"Unexpected token shard name: {path}")
+    return int(match.group(1))
+
+
+def list_token_shards(shard_dir: Path) -> list[Path]:
+    paths = sorted(shard_dir.glob("tokens-*.npy"), key=token_shard_index)
+    indices = [token_shard_index(path) for path in paths]
+    expected = list(range(len(paths)))
+    if indices != expected:
+        raise ValueError(
+            f"Token shards in {shard_dir} are not contiguous from tokens-00000.npy"
+        )
+    return paths
+
+
+def count_shard_tokens(shard_paths: list[Path]) -> int:
+    return sum(int(np.load(path, mmap_mode="r").shape[0]) for path in shard_paths)
+
+
 class TokenShardWriter:
-    def __init__(self, shard_dir: Path, shard_size: int, dtype):
+    def __init__(
+        self,
+        shard_dir: Path,
+        shard_size: int,
+        dtype,
+        *,
+        start_index: int = 0,
+        existing_paths: list[Path] | None = None,
+    ):
         self.shard_dir = shard_dir
         self.shard_size = shard_size
         self.dtype = dtype
         self.buffer = np.empty(shard_size, dtype=dtype)
         self.offset = 0
-        self.index = 0
-        self.paths: list[Path] = []
+        self.index = start_index
+        self.paths: list[Path] = list(existing_paths or [])
 
     def add(self, token_ids: list[int]) -> None:
         token_array = np.asarray(token_ids, dtype=self.dtype)
@@ -200,6 +236,8 @@ class TokenShardWriter:
 
     def _write_shard(self, shard_tokens: np.ndarray) -> None:
         path = self.shard_dir / f"tokens-{self.index:05d}.npy"
+        if path.exists():
+            raise FileExistsError(f"Refusing to overwrite existing token shard: {path}")
         np.save(path, shard_tokens)
         self.paths.append(path)
         self.index += 1
@@ -215,7 +253,15 @@ class TokenShardWriter:
         return self.paths
 
 
-def merge_shards(shard_paths: list[Path], train_path: Path, val_path: Path, train_fraction: float, dtype) -> tuple[int, int]:
+def merge_shards(
+    shard_paths: list[Path],
+    train_path: Path,
+    val_path: Path,
+    train_fraction: float,
+    dtype,
+    *,
+    show_progress: bool = False,
+) -> tuple[int, int]:
     total_tokens = sum(int(np.load(path, mmap_mode="r").shape[0]) for path in shard_paths)
     split_idx = int(total_tokens * train_fraction)
 
@@ -225,21 +271,29 @@ def merge_shards(shard_paths: list[Path], train_path: Path, val_path: Path, trai
     cursor = 0
     train_cursor = 0
     val_cursor = 0
-    for path in shard_paths:
-        shard = np.load(path, mmap_mode="r")
-        shard_len = int(shard.shape[0])
-        shard_start = cursor
-        shard_end = cursor + shard_len
+    with tqdm(
+        total=total_tokens,
+        desc="Merging shards",
+        unit="tok",
+        unit_scale=True,
+        disable=not show_progress,
+    ) as progress:
+        for path in shard_paths:
+            shard = np.load(path, mmap_mode="r")
+            shard_len = int(shard.shape[0])
+            shard_start = cursor
+            shard_end = cursor + shard_len
 
-        train_take = max(0, min(split_idx, shard_end) - shard_start)
-        if train_take:
-            train_arr[train_cursor:train_cursor + train_take] = shard[:train_take]
-            train_cursor += train_take
-        if train_take < shard_len:
-            val_slice = shard[train_take:]
-            val_arr[val_cursor:val_cursor + len(val_slice)] = val_slice
-            val_cursor += len(val_slice)
-        cursor = shard_end
+            train_take = max(0, min(split_idx, shard_end) - shard_start)
+            if train_take:
+                train_arr[train_cursor:train_cursor + train_take] = shard[:train_take]
+                train_cursor += train_take
+            if train_take < shard_len:
+                val_slice = shard[train_take:]
+                val_arr[val_cursor:val_cursor + len(val_slice)] = val_slice
+                val_cursor += len(val_slice)
+            cursor = shard_end
+            progress.update(shard_len)
 
     train_arr.flush()
     val_arr.flush()
@@ -293,10 +347,14 @@ def prepare_data(
     source_glob: str | None = None,
     source_dirs: list[str] | None = None,
     dry_run: bool = False,
+    resume: bool = False,
     tokenizer_threads: int | None = None,
     tokenize_batch_size: int = DEFAULT_TOKENIZE_BATCH_SIZE,
     tokenize_batch_chars: int = DEFAULT_TOKENIZE_BATCH_CHARS,
 ) -> dict:
+    if resume and dry_run:
+        raise ValueError("--resume cannot be combined with --dry_run")
+
     config = config or SpakieConfig()
     if target_train_tokens and target_train_tokens > 0:
         config.target_train_tokens = target_train_tokens
@@ -333,15 +391,32 @@ def prepare_data(
     total_tokens = 0
     shard_paths: list[Path] = []
     shard_dir = Path(config.token_shard_dir)
-    if shard_dir.exists() and not dry_run:
+    existing_shard_paths: list[Path] = []
+    resume_tokens = 0
+    if resume and not dry_run and shard_dir.exists():
+        existing_shard_paths = list_token_shards(shard_dir)
+        resume_tokens = count_shard_tokens(existing_shard_paths)
+    if shard_dir.exists() and not dry_run and not resume:
         shutil.rmtree(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
-    writer = TokenShardWriter(shard_dir, shard_size=config.token_shard_size, dtype=token_dtype)
+    start_shard_index = (
+        token_shard_index(existing_shard_paths[-1]) + 1
+        if existing_shard_paths
+        else 0
+    )
+    writer = TokenShardWriter(
+        shard_dir,
+        shard_size=config.token_shard_size,
+        dtype=token_dtype,
+        start_index=start_shard_index,
+        existing_paths=existing_shard_paths,
+    )
     pending: list[PendingTokenization] = []
     pending_chars = 0
+    resume_tokens_remaining = resume_tokens
 
     def flush_pending() -> bool:
-        nonlocal pending, pending_chars, total_tokens
+        nonlocal pending, pending_chars, total_tokens, resume_tokens_remaining
         if not pending:
             return False
 
@@ -374,7 +449,15 @@ def prepare_data(
                 continue
             stats["tokens_kept"] += len(token_ids)
             total_tokens += len(token_ids)
-            writer.add(token_ids)
+            if resume_tokens_remaining:
+                if len(token_ids) > resume_tokens_remaining:
+                    raise RuntimeError(
+                        "Existing token shards end in the middle of an accepted document. "
+                        "Remove the shard directory and rerun without --resume."
+                    )
+                resume_tokens_remaining -= len(token_ids)
+            else:
+                writer.add(token_ids)
             if total_tokens >= target_tokens:
                 print(f"Reached target token budget: {total_tokens:,}")
                 reached_target = True
@@ -385,61 +468,101 @@ def prepare_data(
         return reached_target
 
     if not dry_run:
+        if resume:
+            if resume_tokens:
+                print(
+                    f"Resuming from {len(existing_shard_paths):,} existing token shard(s) "
+                    f"with {resume_tokens:,} token(s)"
+                )
+            else:
+                print("Resume requested, but no existing token shards were found; starting fresh")
         print(
-            "Tokenizing with "
-            f"{tokenizer_threads} thread(s), batches up to "
+            "Tokenizing with SentencePiece requesting up to "
+            f"{tokenizer_threads} worker thread(s) per batch, batches up to "
             f"{tokenize_batch_size:,} docs / {tokenize_batch_chars:,} chars"
         )
 
-    for doc in iter_documents(raw_root, files):
-        stats = source_stats[doc.source]
-        stats["documents_seen"] += 1
-        stats["raw_bytes"] += len(doc.text.encode("utf-8"))
+    interrupted = False
+    docs_progress = tqdm(
+        total=raw_bytes,
+        desc="Preparing data",
+        unit="B",
+        unit_scale=True,
+        mininterval=0.5,
+    )
+    try:
+        for doc in iter_documents(raw_root, files, progress=docs_progress):
+            stats = source_stats[doc.source]
+            stats["documents_seen"] += 1
+            stats["raw_bytes"] += len(doc.text.encode("utf-8"))
 
-        text = clean_text(doc.text)
-        source_cap = int(source_plan.get(doc.source, {}).get("target_tokens", 0))
-        if source_cap and stats["tokens_kept"] >= source_cap:
-            stats["documents_dropped"] += 1
-            stats["drop_reasons"]["source_cap_reached"] += 1
-            continue
-
-        keep, reason = should_keep_document(text, config, doc.source)
-        if not keep:
-            stats["documents_dropped"] += 1
-            stats["drop_reasons"][reason] += 1
-            continue
-
-        if dedup and dry_run:
-            doc_hash = hashlib.sha1(normalize_clean_text_for_hash(text).encode("utf-8")).hexdigest()
-            if doc_hash in seen_hashes:
-                stats["documents_dropped"] += 1
-                stats["drop_reasons"]["duplicate"] += 1
-                continue
-            seen_hashes.add(doc_hash)
-
-        estimated_tokens = max(1, int(len(text) / config.estimated_chars_per_token))
-        if dry_run:
-            stats["documents_kept"] += 1
-            stats["chars_kept"] += len(text)
-            if source_cap and stats["tokens_kept"] + estimated_tokens > source_cap:
+            text = clean_text(doc.text)
+            source_cap = int(source_plan.get(doc.source, {}).get("target_tokens", 0))
+            if source_cap and stats["tokens_kept"] >= source_cap:
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"]["source_cap_reached"] += 1
                 continue
-            stats["tokens_kept"] += estimated_tokens
-            total_tokens += estimated_tokens
-        else:
-            pending.append(PendingTokenization(source=doc.source, text=text))
-            pending_chars += len(text)
-            if len(pending) >= tokenize_batch_size or pending_chars >= tokenize_batch_chars:
-                if flush_pending():
-                    break
 
-        if total_tokens >= target_tokens:
-            print(f"Reached target token budget: {total_tokens:,}")
-            break
+            keep, reason = should_keep_document(text, config, doc.source)
+            if not keep:
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"][reason] += 1
+                continue
+
+            if dedup and dry_run:
+                doc_hash = hashlib.sha1(normalize_clean_text_for_hash(text).encode("utf-8")).hexdigest()
+                if doc_hash in seen_hashes:
+                    stats["documents_dropped"] += 1
+                    stats["drop_reasons"]["duplicate"] += 1
+                    continue
+                seen_hashes.add(doc_hash)
+
+            estimated_tokens = max(1, int(len(text) / config.estimated_chars_per_token))
+            if dry_run:
+                stats["documents_kept"] += 1
+                stats["chars_kept"] += len(text)
+                if source_cap and stats["tokens_kept"] + estimated_tokens > source_cap:
+                    stats["documents_dropped"] += 1
+                    stats["drop_reasons"]["source_cap_reached"] += 1
+                    continue
+                stats["tokens_kept"] += estimated_tokens
+                total_tokens += estimated_tokens
+            else:
+                pending.append(PendingTokenization(source=doc.source, text=text))
+                pending_chars += len(text)
+                if len(pending) >= tokenize_batch_size or pending_chars >= tokenize_batch_chars:
+                    if flush_pending():
+                        break
+
+            if stats["documents_seen"] % 25 == 0:
+                docs_progress.set_postfix(
+                    docs=f"{sum(s['documents_seen'] for s in source_stats.values()):,}",
+                    kept=f"{sum(s['documents_kept'] for s in source_stats.values()):,}",
+                    dropped=f"{sum(s['documents_dropped'] for s in source_stats.values()):,}",
+                    tokens=f"{total_tokens:,}",
+                    refresh=False,
+                )
+
+            if total_tokens >= target_tokens:
+                print(f"Reached target token budget: {total_tokens:,}")
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        docs_progress.write(
+            "\nInterrupted by Ctrl+C. Finalizing progress report and any completed token shards..."
+        )
+    finally:
+        docs_progress.close()
+
+    if resume_tokens_remaining and not interrupted and total_tokens < target_tokens:
+        raise RuntimeError(
+            "Existing token shards contain more accepted tokens than this run could reproduce. "
+            "Check that the raw inputs and prepare_data.py options match the interrupted run."
+        )
 
     if not dry_run:
-        flush_pending()
+        if pending and not interrupted:
+            flush_pending()
         shard_paths = writer.close()
 
     normalized_source_stats = {}
@@ -490,6 +613,11 @@ def prepare_data(
         dry_run=dry_run,
     )
     report["target_tokens_requested"] = target_tokens
+    report["resume"] = resume
+    if resume:
+        report["resume_existing_shards"] = len(existing_shard_paths)
+        report["resume_existing_tokens"] = resume_tokens
+        report["resume_tokens_remaining"] = resume_tokens_remaining
 
     processed_dir = Path(config.processed_data_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
@@ -497,6 +625,17 @@ def prepare_data(
     report_dest.parent.mkdir(parents=True, exist_ok=True)
     with report_dest.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
+
+    if interrupted:
+        if shard_paths:
+            report["partial_token_shards"] = [str(path) for path in shard_paths]
+            with report_dest.open("w", encoding="utf-8") as handle:
+                json.dump(report, handle, ensure_ascii=False, indent=2)
+        print(f"Partial processed tokens: {total_tokens:,}")
+        print(f"Partial report: {report_dest}")
+        if shard_paths:
+            print(f"Partial token shards: {shard_dir}")
+        return report
 
     if dry_run:
         print(f"Estimated processed tokens: {total_tokens:,}")
@@ -511,7 +650,14 @@ def prepare_data(
     val_path = processed_dir / "val.npy"
     if output_dtype != np.uint16:
         raise ValueError("The current training stack expects uint16-compatible token ids")
-    train_tokens, val_tokens = merge_shards(shard_paths, train_path, val_path, config.train_split_fraction, output_dtype)
+    train_tokens, val_tokens = merge_shards(
+        shard_paths,
+        train_path,
+        val_path,
+        config.train_split_fraction,
+        output_dtype,
+        show_progress=True,
+    )
 
     report["processed_tokens"] = train_tokens + val_tokens
     report["train_tokens"] = train_tokens
@@ -537,6 +683,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_glob", type=str, default="", help="Optional file glob for inputs")
     parser.add_argument("--source_dirs", type=str, default="", help="Comma-separated input directories relative to data/raw")
     parser.add_argument("--dry_run", action="store_true", help="Estimate token totals without writing train/val arrays")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from existing token shards instead of deleting and rebuilding them",
+    )
     parser.add_argument(
         "--tokenizer_threads",
         type=int,
@@ -569,6 +720,7 @@ def main() -> None:
         source_glob=args.source_glob or None,
         source_dirs=source_dirs,
         dry_run=args.dry_run,
+        resume=args.resume,
         tokenizer_threads=args.tokenizer_threads or None,
         tokenize_batch_size=args.tokenize_batch_size,
         tokenize_batch_chars=args.tokenize_batch_chars,

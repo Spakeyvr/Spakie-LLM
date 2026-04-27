@@ -101,13 +101,40 @@ python3 scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_cor
 By default, `python3 scripts/prepare_data.py` uses a recommended number of
 SentencePiece tokenizer threads for the machine. On an 18-core CPU this defaults
 to 16 tokenizer threads, leaving a little headroom for I/O and system work. You
-can override it with `--tokenizer_threads`.
+can override it with `--tokenizer_threads`. This is a per-batch request passed to
+SentencePiece, not a promise that Activity Monitor will show 16 Python threads at
+all times; the surrounding file reading, JSON parsing, filtering, deduping, and
+shard writing still run in the main Python process.
+
+If preparation was interrupted after token shards were written, continue from the
+existing shards with:
+```bash
+python3 scripts/prepare_data.py --resume
+```
+Use the same source/filtering options as the interrupted run so the replay step
+can skip exactly the tokens already saved before appending new shards.
 
 ### 4. Pretrain
 ```bash
 python3 scripts/train.py --preset 180m --device auto --precision auto
 python3 scripts/train.py --backend mlx --preset 92m --precision auto --mlx-profile
 ```
+
+### 4b. Run the full pipeline
+Use the pipeline runner to check for processed data, run `prepare_data.py` if needed, then pretrain and launch SFT:
+```bash
+python3 scripts/run_pipeline.py --preset 92m --backend mlx --max-steps 1000
+python3 scripts/run_pipeline.py --preset 180m --backend torch --device auto --precision auto --source-dirs large_corpus/fineweb-edu
+```
+
+Useful options:
+```bash
+python3 scripts/run_pipeline.py --smoke
+python3 scripts/run_pipeline.py --force-prepare --prepare-target-train-tokens 2000000000
+python3 scripts/run_pipeline.py --max-steps 500 --train-jsonl data/chat/train_mixed.jsonl --max-examples 10000
+```
+
+The runner writes a timestamped log under `data/logs/` and prints elapsed time plus the best validation losses reported by pretraining and SFT.
 
 ### 5. Fine-tune (optional)
 Add chat data to `data/chat/train.jsonl` in the format:
