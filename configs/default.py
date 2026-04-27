@@ -35,8 +35,8 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
         },
         "refinedweb": {
             "kind": "web",
-            "target_tokens": 300_000_000,
-            "target_raw_chars": 1_200_000_000,
+            "target_tokens": 125_000_000,
+            "target_raw_chars": 500_000_000,
             "enabled": True,
         },
         "fineweb_sample": {
@@ -47,14 +47,14 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
         },
         "c4_en": {
             "kind": "web",
-            "target_tokens": 250_000_000,
-            "target_raw_chars": 1_000_000_000,
+            "target_tokens": 125_000_000,
+            "target_raw_chars": 500_000_000,
             "enabled": True,
         },
         "gutenberg": {
             "kind": "books",
-            "target_tokens": 200_000_000,
-            "target_raw_chars": 800_000_000,
+            "target_tokens": 450_000_000,
+            "target_raw_chars": 1_800_000_000,
             "enabled": True,
         },
         "wikipedia_snapshot": {
@@ -83,8 +83,8 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
         },
         "cosmopedia_v2": {
             "kind": "synthetic_education",
-            "target_tokens": 250_000_000,
-            "target_raw_chars": 1_000_000_000,
+            "target_tokens": 450_000_000,
+            "target_raw_chars": 1_800_000_000,
             "enabled": True,
         },
     }

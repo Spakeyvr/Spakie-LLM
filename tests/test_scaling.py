@@ -1,5 +1,6 @@
 import json
 import math
+import numpy as np
 import sys
 import tempfile
 import unittest
@@ -17,12 +18,30 @@ import scripts.prepare_data as prepare_data
 
 
 class FakeTokenizer:
+    encode_batch_calls = 0
+    encode_batch_threads: list[int] = []
+
     def __init__(self, _model_path: str):
         self.vocab_size = 8192
         self.eos_id = 1
 
     def encode(self, text: str) -> list[int]:
-        return [1] * max(1, len(text) // 8)
+        tokens = [2 + ((ord(ch) + idx) % 8000) for idx, ch in enumerate(text)]
+        return tokens or [2]
+
+    def encode_batch(
+        self,
+        texts: list[str],
+        add_bos: bool = False,
+        add_eos: bool = False,
+        num_threads: int = -1,
+    ) -> list[list[int]]:
+        self.__class__.encode_batch_calls += 1
+        self.__class__.encode_batch_threads.append(num_threads)
+        results = [self.encode(text) for text in texts]
+        if add_eos:
+            results = [tokens + [self.eos_id] for tokens in results]
+        return results
 
 
 class ScalingConfigTests(unittest.TestCase):
@@ -91,6 +110,86 @@ class ScalingConfigTests(unittest.TestCase):
             self.assertIn("fineweb-edu", report["source_targets"])
             self.assertGreater(report["source_stats"]["fineweb-edu"]["target_tokens"], 0)
             self.assertGreaterEqual(report["source_stats"]["fineweb-edu"]["completion_ratio"], 0.0)
+
+    def test_token_shard_writer_preserves_token_order_across_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shard_dir = Path(tmpdir)
+            writer = prepare_data.TokenShardWriter(shard_dir, shard_size=5, dtype=np.uint16)
+
+            writer.add([1, 2, 3])
+            writer.add([4, 5, 6, 7, 8, 9, 10, 11])
+            shard_paths = writer.close()
+
+            tokens = np.concatenate([np.load(path) for path in shard_paths])
+            self.assertEqual(tokens.tolist(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+            self.assertEqual([np.load(path).shape[0] for path in shard_paths], [5, 5, 1])
+
+    def test_recommended_tokenizer_threads_leaves_headroom_on_18_core_cpu(self):
+        self.assertEqual(prepare_data.recommended_tokenizer_threads(18), 16)
+        self.assertEqual(prepare_data.recommended_tokenizer_threads(4), 4)
+
+    def test_batched_tokenization_matches_serial_outputs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw" / "large_corpus" / "fineweb-edu"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            rows = [
+                {"text": "alpha beta gamma"},
+                {"text": "delta epsilon zeta"},
+                {"text": "alpha beta gamma"},
+                {"text": "eta theta iota"},
+                {"text": "kappa lambda mu"},
+                {"text": "nu xi omicron"},
+            ]
+            sample = raw_dir / "sample.jsonl"
+            sample.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+            def make_config(name: str) -> SpakieConfig:
+                return SpakieConfig(
+                    raw_data_dir=str(root / "raw"),
+                    processed_data_dir=str(root / name / "processed"),
+                    corpus_report_path=str(root / name / "processed" / "corpus_report.json"),
+                    token_shard_dir=str(root / name / "processed" / "shards"),
+                    target_train_tokens=1_000,
+                    min_doc_chars=1,
+                    token_shard_size=7,
+                    source_min_doc_chars={"fineweb-edu": 1},
+                    corpus_source_plan={
+                        "fineweb-edu": {
+                            "kind": "web",
+                            "target_tokens": 1_053,
+                            "target_raw_chars": 4_212,
+                            "enabled": True,
+                        }
+                    },
+                )
+
+            with patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer):
+                FakeTokenizer.encode_batch_calls = 0
+                FakeTokenizer.encode_batch_threads = []
+                serial_report = prepare_data.prepare_data(
+                    config=make_config("serial"),
+                    target_tokens=1_053,
+                    tokenizer_threads=1,
+                    tokenize_batch_size=1,
+                )
+                serial_train = np.load(root / "serial" / "processed" / "train.npy")
+                serial_val = np.load(root / "serial" / "processed" / "val.npy")
+
+                batched_report = prepare_data.prepare_data(
+                    config=make_config("batched"),
+                    target_tokens=1_053,
+                    tokenizer_threads=4,
+                    tokenize_batch_size=3,
+                )
+                batched_train = np.load(root / "batched" / "processed" / "train.npy")
+                batched_val = np.load(root / "batched" / "processed" / "val.npy")
+
+            self.assertEqual(serial_report["processed_tokens"], batched_report["processed_tokens"])
+            self.assertEqual(serial_train.tolist(), batched_train.tolist())
+            self.assertEqual(serial_val.tolist(), batched_val.tolist())
+            self.assertGreater(FakeTokenizer.encode_batch_calls, 0)
+            self.assertIn(4, FakeTokenizer.encode_batch_threads)
 
     def test_pretrain_budget_derives_steps_for_presets(self):
         config_92m = get_preset_config("92m")

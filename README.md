@@ -94,8 +94,14 @@ python3 scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_cor
 - streams documents from `.md`, `.txt`, and JSONL shards
 - performs document-level near-exact dedup
 - filters short, noisy, repeated-line, and boilerplate-heavy documents
+- tokenizes accepted documents in ordered multicore batches by default
 - writes token shards first, then merges them into `data/processed/train.npy` and `data/processed/val.npy`
 - emits a corpus report with per-source targets, train/val token totals, and remaining gap to target
+
+By default, `python3 scripts/prepare_data.py` uses a recommended number of
+SentencePiece tokenizer threads for the machine. On an 18-core CPU this defaults
+to 16 tokenizer threads, leaving a little headroom for I/O and system work. You
+can override it with `--tokenizer_threads`.
 
 ### 4. Pretrain
 ```bash

@@ -32,6 +32,9 @@ from tokenizer.train_tokenizer import SpakieTokenizer
 SUPPORTED_EXTENSIONS = (".md", ".txt", ".jsonl")
 IGNORED_FILENAMES = {"progress.json"}
 IGNORED_PATTERNS = ("seen_", ".manifest.")
+DEFAULT_TOKENIZE_BATCH_SIZE = 512
+DEFAULT_TOKENIZE_BATCH_CHARS = 8_000_000
+MAX_RECOMMENDED_TOKENIZER_THREADS = 16
 
 
 @dataclass
@@ -40,6 +43,12 @@ class DocumentRecord:
     path: str
     text: str
     metadata: dict
+
+
+@dataclass
+class PendingTokenization:
+    source: str
+    text: str
 
 
 def clean_text(text: str) -> str:
@@ -52,6 +61,12 @@ def clean_text(text: str) -> str:
 
 def normalize_for_hash(text: str) -> str:
     text = clean_text(text).lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_clean_text_for_hash(text: str) -> str:
+    text = text.lower()
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -152,34 +167,51 @@ def min_doc_chars_for_source(config: SpakieConfig, source: str) -> int:
     return config.source_min_doc_chars.get(source, config.min_doc_chars)
 
 
+def recommended_tokenizer_threads(cpu_count: int | None = None) -> int:
+    cores = cpu_count or os.cpu_count() or 1
+    if cores <= 4:
+        return max(1, cores)
+    return max(1, min(MAX_RECOMMENDED_TOKENIZER_THREADS, cores - 2))
+
+
 class TokenShardWriter:
     def __init__(self, shard_dir: Path, shard_size: int, dtype):
         self.shard_dir = shard_dir
         self.shard_size = shard_size
         self.dtype = dtype
-        self.tokens: list[int] = []
+        self.buffer = np.empty(shard_size, dtype=dtype)
+        self.offset = 0
         self.index = 0
         self.paths: list[Path] = []
 
     def add(self, token_ids: list[int]) -> None:
-        self.tokens.extend(token_ids)
-        while len(self.tokens) >= self.shard_size:
-            self._flush(self.shard_size)
+        token_array = np.asarray(token_ids, dtype=self.dtype)
+        start = 0
+        total = int(token_array.shape[0])
+        while start < total:
+            room = self.shard_size - self.offset
+            take = min(room, total - start)
+            end = start + take
+            self.buffer[self.offset:self.offset + take] = token_array[start:end]
+            self.offset += take
+            start = end
+            if self.offset == self.shard_size:
+                self._flush_full()
 
-    def _flush(self, count: int | None = None) -> None:
-        if not self.tokens:
-            return
-        if count is None:
-            count = len(self.tokens)
-        shard_tokens = np.array(self.tokens[:count], dtype=self.dtype)
-        self.tokens = self.tokens[count:]
+    def _write_shard(self, shard_tokens: np.ndarray) -> None:
         path = self.shard_dir / f"tokens-{self.index:05d}.npy"
         np.save(path, shard_tokens)
         self.paths.append(path)
         self.index += 1
 
+    def _flush_full(self) -> None:
+        self._write_shard(self.buffer)
+        self.offset = 0
+
     def close(self) -> list[Path]:
-        self._flush()
+        if self.offset:
+            self._write_shard(self.buffer[:self.offset].copy())
+            self.offset = 0
         return self.paths
 
 
@@ -261,6 +293,9 @@ def prepare_data(
     source_glob: str | None = None,
     source_dirs: list[str] | None = None,
     dry_run: bool = False,
+    tokenizer_threads: int | None = None,
+    tokenize_batch_size: int = DEFAULT_TOKENIZE_BATCH_SIZE,
+    tokenize_batch_chars: int = DEFAULT_TOKENIZE_BATCH_CHARS,
 ) -> dict:
     config = config or SpakieConfig()
     if target_train_tokens and target_train_tokens > 0:
@@ -271,6 +306,9 @@ def prepare_data(
     source_plan = config.scaled_corpus_source_plan(target_processed_tokens=target_tokens)
     tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
     token_dtype = pick_token_dtype(tokenizer)
+    tokenizer_threads = tokenizer_threads or recommended_tokenizer_threads()
+    tokenize_batch_size = max(1, tokenize_batch_size)
+    tokenize_batch_chars = max(1, tokenize_batch_chars)
 
     raw_root = Path(config.raw_data_dir).resolve()
     files = iter_input_files(raw_root, source_glob=source_glob, source_dirs=source_dirs)
@@ -299,6 +337,59 @@ def prepare_data(
         shutil.rmtree(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
     writer = TokenShardWriter(shard_dir, shard_size=config.token_shard_size, dtype=token_dtype)
+    pending: list[PendingTokenization] = []
+    pending_chars = 0
+
+    def flush_pending() -> bool:
+        nonlocal pending, pending_chars, total_tokens
+        if not pending:
+            return False
+
+        texts = [item.text for item in pending]
+        if tokenizer_threads == 1 or len(texts) == 1:
+            encoded_batch = [tokenizer.encode(text) + [tokenizer.eos_id] for text in texts]
+        else:
+            encoded_batch = tokenizer.encode_batch(texts, add_eos=True, num_threads=tokenizer_threads)
+
+        reached_target = False
+        for item, token_ids in zip(pending, encoded_batch):
+            stats = source_stats[item.source]
+            source_cap = int(source_plan.get(item.source, {}).get("target_tokens", 0))
+            if source_cap and stats["tokens_kept"] >= source_cap:
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"]["source_cap_reached"] += 1
+                continue
+            if dedup:
+                doc_hash = hashlib.sha1(normalize_clean_text_for_hash(item.text).encode("utf-8")).hexdigest()
+                if doc_hash in seen_hashes:
+                    stats["documents_dropped"] += 1
+                    stats["drop_reasons"]["duplicate"] += 1
+                    continue
+                seen_hashes.add(doc_hash)
+            stats["documents_kept"] += 1
+            stats["chars_kept"] += len(item.text)
+            if source_cap and stats["tokens_kept"] + len(token_ids) > source_cap:
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"]["source_cap_reached"] += 1
+                continue
+            stats["tokens_kept"] += len(token_ids)
+            total_tokens += len(token_ids)
+            writer.add(token_ids)
+            if total_tokens >= target_tokens:
+                print(f"Reached target token budget: {total_tokens:,}")
+                reached_target = True
+                break
+
+        pending = []
+        pending_chars = 0
+        return reached_target
+
+    if not dry_run:
+        print(
+            "Tokenizing with "
+            f"{tokenizer_threads} thread(s), batches up to "
+            f"{tokenize_batch_size:,} docs / {tokenize_batch_chars:,} chars"
+        )
 
     for doc in iter_documents(raw_root, files):
         stats = source_stats[doc.source]
@@ -318,18 +409,18 @@ def prepare_data(
             stats["drop_reasons"][reason] += 1
             continue
 
-        if dedup:
-            doc_hash = hashlib.sha1(normalize_for_hash(text).encode("utf-8")).hexdigest()
+        if dedup and dry_run:
+            doc_hash = hashlib.sha1(normalize_clean_text_for_hash(text).encode("utf-8")).hexdigest()
             if doc_hash in seen_hashes:
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"]["duplicate"] += 1
                 continue
             seen_hashes.add(doc_hash)
 
-        stats["documents_kept"] += 1
-        stats["chars_kept"] += len(text)
         estimated_tokens = max(1, int(len(text) / config.estimated_chars_per_token))
         if dry_run:
+            stats["documents_kept"] += 1
+            stats["chars_kept"] += len(text)
             if source_cap and stats["tokens_kept"] + estimated_tokens > source_cap:
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"]["source_cap_reached"] += 1
@@ -337,21 +428,18 @@ def prepare_data(
             stats["tokens_kept"] += estimated_tokens
             total_tokens += estimated_tokens
         else:
-            token_ids = tokenizer.encode(text)
-            token_ids.append(tokenizer.eos_id)
-            if source_cap and stats["tokens_kept"] + len(token_ids) > source_cap:
-                stats["documents_dropped"] += 1
-                stats["drop_reasons"]["source_cap_reached"] += 1
-                continue
-            stats["tokens_kept"] += len(token_ids)
-            total_tokens += len(token_ids)
-            writer.add(token_ids)
+            pending.append(PendingTokenization(source=doc.source, text=text))
+            pending_chars += len(text)
+            if len(pending) >= tokenize_batch_size or pending_chars >= tokenize_batch_chars:
+                if flush_pending():
+                    break
 
         if total_tokens >= target_tokens:
             print(f"Reached target token budget: {total_tokens:,}")
             break
 
     if not dry_run:
+        flush_pending()
         shard_paths = writer.close()
 
     normalized_source_stats = {}
@@ -449,6 +537,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_glob", type=str, default="", help="Optional file glob for inputs")
     parser.add_argument("--source_dirs", type=str, default="", help="Comma-separated input directories relative to data/raw")
     parser.add_argument("--dry_run", action="store_true", help="Estimate token totals without writing train/val arrays")
+    parser.add_argument(
+        "--tokenizer_threads",
+        type=int,
+        default=0,
+        help="SentencePiece tokenizer threads for prepare tokenization (0 = recommended auto)",
+    )
+    parser.add_argument(
+        "--tokenize_batch_size",
+        type=int,
+        default=DEFAULT_TOKENIZE_BATCH_SIZE,
+        help="Maximum documents per tokenizer batch",
+    )
+    parser.add_argument(
+        "--tokenize_batch_chars",
+        type=int,
+        default=DEFAULT_TOKENIZE_BATCH_CHARS,
+        help="Maximum cleaned characters per tokenizer batch",
+    )
     return parser.parse_args()
 
 
@@ -463,6 +569,9 @@ def main() -> None:
         source_glob=args.source_glob or None,
         source_dirs=source_dirs,
         dry_run=args.dry_run,
+        tokenizer_threads=args.tokenizer_threads or None,
+        tokenize_batch_size=args.tokenize_batch_size,
+        tokenize_batch_chars=args.tokenize_batch_chars,
     )
 
 
