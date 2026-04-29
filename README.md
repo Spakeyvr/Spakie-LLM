@@ -131,7 +131,7 @@ Useful options:
 ```bash
 python3 scripts/run_pipeline.py --smoke
 python3 scripts/run_pipeline.py --force-prepare --prepare-target-train-tokens 2000000000
-python3 scripts/run_pipeline.py --max-steps 500 --train-jsonl data/chat/train_mixed.jsonl --max-examples 10000
+python3 scripts/run_pipeline.py --max-steps 500 --train-jsonl data/chat/train.jsonl --max-examples 10000
 ```
 
 The runner writes a timestamped log under `data/logs/` and prints elapsed time plus the best validation losses reported by pretraining and SFT.

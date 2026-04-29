@@ -29,10 +29,6 @@ def list_available_checkpoints(checkpoint_dirs: list[str], backend: str) -> list
     preferred_names = (
         "pretrain_best",
         "pretrain_interrupt",
-        "sft_targeted_best",
-        "sft_targeted_interrupt",
-        "sft_mixed_best",
-        "sft_mixed_interrupt",
         "sft_best",
         "sft_interrupt",
     )
@@ -134,11 +130,6 @@ def resolve_named_checkpoint(config, requested: str | None, default_name: str) -
 
 def default_sft_output_name(train_jsonl_path: str, backend: str) -> str:
     ext = ".safetensors" if backend == "mlx" else ".pt"
-    basename = os.path.basename(train_jsonl_path).lower()
-    if basename == "train_mixed.jsonl":
-        return f"sft_mixed_best{ext}"
-    if basename == "train_targeted.jsonl":
-        return f"sft_targeted_best{ext}"
     return f"sft_best{ext}"
 
 
@@ -382,10 +373,7 @@ def main():
     if args.smoke:
         config.sft_epochs = 1
 
-    default_jsonl = os.path.join(config.chat_data_dir, "train_mixed.jsonl")
-    if not os.path.exists(default_jsonl):
-        legacy_jsonl = os.path.join(config.chat_data_dir, "train.jsonl")
-        default_jsonl = legacy_jsonl if os.path.exists(legacy_jsonl) else default_jsonl
+    default_jsonl = os.path.join(config.chat_data_dir, "train.jsonl")
     jsonl_path = args.train_jsonl or default_jsonl
     output_name = args.output_name or default_sft_output_name(jsonl_path, args.backend)
 

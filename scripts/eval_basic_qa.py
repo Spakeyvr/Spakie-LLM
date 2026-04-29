@@ -48,7 +48,7 @@ def resolve_checkpoint(config, checkpoint_arg: str | None) -> str:
                 return candidate
         return os.path.join(config.checkpoint_dir, checkpoint_arg)
 
-    preferred = ["sft_targeted_best.pt", "sft_mixed_best.pt", "sft_best.pt", "pretrain_best.pt"]
+    preferred = ["sft_best.pt", "pretrain_best.pt"]
     for name in preferred:
         for directory in checkpoint_search_dirs(config):
             candidate = os.path.join(directory, name)
@@ -104,7 +104,7 @@ def refusal_result(prompt: str, answer: str, reject_any: list[str]) -> dict[str,
 
 def acceptance_thresholds(preset: str, checkpoint_path: str) -> tuple[int | None, int | None]:
     name = os.path.basename(checkpoint_path).lower()
-    if "sft_targeted_best" not in name:
+    if "sft_best" not in name:
         return None, None
     if preset == "180m":
         return 75, 0

@@ -62,11 +62,7 @@ class SyntheticSequenceDataset:
 
 
 def _default_sft_jsonl(config) -> str:
-    mixed = os.path.join(config.chat_data_dir, "train_mixed.jsonl")
-    if os.path.exists(mixed):
-        return mixed
-    legacy = os.path.join(config.chat_data_dir, "train.jsonl")
-    return legacy
+    return os.path.join(config.chat_data_dir, "train.jsonl")
 
 
 def _resolve_task_hparams(config, task: str, args) -> dict[str, float | int]:

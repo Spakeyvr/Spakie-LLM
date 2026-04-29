@@ -215,7 +215,7 @@ def dedup_examples(examples: list[dict]) -> list[dict]:
 
 def main() -> None:
     config = SpakieConfig()
-    parser = argparse.ArgumentParser(description="Build a mixed SFT dataset")
+    parser = argparse.ArgumentParser(description="Build the canonical SFT dataset")
     parser.add_argument(
         "--max",
         type=int,
@@ -226,7 +226,7 @@ def main() -> None:
     parser.add_argument(
         "--output-name",
         type=str,
-        default="train_mixed.jsonl",
+        default="train.jsonl",
         help="Output filename inside data/chat/",
     )
     args = parser.parse_args()

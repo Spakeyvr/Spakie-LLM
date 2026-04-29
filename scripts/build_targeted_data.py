@@ -1,11 +1,10 @@
-"""Build targeted SFT and eval datasets for basic factual QA and refusals."""
+"""Build the canonical SFT and eval datasets for Spakie-LM."""
 
 from __future__ import annotations
 
 import json
 import os
 import random
-import shutil
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -139,6 +138,9 @@ EXPLAINER_TEMPLATES = [
 ]
 
 ANCHOR_QA = [
+    ("What are you?", "I am Spakie-LM, a large language model trained by Spakie. I am designed to assist you with a variety of tasks."),
+    ("Hi", "Hello! How can I assist you today?"),
+    ("Are you ChatGPT?", "No, I'm Spakie-LM, a language model designed to assist you."),
     ("What is the capital of France?", "The capital of France is Paris."),
     ("France's capital is what?", "France's capital is Paris."),
     ("Name the capital city of France.", "Paris is the capital city of France."),
@@ -380,7 +382,7 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def build_targeted_sft(facts: list[dict], seed: int) -> list[dict]:
+def build_sft(facts: list[dict], seed: int) -> list[dict]:
     rows = []
     for fact in facts:
         for template in QA_TEMPLATES:
@@ -419,28 +421,19 @@ def build_refusal_eval() -> list[dict]:
     return [{"prompt": prompt, "must_refuse": True, "reject_any": REFUSAL_REJECT_TOKENS} for prompt in REFUSAL_PROMPTS]
 
 
-def sync_mixed_dataset(config: SpakieConfig) -> None:
-    mixed_path = os.path.join(config.chat_data_dir, "train_mixed.jsonl")
-    legacy_path = os.path.join(config.chat_data_dir, "train.jsonl")
-    if os.path.exists(legacy_path) and not os.path.exists(mixed_path):
-        shutil.copyfile(legacy_path, mixed_path)
-        print(f"Copied {legacy_path} -> {mixed_path}")
-
-
 def main() -> None:
     config = SpakieConfig()
     facts = fact_rows()
-    sync_mixed_dataset(config)
 
-    targeted_rows = build_targeted_sft(facts, seed=42)
+    sft_rows = build_sft(facts, seed=42)
     basic_eval_rows = build_basic_eval(facts)
     refusal_eval_rows = build_refusal_eval()
 
-    write_jsonl(os.path.join(config.chat_data_dir, "train_targeted.jsonl"), targeted_rows)
+    write_jsonl(os.path.join(config.chat_data_dir, "train.jsonl"), sft_rows)
     write_jsonl(os.path.join(config.eval_data_dir, "basic_qa.jsonl"), basic_eval_rows)
     write_jsonl(os.path.join(config.eval_data_dir, "refusal.jsonl"), refusal_eval_rows)
 
-    print(f"Wrote {len(targeted_rows)} targeted SFT examples")
+    print(f"Wrote {len(sft_rows)} SFT examples")
     print(f"Wrote {len(basic_eval_rows)} basic QA eval prompts")
     print(f"Wrote {len(refusal_eval_rows)} refusal eval prompts")
 

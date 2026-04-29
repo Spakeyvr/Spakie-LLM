@@ -42,10 +42,6 @@ def list_available_checkpoints(checkpoint_dirs: list[str], backend: str) -> list
                 seen_names.add(name)
 
     preferred_names = (
-        "sft_targeted_best",
-        "sft_targeted_interrupt",
-        "sft_mixed_best",
-        "sft_mixed_interrupt",
         "sft_best",
         "sft_interrupt",
         "pretrain_best",
