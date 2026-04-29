@@ -309,6 +309,8 @@ def main():
     parser.add_argument("--output-name", type=str, default="", help="Filename for the best SFT checkpoint")
     parser.add_argument("--smoke", action="store_true", help="Run a one-epoch subset smoke test")
     parser.add_argument("--max-examples", type=int, default=0, help="Optional cap on loaded SFT examples")
+    parser.add_argument("--epochs", type=int, default=0, help="Override number of SFT epochs")
+    parser.add_argument("--lr", type=float, default=0.0, help="Override SFT learning rate")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes (torch backend)")
@@ -371,6 +373,10 @@ def main():
         sys.exit(1)
 
     config = get_preset_config(selected_preset)
+    if args.epochs > 0:
+        config.sft_epochs = args.epochs
+    if args.lr > 0:
+        config.sft_lr = args.lr
     args.source_checkpoint = resolved_source_checkpoint
     output_checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_sft") if args.smoke else config.checkpoint_dir
     if args.smoke:

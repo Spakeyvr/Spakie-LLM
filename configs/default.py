@@ -148,9 +148,9 @@ class SpakieConfig:
     sft_download_max_examples: int = 72_000
 
     # Generation
-    temperature: float = 0.8
-    top_k: int = 50
-    top_p: float = 0.9
+    temperature: float = 0.1
+    top_k: int = 1
+    top_p: float = 1.0
 
     # Paths
     raw_data_dir: str = "data/raw"

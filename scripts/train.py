@@ -29,6 +29,8 @@ def run_torch_pretrain(args, config):
             print(f"Error: resume checkpoint not found at {resume_path}")
             sys.exit(1)
         resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if args.reset_best_loss:
+            resume_state["best_val_loss"] = float("inf")
         checkpoint_config = resume_state.get("config")
         if checkpoint_config is not None:
             config = checkpoint_config
@@ -41,6 +43,15 @@ def run_torch_pretrain(args, config):
                 config.pretrain_target_tokens = max(
                     config.pretrain_target_tokens,
                     config.pretrain_tokens_per_step() * args.max_steps,
+                )
+        if args.additional_steps > 0:
+            resume_step = int(resume_state.get("step", 0))
+            config.pretrain_max_steps = resume_step + args.additional_steps
+            if args.target_tokens <= 0:
+                resume_tokens = int(resume_state.get("tokens_processed", 0))
+                config.pretrain_target_tokens = max(
+                    config.pretrain_target_tokens,
+                    resume_tokens + config.pretrain_tokens_per_step() * args.additional_steps,
                 )
 
     runtime = resolve_runtime_settings(args.device, args.precision)
@@ -105,6 +116,8 @@ def run_mlx_pretrain(args, config):
             print(f"Error: resume checkpoint not found at {resume_path}")
             sys.exit(1)
         resume_state = load_training_checkpoint_mlx(resume_path)
+        if args.reset_best_loss:
+            resume_state.setdefault("meta", {})["best_val_loss"] = float("inf")
         # Config fields aren't serialized in the safetensors; preset hyperparameters
         # come from get_preset_config. Honor CLI overrides for steps/tokens.
         if args.target_tokens > 0:
@@ -116,6 +129,15 @@ def run_mlx_pretrain(args, config):
                 config.pretrain_target_tokens = max(
                     config.pretrain_target_tokens,
                     config.pretrain_tokens_per_step() * args.max_steps,
+                )
+        if args.additional_steps > 0:
+            resume_step = int(resume_state["meta"].get("step", 0))
+            config.pretrain_max_steps = resume_step + args.additional_steps
+            if args.target_tokens <= 0:
+                resume_tokens = int(resume_state["meta"].get("tokens_processed", 0))
+                config.pretrain_target_tokens = max(
+                    config.pretrain_target_tokens,
+                    resume_tokens + config.pretrain_tokens_per_step() * args.additional_steps,
                 )
 
     runtime = resolve_mlx_runtime(args.precision)
@@ -197,6 +219,35 @@ def main():
         help="Override the pretraining token budget",
     )
     parser.add_argument("--max-steps", type=int, default=0, help="Override max training steps")
+    parser.add_argument(
+        "--additional-steps",
+        type=int,
+        default=0,
+        help="When resuming, train this many optimizer steps beyond the checkpoint step",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="",
+        help="Write checkpoints to this directory instead of the preset checkpoint directory",
+    )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=0,
+        help="Override pretraining validation/checkpoint interval in optimizer steps",
+    )
+    parser.add_argument(
+        "--eval-batches",
+        type=int,
+        default=0,
+        help="Override number of validation batches used at each pretraining eval",
+    )
+    parser.add_argument(
+        "--reset-best-loss",
+        action="store_true",
+        help="When resuming, reset best loss so the first validation in a new output dir saves",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume from the latest interrupt checkpoint")
     parser.add_argument("--resume-from", type=str, default="", help="Resume from a specific checkpoint path")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
@@ -239,6 +290,12 @@ def main():
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
+    if args.output_dir:
+        config.checkpoint_dir = args.output_dir
+    if args.eval_interval > 0:
+        config.pretrain_eval_interval = args.eval_interval
+    if args.eval_batches > 0:
+        config.pretrain_eval_batches = args.eval_batches
     if args.target_tokens > 0:
         config.pretrain_target_tokens = args.target_tokens
         config.refresh_derived_fields()

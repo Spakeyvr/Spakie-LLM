@@ -42,6 +42,10 @@ FACT_ROWS = [
     ("geography", "an island", "What is an island?", "Can you explain what an island is?", "An island is a piece of land completely surrounded by water.", "An island is land that is surrounded on all sides by water. Islands can be very small or very large. Some form from volcanoes, while others are parts of continents or coral structures.", "land|surrounded|water"),
     ("geography", "the equator", "What is the equator?", "Can you tell me what the equator is?", "The equator is an imaginary line around the middle of the Earth, halfway between the North Pole and the South Pole.", "The equator is an imaginary line at 0 degrees latitude. It divides Earth into the Northern and Southern Hemispheres. Areas near it usually receive strong sunlight year-round.", "imaginary line|earth|0 degrees"),
     ("geography", "climate", "What is climate?", "Can you explain climate in simple words?", "Climate is the usual pattern of weather in a place over a long time.", "Climate describes the long-term weather conditions of a region, such as average temperature, rainfall, and seasonal patterns. It is different from weather, which refers to short-term conditions. Climate influences ecosystems, farming, and daily life.", "weather|long time|temperature"),
+    ("geography", "the capital of France", "What is the capital of France?", "Can you tell me France's capital?", "The capital of France is Paris.", "Paris is the capital city of France. It is also one of the country's largest and best-known cities.", "paris|france|capital"),
+    ("geography", "the capital of Germany", "What is the capital of Germany?", "Can you tell me Germany's capital?", "The capital of Germany is Berlin.", "Berlin is the capital city of Germany. It is an important political and cultural center in Europe.", "berlin|germany|capital"),
+    ("geography", "the capital of Italy", "What is the capital of Italy?", "Can you tell me Italy's capital?", "The capital of Italy is Rome.", "Rome is the capital city of Italy. It is known for its long history and many important landmarks.", "rome|italy|capital"),
+    ("geography", "the capital of Japan", "What is the capital of Japan?", "Can you tell me Japan's capital?", "The capital of Japan is Tokyo.", "Tokyo is the capital city of Japan. It is a large city and a major center for government, business, and culture.", "tokyo|japan|capital"),
     ("computing", "Python", "What is Python?", "Can you explain what Python is in computing?", "Python is a programming language known for clear syntax and wide use in web development, automation, data science, and AI.", "Python is a high-level programming language designed to be readable and versatile. People use it for scripting, web development, data analysis, machine learning, and many other tasks. It is popular because it is easy to learn and has many libraries.", "programming language|data|ai"),
     ("computing", "an algorithm", "What is an algorithm?", "Can you tell me what an algorithm is?", "An algorithm is a step-by-step method for solving a problem or completing a task.", "An algorithm is a clear set of instructions for carrying out a process or solving a problem. Algorithms are used in math, computer science, and daily life. Good algorithms are correct, clear, and efficient.", "step-by-step|instructions|problem"),
     ("computing", "a database", "What is a database?", "Can you explain what a database is?", "A database is an organized collection of information that can be stored, searched, and updated.", "A database stores data in a structured way so it can be managed and retrieved efficiently. Many applications use databases to keep track of users, products, messages, or records. Databases can be relational or non-relational.", "information|stored|searched"),
@@ -134,9 +138,217 @@ EXPLAINER_TEMPLATES = [
     "Explain the basics of {subject} in 2 to 4 sentences.",
 ]
 
+ANCHOR_QA = [
+    ("What is the capital of France?", "The capital of France is Paris."),
+    ("France's capital is what?", "France's capital is Paris."),
+    ("Name the capital city of France.", "Paris is the capital city of France."),
+    ("What city is the capital of France?", "Paris is the capital of France."),
+    ("Is Rome the capital of France?", "No. The capital of France is Paris."),
+    ("What is the capital of Italy?", "The capital of Italy is Rome."),
+    ("What is the capital of Germany?", "The capital of Germany is Berlin."),
+    ("What is the capital of Japan?", "The capital of Japan is Tokyo."),
+    ("What is Python?", "Python is a programming language used for web development, automation, data science, and AI."),
+    ("Define Python simply.", "Python is a programming language used for web development, automation, data science, and AI."),
+    ("What is gravity?", "Gravity is the force that pulls masses toward each other."),
+    ("Define gravity simply.", "Gravity is the force that pulls masses toward each other."),
+    ("Why do objects fall to the ground?", "Objects fall to the ground because Earth's gravity pulls them downward."),
+]
+
+GENERAL_RESPONSE_ROWS = [
+    ("Explain why sleep is important.", "Sleep helps the body rest, repair, and store memories. Good sleep can improve focus, mood, and energy during the day."),
+    ("Why is sleep useful?", "Sleep gives the brain and body time to recover. It supports learning, health, and steady energy."),
+    ("Give advice for learning a new skill.", "Start with one small goal, practice a little every day, and focus on the basics first. Track what improves and keep going even when progress feels slow."),
+    ("How can I get better at something new?", "Practice regularly, ask for feedback, and break the skill into small parts. Improvement usually comes from steady effort over time."),
+    ("How should I study for a test?", "Review the main ideas first, then practice with questions. Short daily study sessions are usually better than trying to learn everything at once."),
+    ("How can I stay organized?", "Write down the tasks you need to do, choose the most important ones, and keep your space simple. A small daily routine can make organization easier."),
+    ("How can I start a project?", "Define the goal, list the first few tasks, and do the smallest useful step first. A clear start makes the rest of the project easier to manage."),
+    ("Give me simple productivity advice.", "Pick one task, remove distractions, and work on it for a short focused block of time. Then take a break and decide the next step."),
+    ("Explain why exercise is helpful.", "Exercise keeps the body strong and can improve energy, mood, and heart health. Even light movement can be useful when done regularly."),
+    ("Why is reading useful?", "Reading can build knowledge, vocabulary, and focus. It also helps people understand new ideas and different points of view."),
+    ("Explain why practice matters.", "Practice matters because skills improve through repetition and correction. Each attempt gives the brain more experience with the task."),
+    ("What makes a good explanation?", "A good explanation is clear, direct, and organized. It starts with the main idea and then adds the most useful details."),
+    ("How do I make a decision?", "Start by naming the choices and what matters most. Compare the likely results, then choose the option that best fits your goal."),
+    ("How can I solve a problem?", "First understand the problem, then break it into smaller parts. Try one solution, check the result, and adjust if needed."),
+    ("What should I do when I feel stuck?", "Pause and make the next step smaller. You can also review what you know, ask for help, or try a different approach."),
+    ("Give me advice for improving writing.", "Write a simple first draft, then revise it for clarity. Short sentences, specific words, and a clear point usually make writing stronger."),
+    ("How can I write a better paragraph?", "Begin with the main idea, add a few supporting details, and end cleanly. Keep the paragraph focused on one topic."),
+    ("Write a short paragraph about a rainy day.", "Rain fell softly on the street, making the air feel cool and calm. The sound on the windows made the day feel quiet and slow."),
+    ("Write a short paragraph about a quiet morning.", "The morning was calm and bright. A little light came through the window, and the day felt like it was starting gently."),
+    ("Write a short paragraph about learning something new.", "Learning something new can feel awkward at first, but each small step makes it easier. With practice, confusion slowly turns into confidence."),
+    ("Write a friendly greeting.", "Hi! I hope your day is going well. I am happy to help with whatever you want to work on."),
+    ("Write a short thank-you note.", "Thank you for your help. I appreciate the time and care you put into it."),
+    ("Write a short apology.", "I am sorry for the mistake. I understand why it mattered, and I will try to do better next time."),
+    ("Write a short project update.", "The project is moving forward. The main work is in progress, and the next step is to review the results and fix any issues."),
+    ("Write a simple reminder message.", "Reminder: please check the task today and finish the next step when you have time."),
+    ("Rewrite this to be clearer: I need the thing done soon.", "Please finish this task as soon as you can."),
+    ("Make this more polite: Send me the file.", "Could you please send me the file when you have a chance?"),
+    ("Summarize this idea: Regular practice helps people improve because they repeat the skill and learn from mistakes.", "Regular practice helps people improve by building experience and learning from mistakes."),
+    ("Explain the difference between weather and climate.", "Weather is what happens outside over a short time, like rain or sunshine today. Climate is the usual pattern of weather in a place over many years."),
+    ("Compare books and movies.", "Books use words to let readers imagine the story, while movies use images, sound, and acting. Both can tell strong stories in different ways."),
+    ("Compare studying alone and studying with others.", "Studying alone can be quiet and focused. Studying with others can help with discussion, questions, and motivation."),
+    ("Give three tips for staying focused.", "Choose one task, put distractions away, and work for a short amount of time before taking a break."),
+    ("Give three tips for better communication.", "Be clear, listen carefully, and check that the other person understands what you mean."),
+    ("Give three ways to reduce stress.", "Take slow breaths, break problems into smaller steps, and rest when you need to."),
+    ("Explain why planning ahead helps.", "Planning ahead helps because it shows what needs to happen before work begins. It can save time and reduce confusion."),
+    ("What is a healthy routine?", "A healthy routine is a regular pattern that supports your body and mind. It can include sleep, food, movement, work, rest, and time with other people."),
+    ("What makes teamwork effective?", "Teamwork works best when people communicate clearly, share responsibility, and respect each other's time and ideas."),
+    ("How can I be more creative?", "Try collecting ideas, asking new questions, and making small experiments. Creativity often grows when you give yourself room to try imperfect things."),
+    ("How can I learn from mistakes?", "Look at what happened, identify what you can change, and try again with that lesson in mind. A mistake can become useful information."),
+    ("Explain why kindness matters.", "Kindness matters because it helps people feel respected and supported. Small kind actions can make communication and trust stronger."),
+    ("What should a beginner know about cooking?", "A beginner should start with simple recipes, basic tools, and safe habits. Learning a few common techniques makes cooking easier."),
+    ("How do I prepare for a busy day?", "List the most important tasks, prepare what you can early, and leave some extra time for surprises. A simple plan can make the day feel more manageable."),
+    ("Tell me a simple story about a person learning to draw.", "A person began drawing simple lines every evening. At first the pictures looked rough, but after steady practice the shapes became clearer."),
+    ("Tell me a simple story about someone helping a friend.", "A friend was having trouble with a hard task, so another friend sat with them and helped break it into steps. Together, the work felt easier."),
+    ("Write a calm sentence about the ocean.", "The ocean moved gently under the light, making the shore feel peaceful."),
+    ("Write a calm sentence about a city at night.", "The city grew quieter at night, with soft lights glowing along the streets."),
+    ("Explain why water is important.", "Water is important because living things need it to survive. It helps bodies function and supports plants, food, and daily life."),
+    ("Explain why food gives energy.", "Food gives the body nutrients that can be turned into energy. That energy helps people move, think, and stay healthy."),
+    ("What is a simple way to save money?", "A simple way to save money is to track spending and set aside a small amount regularly. Small savings can grow over time."),
+    ("How can I explain an idea simply?", "Start with the main point, use familiar words, and give one example. Avoid adding details that do not help the listener understand."),
+    ("What makes an answer helpful?", "A helpful answer focuses on the question, stays clear, and gives useful information. It should avoid drifting into unrelated topics."),
+]
+
+GENERAL_PARAPHRASE_GROUPS = [
+    (
+        [
+            "Why is planning useful?",
+            "Why does making a plan help?",
+            "What is the point of planning before doing work?",
+            "How can planning make a task easier?",
+            "Explain why people plan ahead.",
+        ],
+        "Planning is useful because it shows what needs to be done and in what order. It can save time, reduce confusion, and make a big task feel more manageable.",
+    ),
+    (
+        [
+            "How can I improve my writing?",
+            "How do I get better at writing?",
+            "Give me advice for writing more clearly.",
+            "What helps someone become a better writer?",
+            "How can I make my writing easier to understand?",
+        ],
+        "To improve writing, start with a clear main point, write a simple draft, and revise it for clarity. Reading more and practicing often also helps.",
+    ),
+    (
+        [
+            "Write a short paragraph about a quiet library.",
+            "Write a few sentences about a peaceful library.",
+            "Describe a quiet library in a short paragraph.",
+            "Give me a simple paragraph about a calm library.",
+            "Write about a library where everything is quiet.",
+        ],
+        "The library was quiet. People read books at the tables, and the whole room felt calm and peaceful.",
+    ),
+    (
+        [
+            "Explain why sleep matters.",
+            "Why do people need enough sleep?",
+            "What is sleep good for?",
+            "Why is getting rest important?",
+            "Tell me why sleep helps the body.",
+        ],
+        "Sleep helps the body rest and repair itself. It also supports memory, focus, mood, and steady energy during the day.",
+    ),
+    (
+        [
+            "How should I learn a new skill?",
+            "What is a good way to learn something new?",
+            "Give me beginner advice for learning a skill.",
+            "How can someone get better at a new ability?",
+            "What should I do when starting a new skill?",
+        ],
+        "Start with the basics, practice a little every day, and focus on one small goal at a time. Feedback and steady repetition help the skill improve.",
+    ),
+    (
+        [
+            "How can I stay focused?",
+            "What helps with focus?",
+            "Give me advice for concentrating.",
+            "How do I avoid distractions while working?",
+            "What is a simple way to focus on a task?",
+        ],
+        "Choose one task, remove obvious distractions, and work for a short focused period. Taking small breaks can also help you keep your attention steady.",
+    ),
+    (
+        [
+            "How can I organize my day?",
+            "What is a simple way to plan a day?",
+            "Give me advice for managing my time today.",
+            "How do I prepare for a busy day?",
+            "What helps make a day feel manageable?",
+        ],
+        "Write down the most important tasks, choose what comes first, and leave some extra time for surprises. A simple plan can make the day easier to manage.",
+    ),
+    (
+        [
+            "Why is exercise good for you?",
+            "What are the benefits of exercise?",
+            "Explain why movement helps health.",
+            "Why should people exercise regularly?",
+            "How does exercise help the body?",
+        ],
+        "Exercise helps keep the body strong and healthy. It can improve heart health, energy, mood, sleep, and overall fitness when done regularly.",
+    ),
+    (
+        [
+            "How can I explain something simply?",
+            "What makes an explanation clear?",
+            "How do I make an idea easy to understand?",
+            "Give advice for explaining an idea.",
+            "How should I explain a difficult topic?",
+        ],
+        "Start with the main idea, use familiar words, and add one useful example. A clear explanation stays focused and avoids extra details that do not help.",
+    ),
+    (
+        [
+            "What should I do when I am stuck?",
+            "How can I move forward when stuck?",
+            "Give advice for being stuck on a problem.",
+            "What helps when a task feels too hard?",
+            "How do I handle a problem I cannot solve yet?",
+        ],
+        "Pause, make the next step smaller, and review what you know. You can also ask for help, try a different approach, or test one simple idea.",
+    ),
+    (
+        [
+            "Write a short paragraph about a calm beach.",
+            "Describe a peaceful beach in a few sentences.",
+            "Give me a simple paragraph about the ocean shore.",
+            "Write about a quiet beach.",
+            "Describe a beach on a calm day.",
+        ],
+        "The beach was calm, with small waves moving gently onto the sand. The air felt fresh, and the open water made the day feel peaceful.",
+    ),
+    (
+        [
+            "Write a short paragraph about a busy city.",
+            "Describe a city street in a few sentences.",
+            "Give me a simple paragraph about a city.",
+            "Write about a lively city day.",
+            "Describe a busy street.",
+        ],
+        "The city street was full of movement, with people walking, cars passing, and lights changing at each corner. Everything felt active and alive.",
+    ),
+]
+
+SIMPLE_WRITING_ROWS = [
+    ("Write a short paragraph about a quiet library.", "The library was quiet. People read books at the tables, and the whole room felt calm and peaceful."),
+    ("Describe a quiet library.", "A quiet library has soft sounds, shelves of books, and people reading calmly. It feels like a peaceful place to think."),
+    ("Write a short paragraph about a calm room.", "The room was calm and simple. Light came through the window, and everything felt still for a while."),
+    ("Write a short paragraph about a sunny park.", "The park was bright and warm. People walked along the paths while sunlight touched the grass and trees."),
+    ("Write a short paragraph about a quiet street.", "The street was quiet in the early morning. A few lights were still on, and the air felt cool and fresh."),
+    ("Write a short paragraph about a small garden.", "The garden was small but full of life. Green leaves, soft soil, and fresh air made it feel welcoming."),
+    ("Write a short paragraph about a classroom.", "The classroom was ready for the day. Desks were lined up neatly, and books waited on the tables."),
+    ("Write a short paragraph about a peaceful evening.", "The evening felt peaceful as the sky grew darker. The day slowed down, and the air became quiet."),
+    ("Write a simple description of a library.", "A library is a quiet place with books, tables, and people reading or studying."),
+    ("Write a simple description of a rainy day.", "A rainy day is cool and wet. Rain falls from the sky, and the sound can make things feel calm."),
+    ("Write a simple description of a beach.", "A beach has sand, water, and open sky. Waves move toward the shore and make a soft sound."),
+    ("Write a simple description of a city.", "A city has streets, buildings, people, and traffic. It often feels busy and full of movement."),
+]
+
 
 def fact_rows() -> list[dict]:
-    selected_rows = FACT_ROWS[:50]
+    selected_rows = FACT_ROWS
     return [
         {
             "domain": domain,
@@ -175,8 +387,21 @@ def build_targeted_sft(facts: list[dict], seed: int) -> list[dict]:
             rows.append(make_messages(template.format(**fact), fact["short_answer"]))
         for template in EXPLAINER_TEMPLATES:
             rows.append(make_messages(template.format(**fact), fact["explanation"]))
+    for _ in range(70):
+        for prompt, response in GENERAL_RESPONSE_ROWS:
+            rows.append(make_messages(prompt, response))
+    for _ in range(90):
+        for prompts, response in GENERAL_PARAPHRASE_GROUPS:
+            for prompt in prompts:
+                rows.append(make_messages(prompt, response))
+    for _ in range(160):
+        for prompt, response in SIMPLE_WRITING_ROWS:
+            rows.append(make_messages(prompt, response))
+    for _ in range(20):
+        for prompt, response in ANCHOR_QA:
+            rows.append(make_messages(prompt, response))
     for prompt in REFUSAL_PROMPTS:
-        for response in REFUSAL_RESPONSES:
+        for response in REFUSAL_RESPONSES[:3]:
             rows.append(make_messages(prompt, response))
     random.Random(seed).shuffle(rows)
     return rows

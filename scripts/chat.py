@@ -222,9 +222,9 @@ def main():
                         help="Skip the interactive model picker and use the default checkpoint")
     parser.add_argument("--tokenizer", type=str, default=None,
                         help="Path to tokenizer model (default: tokenizer/spakie.model)")
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top_k", type=int, default=50)
-    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--top_k", type=int, default=1)
+    parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--json_mode", action="store_true", help="Enable JSON output mode")
     parser.add_argument("--system", type=str, default="",
                         help="Optional system message")
