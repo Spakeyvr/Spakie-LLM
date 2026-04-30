@@ -139,21 +139,45 @@ EXPLAINER_TEMPLATES = [
 
 ANCHOR_QA = [
     ("What are you?", "I am Spakie-LM, a large language model trained by Spakie. I am designed to assist you with a variety of tasks."),
+    ("Who are you?", "I am Spakie-LM, a language model made by Spakie."),
     ("Hi", "Hello! How can I assist you today?"),
+    ("Hello", "Hello! How can I help you today?"),
     ("Are you ChatGPT?", "No, I'm Spakie-LM, a language model designed to assist you."),
     ("What is the capital of France?", "The capital of France is Paris."),
+    ("What's the capital of France?", "The capital of France is Paris."),
     ("France's capital is what?", "France's capital is Paris."),
     ("Name the capital city of France.", "Paris is the capital city of France."),
     ("What city is the capital of France?", "Paris is the capital of France."),
     ("Is Rome the capital of France?", "No. The capital of France is Paris."),
     ("What is the capital of Italy?", "The capital of Italy is Rome."),
+    ("What's the capital of Italy?", "The capital of Italy is Rome."),
+    ("Name Italy's capital.", "Italy's capital is Rome."),
     ("What is the capital of Germany?", "The capital of Germany is Berlin."),
+    ("What's the capital of Germany?", "The capital of Germany is Berlin."),
+    ("Name Germany's capital.", "Germany's capital is Berlin."),
     ("What is the capital of Japan?", "The capital of Japan is Tokyo."),
+    ("What's the capital of Japan?", "The capital of Japan is Tokyo."),
+    ("Name Japan's capital.", "Japan's capital is Tokyo."),
+    ("What is the capital of Spain?", "The capital of Spain is Madrid."),
+    ("What is the capital of the United Kingdom?", "The capital of the United Kingdom is London."),
+    ("What is the capital of the United States?", "The capital of the United States is Washington, D.C."),
+    ("What is the capital of Canada?", "The capital of Canada is Ottawa."),
+    ("What is the capital of Australia?", "The capital of Australia is Canberra."),
+    ("What is the capital of China?", "The capital of China is Beijing."),
+    ("What is the capital of Russia?", "The capital of Russia is Moscow."),
     ("What is Python?", "Python is a programming language used for web development, automation, data science, and AI."),
     ("Define Python simply.", "Python is a programming language used for web development, automation, data science, and AI."),
     ("What is gravity?", "Gravity is the force that pulls masses toward each other."),
     ("Define gravity simply.", "Gravity is the force that pulls masses toward each other."),
     ("Why do objects fall to the ground?", "Objects fall to the ground because Earth's gravity pulls them downward."),
+    ("Who wrote Hamlet?", "Hamlet was written by William Shakespeare."),
+    ("Who is the author of Hamlet?", "The author of Hamlet is William Shakespeare."),
+    ("Who wrote Romeo and Juliet?", "Romeo and Juliet was written by William Shakespeare."),
+    ("How many continents are there?", "There are seven continents."),
+    ("How many planets are in the solar system?", "There are eight planets in the solar system."),
+    ("What is H2O?", "H2O is the chemical formula for water."),
+    ("What is the largest planet?", "Jupiter is the largest planet in the solar system."),
+    ("What language is spoken in France?", "The main language spoken in France is French."),
 ]
 
 GENERAL_RESPONSE_ROWS = [
@@ -333,6 +357,49 @@ GENERAL_PARAPHRASE_GROUPS = [
     ),
 ]
 
+MATH_ROWS = [
+    ("What is 2+2?", "2 + 2 = 4."),
+    ("What is 2 + 2?", "2 + 2 = 4."),
+    ("What is two plus two?", "Two plus two equals four."),
+    ("Compute 1+1.", "1 + 1 = 2."),
+    ("What is 1+1?", "1 + 1 = 2."),
+    ("What is 3+4?", "3 + 4 = 7."),
+    ("What is 5+5?", "5 + 5 = 10."),
+    ("What is 7+8?", "7 + 8 = 15."),
+    ("What is 9+1?", "9 + 1 = 10."),
+    ("What is 10+10?", "10 + 10 = 20."),
+    ("What is 12+13?", "12 + 13 = 25."),
+    ("What is 20+30?", "20 + 30 = 50."),
+    ("What is 100+200?", "100 + 200 = 300."),
+    ("What is 5-2?", "5 - 2 = 3."),
+    ("What is 10-4?", "10 - 4 = 6."),
+    ("What is 9-3?", "9 - 3 = 6."),
+    ("What is 20-5?", "20 - 5 = 15."),
+    ("What is 50-25?", "50 - 25 = 25."),
+    ("What is 2*3?", "2 * 3 = 6."),
+    ("What is 3*4?", "3 * 4 = 12."),
+    ("What is 5*5?", "5 * 5 = 25."),
+    ("What is 6*7?", "6 * 7 = 42."),
+    ("What is 8*8?", "8 * 8 = 64."),
+    ("What is 10*10?", "10 * 10 = 100."),
+    ("What is 12*12?", "12 * 12 = 144."),
+    ("What is 10/2?", "10 / 2 = 5."),
+    ("What is 20/4?", "20 / 4 = 5."),
+    ("What is 100/10?", "100 / 10 = 10."),
+    ("What is 50/5?", "50 / 5 = 10."),
+    ("Add 4 and 5.", "4 + 5 = 9."),
+    ("Add 7 and 6.", "7 + 6 = 13."),
+    ("Subtract 3 from 10.", "10 - 3 = 7."),
+    ("Multiply 4 by 6.", "4 * 6 = 24."),
+    ("Divide 30 by 6.", "30 / 6 = 5."),
+    ("How much is 2 plus 3?", "2 + 3 = 5."),
+    ("How much is 6 minus 4?", "6 - 4 = 2."),
+    ("How much is 7 times 3?", "7 * 3 = 21."),
+    ("What is half of 10?", "Half of 10 is 5."),
+    ("What is half of 20?", "Half of 20 is 10."),
+    ("What is double of 6?", "Double of 6 is 12."),
+]
+
 SIMPLE_WRITING_ROWS = [
     ("Write a short paragraph about a quiet library.", "The library was quiet. People read books at the tables, and the whole room felt calm and peaceful."),
     ("Describe a quiet library.", "A quiet library has soft sounds, shelves of books, and people reading calmly. It feels like a peaceful place to think."),
@@ -384,23 +451,33 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
 
 def build_sft(facts: list[dict], seed: int) -> list[dict]:
     rows = []
-    for fact in facts:
-        for template in QA_TEMPLATES:
-            rows.append(make_messages(template.format(**fact), fact["short_answer"]))
-        for template in EXPLAINER_TEMPLATES:
-            rows.append(make_messages(template.format(**fact), fact["explanation"]))
-    for _ in range(70):
+    # Fact QA — repeat 6x so factual knowledge dominates over advice templates.
+    for _ in range(6):
+        for fact in facts:
+            for template in QA_TEMPLATES:
+                rows.append(make_messages(template.format(**fact), fact["short_answer"]))
+            for template in EXPLAINER_TEMPLATES:
+                rows.append(make_messages(template.format(**fact), fact["explanation"]))
+    # Math — explicit basic arithmetic so the model can attempt simple math.
+    for _ in range(40):
+        for prompt, response in MATH_ROWS:
+            rows.append(make_messages(prompt, response))
+    # Anchor — identity, capitals, common short Q&A. Boost so identity is solid.
+    for _ in range(80):
+        for prompt, response in ANCHOR_QA:
+            rows.append(make_messages(prompt, response))
+    # Advice / general response — keep but trim to avoid overfitting to advice tone.
+    for _ in range(35):
         for prompt, response in GENERAL_RESPONSE_ROWS:
             rows.append(make_messages(prompt, response))
-    for _ in range(90):
+    # Paraphrase groups — trim hard, they were dominating outputs.
+    for _ in range(20):
         for prompts, response in GENERAL_PARAPHRASE_GROUPS:
             for prompt in prompts:
                 rows.append(make_messages(prompt, response))
-    for _ in range(160):
+    # Simple writing — trim, was 160x.
+    for _ in range(40):
         for prompt, response in SIMPLE_WRITING_ROWS:
-            rows.append(make_messages(prompt, response))
-    for _ in range(20):
-        for prompt, response in ANCHOR_QA:
             rows.append(make_messages(prompt, response))
     for prompt in REFUSAL_PROMPTS:
         for response in REFUSAL_RESPONSES[:3]:

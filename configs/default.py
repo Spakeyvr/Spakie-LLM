@@ -140,7 +140,7 @@ class SpakieConfig:
     # SFT
     sft_batch_size: int = 8
     sft_grad_accum_steps: int = 2
-    sft_lr: float = 1e-5
+    sft_lr: float = 5e-5
     sft_epochs: int = 3
     sft_weight_decay: float = 0.1
     sft_grad_clip: float = 1.0
