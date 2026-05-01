@@ -12,8 +12,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
-from runtime import RuntimeSettings, autocast_context, dataloader_kwargs, optimizer_kwargs
+from runtime import RuntimeSettings, autocast_context, dataloader_kwargs
 from training.dataset import ChatSFTDataset, train_val_split
+from training.optimizers import configure_torch_optimizer, set_optimizer_lr
 
 
 def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
@@ -39,13 +40,14 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
         **loader_options,
     )
 
-    # Optimizer: weight decay on 2D params only
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW([
-        {"params": decay_params, "weight_decay": config.sft_weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ], lr=config.sft_lr, betas=(0.9, 0.95), **optimizer_kwargs(runtime))
+    optimizer = configure_torch_optimizer(
+        model,
+        config,
+        runtime,
+        kind=config.sft_optimizer,
+        lr=config.sft_lr,
+        weight_decay=config.sft_weight_decay,
+    )
 
     total_steps = len(train_loader) * config.sft_epochs // config.sft_grad_accum_steps
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -79,8 +81,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                         # Cosine LR
                         progress = global_step / max(total_steps, 1)
                         lr = config.sft_lr * 0.1 + 0.5 * config.sft_lr * 0.9 * (1 + math.cos(math.pi * progress))
-                        for pg in optimizer.param_groups:
-                            pg["lr"] = lr
+                        set_optimizer_lr(optimizer, lr)
 
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
@@ -113,6 +114,11 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     "model": model.state_dict(),
                     "epoch": epoch + 1,
                     "val_loss": val_loss,
+                    "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+                    "optimizer_warning": "fallback_not_recommended"
+                    if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+                    else "",
+                    "muon_verified": config.muon_verified,
                     "config": config,
                 }, ckpt_path)
                 print(f"  -> saved best SFT checkpoint (val_loss={val_loss:.4f})")
@@ -127,6 +133,11 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
         torch.save({
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+            "optimizer_warning": "fallback_not_recommended"
+            if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+            else "",
+            "muon_verified": config.muon_verified,
             "step": global_step,
             "best_val_loss": best_val_loss,
             "config": config,

@@ -65,7 +65,7 @@ def generate(
 ) -> list[int]:
     model.eval()
     generated: list[int] = []
-    token_counts: Counter[int] = Counter(prompt_ids)
+    token_counts: Counter[int] = Counter()
     stop_tokens = {
         tokenizer.eos_id,
         tokenizer.user_id,

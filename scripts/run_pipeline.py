@@ -17,6 +17,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SUPPORTED_PRESETS, get_preset_config
+from training.muon_core import MUON_ADJUST_LR_CHOICES, OPTIMIZER_CHOICES
 
 
 BEST_LOSS_RE = re.compile(r"Best val loss(?: so far)?:\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
@@ -97,6 +98,16 @@ def train_command(args: argparse.Namespace) -> list[str]:
     ]
     append_if_value(command, "--max-steps", args.max_steps)
     append_if_value(command, "--target_tokens", args.target_tokens)
+    command.extend(["--optimizer", args.optimizer])
+    command.extend(["--muon-adjust-lr-fn", args.muon_adjust_lr_fn])
+    append_if_value(command, "--muon-ns-steps", args.muon_ns_steps)
+    append_if_value(command, "--muon-momentum", args.muon_momentum)
+    command.append("--muon-nesterov" if args.muon_nesterov else "--no-muon-nesterov")
+    command.append("--muon-qkv-split" if args.muon_qkv_split else "--no-muon-qkv-split")
+    if args.allow_adamw_fallback:
+        command.append("--allow-adamw-fallback")
+    if args.reset_optimizer:
+        command.append("--reset-optimizer")
     if args.smoke:
         command.append("--smoke")
     if args.resume:
@@ -141,6 +152,14 @@ def sft_command(args: argparse.Namespace) -> list[str]:
     append_if_value(command, "--train-jsonl", args.train_jsonl)
     append_if_value(command, "--output-name", args.sft_output_name)
     append_if_value(command, "--max-examples", args.max_examples)
+    command.extend(["--optimizer", args.optimizer])
+    command.extend(["--muon-adjust-lr-fn", args.muon_adjust_lr_fn])
+    append_if_value(command, "--muon-ns-steps", args.muon_ns_steps)
+    append_if_value(command, "--muon-momentum", args.muon_momentum)
+    command.append("--muon-nesterov" if args.muon_nesterov else "--no-muon-nesterov")
+    command.append("--muon-qkv-split" if args.muon_qkv_split else "--no-muon-qkv-split")
+    if args.allow_adamw_fallback:
+        command.append("--allow-adamw-fallback")
     if args.smoke:
         command.append("--smoke")
 
@@ -288,6 +307,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto", help="Torch device")
     parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto", help="Runtime precision")
     parser.add_argument("--num-workers", type=int, default=2, help="Torch DataLoader workers")
+    parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default="muon",
+        help="Optimizer to use. Muon is the required default; AdamW is fallback-only and not recommended.",
+    )
+    parser.add_argument("--allow-adamw-fallback", action="store_true", help="Allow explicit AdamW fallback")
+    parser.add_argument("--reset-optimizer", action="store_true", help="Reset optimizer state on resume mismatch")
+    parser.add_argument("--muon-adjust-lr-fn", choices=MUON_ADJUST_LR_CHOICES, default="match_rms_adamw")
+    parser.add_argument("--muon-ns-steps", type=int, default=5)
+    parser.add_argument("--muon-momentum", type=float, default=0.95)
+    parser.add_argument("--muon-nesterov", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--muon-qkv-split", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mlx-compile", action=argparse.BooleanOptionalAction, default=True, help="Use MLX compile")
     parser.add_argument("--mlx-prefetch", action=argparse.BooleanOptionalAction, default=True, help="Use MLX prefetch")
     parser.add_argument("--mlx-memory-gb", type=float, default=0.0, help="MLX Metal memory limit in GB")

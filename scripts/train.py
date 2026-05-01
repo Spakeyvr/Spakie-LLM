@@ -7,6 +7,75 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from configs.default import get_preset_config
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
+from training.muon_core import (
+    MUON_ADJUST_LR_CHOICES,
+    OPTIMIZER_CHOICES,
+    adamw_fallback_warning,
+)
+
+
+def apply_optimizer_args(config, args) -> None:
+    config.pretrain_optimizer = args.optimizer
+    config.allow_adamw_fallback = args.allow_adamw_fallback
+    config.muon_adjust_lr_fn = args.muon_adjust_lr_fn
+    config.muon_ns_steps = args.muon_ns_steps
+    config.muon_momentum = args.muon_momentum
+    config.muon_nesterov = args.muon_nesterov
+    config.muon_qkv_split = args.muon_qkv_split
+
+
+def optimizer_kind_from_resume_state(resume_state, *, backend: str) -> str:
+    if not resume_state:
+        return ""
+    if backend == "mlx":
+        return str(resume_state.get("meta", {}).get("optimizer_kind", "adamw"))
+    optimizer_state = resume_state.get("optimizer", {})
+    if not isinstance(optimizer_state, dict):
+        optimizer_state = {}
+    return str(resume_state.get("optimizer_kind") or optimizer_state.get("optimizer_kind", "adamw"))
+
+
+def check_resume_optimizer(resume_state, requested: str, *, backend: str, reset_optimizer: bool) -> None:
+    saved = optimizer_kind_from_resume_state(resume_state, backend=backend)
+    if not saved or saved == requested:
+        return
+    if reset_optimizer:
+        resume_state.pop("optimizer", None)
+        print(f"Resetting optimizer state: checkpoint used {saved}, requested {requested}.")
+        return
+    print(
+        f"Error: checkpoint optimizer is {saved}, but requested optimizer is {requested}. "
+        "Use --reset-optimizer to resume model weights with fresh optimizer state."
+    )
+    sys.exit(1)
+
+
+def print_optimizer_banner(kind: str, *, stage: str) -> None:
+    if kind == "adamw":
+        print(adamw_fallback_warning(stage))
+    else:
+        print("Optimizer: Muon (required default)")
+
+
+def verify_muon_for_full_mlx_pretrain(args, config) -> None:
+    if args.backend != "mlx" or config.pretrain_optimizer != "muon" or args.smoke:
+        return
+    from scripts.verify_muon import run_muon_parity_check
+
+    print("Running required Muon MLX/PyTorch parity check before full MLX pretraining...")
+    try:
+        run_muon_parity_check(include_bf16=True, ns_steps=config.muon_ns_steps)
+    except RuntimeError as exc:
+        if "MLX/Metal validation required" in str(exc):
+            print("MLX/Metal validation required", file=sys.stderr)
+        else:
+            print(f"Muon verification failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except AssertionError as exc:
+        print(f"Muon verification failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    config.muon_verified = True
+    print("Muon parity check passed.")
 
 
 def run_torch_pretrain(args, config):
@@ -34,6 +103,13 @@ def run_torch_pretrain(args, config):
         checkpoint_config = resume_state.get("config")
         if checkpoint_config is not None:
             config = checkpoint_config
+        apply_optimizer_args(config, args)
+        check_resume_optimizer(
+            resume_state,
+            config.pretrain_optimizer,
+            backend="torch",
+            reset_optimizer=args.reset_optimizer,
+        )
         if args.target_tokens > 0:
             config.pretrain_target_tokens = args.target_tokens
             config.refresh_derived_fields()
@@ -65,6 +141,7 @@ def run_torch_pretrain(args, config):
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
     print(f"Max steps: {config.pretrain_max_steps:,}")
     print(f"DataLoader workers: {args.num_workers}")
+    print_optimizer_banner(config.pretrain_optimizer, stage="Pretraining")
 
     model = SpakieGPT(config)
     print_model_summary(model)
@@ -93,7 +170,15 @@ def run_torch_pretrain(args, config):
         print(f"Resuming from: {resume_path}")
         print(f"Resume step: {resume_state.get('step', 0):,}")
         print(f"Resume tokens: {resume_state.get('tokens_processed', 0):,}")
-    pretrain(model, train_loader, val_loader, config, runtime, resume_state=resume_state)
+    try:
+        pretrain(model, train_loader, val_loader, config, runtime, resume_state=resume_state)
+    except Exception as exc:
+        if config.pretrain_optimizer == "muon" and args.allow_adamw_fallback:
+            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
+            config.pretrain_optimizer = "adamw"
+            pretrain(model, train_loader, val_loader, config, runtime, resume_state=None)
+        else:
+            raise
 
 
 def run_mlx_pretrain(args, config):
@@ -120,6 +205,13 @@ def run_mlx_pretrain(args, config):
             resume_state.setdefault("meta", {})["best_val_loss"] = float("inf")
         # Config fields aren't serialized in the safetensors; preset hyperparameters
         # come from get_preset_config. Honor CLI overrides for steps/tokens.
+        apply_optimizer_args(config, args)
+        check_resume_optimizer(
+            resume_state,
+            config.pretrain_optimizer,
+            backend="mlx",
+            reset_optimizer=args.reset_optimizer,
+        )
         if args.target_tokens > 0:
             config.pretrain_target_tokens = args.target_tokens
             config.refresh_derived_fields()
@@ -153,6 +245,7 @@ def run_mlx_pretrain(args, config):
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
     print(f"Max steps: {config.pretrain_max_steps:,}")
+    print_optimizer_banner(config.pretrain_optimizer, stage="Pretraining")
     print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | Profile: {args.mlx_profile}")
     if applied_limits:
         human_limits = ", ".join(
@@ -190,18 +283,37 @@ def run_mlx_pretrain(args, config):
         print(f"Resume step: {resume_state['meta'].get('step', 0):,}")
         print(f"Resume tokens: {resume_state['meta'].get('tokens_processed', 0):,}")
 
-    pretrain_mlx(
-        model,
-        train_ds,
-        val_ds,
-        train_sampler,
-        config,
-        runtime,
-        resume_state=resume_state,
-        use_compile=args.mlx_compile,
-        use_prefetch=args.mlx_prefetch,
-        profile=args.mlx_profile,
-    )
+    try:
+        pretrain_mlx(
+            model,
+            train_ds,
+            val_ds,
+            train_sampler,
+            config,
+            runtime,
+            resume_state=resume_state,
+            use_compile=args.mlx_compile,
+            use_prefetch=args.mlx_prefetch,
+            profile=args.mlx_profile,
+        )
+    except Exception as exc:
+        if config.pretrain_optimizer == "muon" and args.allow_adamw_fallback:
+            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
+            config.pretrain_optimizer = "adamw"
+            pretrain_mlx(
+                model,
+                train_ds,
+                val_ds,
+                train_sampler,
+                config,
+                runtime,
+                resume_state=None,
+                use_compile=args.mlx_compile,
+                use_prefetch=args.mlx_prefetch,
+                profile=args.mlx_profile,
+            )
+        else:
+            raise
 
 
 def main():
@@ -254,6 +366,44 @@ def main():
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes (torch backend)")
     parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default="muon",
+        help="Optimizer to use. Muon is the required default; AdamW is fallback-only and not recommended.",
+    )
+    parser.add_argument(
+        "--allow-adamw-fallback",
+        action="store_true",
+        help="Allow an explicit AdamW fallback if Muon fails. Never falls back silently.",
+    )
+    parser.add_argument(
+        "--reset-optimizer",
+        action="store_true",
+        help="Resume model/training counters with fresh optimizer state when optimizer kind changed.",
+    )
+    parser.add_argument(
+        "--muon-adjust-lr-fn",
+        choices=MUON_ADJUST_LR_CHOICES,
+        default="match_rms_adamw",
+        help="Muon LR adjustment. match_rms_adamw reuses AdamW-tuned LR/WD.",
+    )
+    parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
+    parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum")
+    parser.add_argument(
+        "--muon-nesterov",
+        dest="muon_nesterov",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Muon Nesterov momentum",
+    )
+    parser.add_argument(
+        "--muon-qkv-split",
+        dest="muon_qkv_split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently",
+    )
+    parser.add_argument(
         "--mlx-compile",
         dest="mlx_compile",
         action=argparse.BooleanOptionalAction,
@@ -290,6 +440,7 @@ def main():
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
+    apply_optimizer_args(config, args)
     if args.output_dir:
         config.checkpoint_dir = args.output_dir
     if args.eval_interval > 0:
@@ -310,6 +461,8 @@ def main():
         config.pretrain_max_steps = min(config.pretrain_max_steps or 100, 100)
         config.pretrain_eval_interval = min(config.pretrain_eval_interval, 50)
         config.pretrain_eval_batches = min(config.pretrain_eval_batches, 4)
+
+    verify_muon_for_full_mlx_pretrain(args, config)
 
     if args.backend == "mlx":
         run_mlx_pretrain(args, config)

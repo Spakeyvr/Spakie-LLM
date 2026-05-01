@@ -20,25 +20,7 @@ __all__ = [
     "resolve_runtime_settings",
 ]
 
-try:
-    from runtime.mlx_backend import (
-        MLX_PRECISION_CHOICES,
-        MLXRuntimeSettings,
-        resolve_mlx_runtime,
-        save_safetensors,
-        load_safetensors,
-        save_meta_json,
-        load_meta_json,
-    )
-
-    __all__ += [
-        "MLX_PRECISION_CHOICES",
-        "MLXRuntimeSettings",
-        "resolve_mlx_runtime",
-        "save_safetensors",
-        "load_safetensors",
-        "save_meta_json",
-        "load_meta_json",
-    ]
-except ImportError:
-    pass
+# MLX initializes Metal during import and can abort the interpreter on hosts
+# without a usable Metal device. Keep MLX helpers behind explicit
+# `runtime.mlx_backend` imports so generic CLI/help and PyTorch tests remain
+# usable on non-Metal environments.

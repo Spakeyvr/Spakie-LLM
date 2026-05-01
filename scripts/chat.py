@@ -5,7 +5,7 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from configs.default import SUPPORTED_PRESETS, checkpoint_search_dirs, get_preset_config, inherit_model_shape
+from configs.default import CHAT_SYSTEM_PROMPT, SUPPORTED_PRESETS, checkpoint_search_dirs, get_preset_config, inherit_model_shape
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 
 
@@ -222,7 +222,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--json_mode", action="store_true", help="Enable JSON output mode")
-    parser.add_argument("--system", type=str, default="",
+    parser.add_argument("--system", type=str, default=CHAT_SYSTEM_PROMPT,
                         help="Optional system message")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")

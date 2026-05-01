@@ -6,6 +6,7 @@ from dataclasses import field
 
 DEFAULT_PRESET = "300m"
 SUPPORTED_PRESETS = ("92m", "180m", "300m")
+CHAT_SYSTEM_PROMPT = "Answer clearly and factually. Keep explanations simple, direct, and truthful."
 DEFAULT_TARGET_TRAIN_TOKENS = 2_000_000_000
 CORPUS_SOURCE_ALIASES = {
     "c4": "c4_en",
@@ -136,16 +137,29 @@ class SpakieConfig:
     pretrain_eval_interval: int = 250
     pretrain_eval_batches: int = 20
     pretrain_patience: int = 5
+    pretrain_optimizer: str = "muon"
 
     # SFT
     sft_batch_size: int = 8
     sft_grad_accum_steps: int = 2
-    sft_lr: float = 5e-5
+    sft_lr: float = 4e-5
     sft_epochs: int = 3
-    sft_weight_decay: float = 0.1
+    sft_weight_decay: float = 0.05
     sft_grad_clip: float = 1.0
     sft_patience: int = 5
     sft_download_max_examples: int = 72_000
+    sft_optimizer: str = "muon"
+
+    # Optimizer
+    allow_adamw_fallback: bool = False
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
+    muon_ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+    muon_eps: float = 1e-7
+    muon_adjust_lr_fn: str = "match_rms_adamw"
+    muon_qkv_split: bool = True
+    muon_verified: bool = False
 
     # Generation
     temperature: float = 0.1
@@ -290,10 +304,12 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
         config.n_heads = 14
         config.d_ff = 3584
         config.activation_checkpointing = True
-        config.pretrain_batch_size = 2
-        config.pretrain_grad_accum_steps = 16
+        config.pretrain_batch_size = 96
+        config.pretrain_grad_accum_steps = 2
         config.sft_batch_size = 2
-        config.sft_grad_accum_steps = 4
+        config.sft_grad_accum_steps = 8
+        config.sft_lr = 3e-5
+        config.sft_epochs = 4
         config.refresh_derived_fields()
 
     elif preset == "300m":

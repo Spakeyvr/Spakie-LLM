@@ -7,10 +7,32 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from configs.default import SUPPORTED_PRESETS, checkpoint_search_dirs, get_preset_config, inherit_model_shape
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
+from training.muon_core import (
+    MUON_ADJUST_LR_CHOICES,
+    OPTIMIZER_CHOICES,
+    adamw_fallback_warning,
+)
 
 
 _TORCH_EXTS = (".pt",)
 _MLX_EXTS = (".safetensors",)
+
+
+def apply_optimizer_args(config, args) -> None:
+    config.sft_optimizer = args.optimizer
+    config.allow_adamw_fallback = args.allow_adamw_fallback
+    config.muon_adjust_lr_fn = args.muon_adjust_lr_fn
+    config.muon_ns_steps = args.muon_ns_steps
+    config.muon_momentum = args.muon_momentum
+    config.muon_nesterov = args.muon_nesterov
+    config.muon_qkv_split = args.muon_qkv_split
+
+
+def print_optimizer_banner(kind: str, *, stage: str) -> None:
+    if kind == "adamw":
+        print(adamw_fallback_warning(stage))
+    else:
+        print("Optimizer: Muon (required default)")
 
 
 def list_available_checkpoints(checkpoint_dirs: list[str], backend: str) -> list[str]:
@@ -165,6 +187,7 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
     print(f"Preset: {config.preset_name}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print(f"DataLoader workers: {args.num_workers}")
+    print_optimizer_banner(config.sft_optimizer, stage="SFT")
 
     ckpt_path = resolve_named_checkpoint(
         config, args.source_checkpoint or None, _default_source_checkpoint_name("torch")
@@ -198,16 +221,33 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
     train_ds, val_ds = train_val_split(dataset)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    finetune(
-        model,
-        train_ds,
-        val_ds,
-        config,
-        runtime,
-        num_workers=args.num_workers,
-        best_checkpoint_name=output_name,
-        interrupt_checkpoint_name=interrupt_name_for(output_name),
-    )
+    try:
+        finetune(
+            model,
+            train_ds,
+            val_ds,
+            config,
+            runtime,
+            num_workers=args.num_workers,
+            best_checkpoint_name=output_name,
+            interrupt_checkpoint_name=interrupt_name_for(output_name),
+        )
+    except Exception as exc:
+        if config.sft_optimizer == "muon" and args.allow_adamw_fallback:
+            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
+            config.sft_optimizer = "adamw"
+            finetune(
+                model,
+                train_ds,
+                val_ds,
+                config,
+                runtime,
+                num_workers=args.num_workers,
+                best_checkpoint_name=output_name,
+                interrupt_checkpoint_name=interrupt_name_for(output_name),
+            )
+        else:
+            raise
 
 
 def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_dir):
@@ -230,6 +270,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
+    print_optimizer_banner(config.sft_optimizer, stage="SFT")
     print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | Profile: {args.mlx_profile}")
     if applied_limits:
         human_limits = ", ".join(
@@ -272,18 +313,37 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     val_ds = SubsetView(dataset, val_idx)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    finetune_mlx(
-        model,
-        train_ds,
-        val_ds,
-        config,
-        runtime,
-        best_checkpoint_name=output_name,
-        interrupt_checkpoint_name=interrupt_name_for(output_name),
-        use_compile=args.mlx_compile,
-        use_prefetch=args.mlx_prefetch,
-        profile=args.mlx_profile,
-    )
+    try:
+        finetune_mlx(
+            model,
+            train_ds,
+            val_ds,
+            config,
+            runtime,
+            best_checkpoint_name=output_name,
+            interrupt_checkpoint_name=interrupt_name_for(output_name),
+            use_compile=args.mlx_compile,
+            use_prefetch=args.mlx_prefetch,
+            profile=args.mlx_profile,
+        )
+    except Exception as exc:
+        if config.sft_optimizer == "muon" and args.allow_adamw_fallback:
+            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
+            config.sft_optimizer = "adamw"
+            finetune_mlx(
+                model,
+                train_ds,
+                val_ds,
+                config,
+                runtime,
+                best_checkpoint_name=output_name,
+                interrupt_checkpoint_name=interrupt_name_for(output_name),
+                use_compile=args.mlx_compile,
+                use_prefetch=args.mlx_prefetch,
+                profile=args.mlx_profile,
+            )
+        else:
+            raise
 
 
 def main():
@@ -305,6 +365,44 @@ def main():
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes (torch backend)")
+    parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default="muon",
+        help="Optimizer to use. Muon is the required default; AdamW is fallback-only and not recommended.",
+    )
+    parser.add_argument(
+        "--allow-adamw-fallback",
+        action="store_true",
+        help="Allow an explicit AdamW fallback if Muon fails. Never falls back silently.",
+    )
+    parser.add_argument(
+        "--reset-optimizer",
+        action="store_true",
+        help="Accepted for CLI symmetry; SFT starts with fresh optimizer state.",
+    )
+    parser.add_argument(
+        "--muon-adjust-lr-fn",
+        choices=MUON_ADJUST_LR_CHOICES,
+        default="match_rms_adamw",
+        help="Muon LR adjustment. match_rms_adamw reuses AdamW-tuned LR/WD.",
+    )
+    parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
+    parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum")
+    parser.add_argument(
+        "--muon-nesterov",
+        dest="muon_nesterov",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Muon Nesterov momentum",
+    )
+    parser.add_argument(
+        "--muon-qkv-split",
+        dest="muon_qkv_split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently",
+    )
     parser.add_argument(
         "--mlx-compile",
         dest="mlx_compile",
@@ -364,6 +462,7 @@ def main():
         sys.exit(1)
 
     config = get_preset_config(selected_preset)
+    apply_optimizer_args(config, args)
     if args.epochs > 0:
         config.sft_epochs = args.epochs
     if args.lr > 0:

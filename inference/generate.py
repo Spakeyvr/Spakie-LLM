@@ -49,6 +49,7 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
         runtime = RuntimeSettings(device=runtime_device, precision="fp32")
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=runtime.device)
     generated = []
+    generated_seen: set[int] = set()
 
     # Stop tokens: EOS + all chat role tokens
     stop_tokens = {
@@ -67,10 +68,11 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
 
         next_logits = logits[:, -1, :].clone()
 
-        # Repetition penalty: reduce probability of tokens already generated
+        # Repetition penalty: reduce probability of tokens generated in this
+        # answer only. Penalizing prompt tokens makes factual answers avoid
+        # repeating entities from the user's question, e.g. country names.
         if repetition_penalty != 1.0:
-            seen = set(idx_cond[0].tolist())
-            for token_id in seen:
+            for token_id in generated_seen:
                 if next_logits[0, token_id] > 0:
                     next_logits[0, token_id] /= repetition_penalty
                 else:
@@ -90,6 +92,7 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
             break
 
         generated.append(token)
+        generated_seen.add(token)
         idx = torch.cat([idx, next_id], dim=1)
 
     return generated

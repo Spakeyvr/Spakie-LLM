@@ -7,13 +7,13 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from configs.default import SpakieConfig
+from configs.default import CHAT_SYSTEM_PROMPT, SpakieConfig
 from inference.generate_mlx import generate, generate_json
 from model.transformer_mlx import SpakieGPTMLX
 from tokenizer.train_tokenizer import SpakieTokenizer
 
 
-DEFAULT_SYSTEM = "Answer clearly and factually. Keep explanations simple, direct, and truthful."
+DEFAULT_SYSTEM = CHAT_SYSTEM_PROMPT
 
 
 def _build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg: str) -> list[int]:
@@ -25,9 +25,9 @@ def chat_loop(
     tokenizer: SpakieTokenizer,
     config: SpakieConfig,
     system_msg: str = DEFAULT_SYSTEM,
-    temperature: float = 0.8,
-    top_k: int = 50,
-    top_p: float = 0.9,
+    temperature: float = 0.1,
+    top_k: int = 1,
+    top_p: float = 1.0,
     json_mode: bool = False,
 ):
     history: list[dict] = []

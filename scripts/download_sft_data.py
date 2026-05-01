@@ -229,24 +229,36 @@ def main() -> None:
         default="train.jsonl",
         help="Output filename inside data/chat/",
     )
+    parser.add_argument(
+        "--sources",
+        type=str,
+        default="alpaca,dolly,squad,sciq,boolq,arc_easy,arc_challenge,openbookqa",
+        help="Comma-separated SFT sources to include",
+    )
     args = parser.parse_args()
 
     os.makedirs(config.chat_data_dir, exist_ok=True)
 
-    source_builders = [
-        ("alpaca", lambda limit: download_alpaca(limit, args.seed)),
-        # ("dolly", lambda limit: load_dolly(limit, args.seed)),
-        # ("squad", lambda limit: load_squad(limit, args.seed)),
-        # ("sciq", lambda limit: load_sciq(limit, args.seed)),
-        # ("boolq", lambda limit: load_boolq(limit, args.seed)),
-        # ("arc_easy", lambda limit: load_arc("ARC-Easy", limit, args.seed, "Easy")),
-        # ("arc_challenge", lambda limit: load_arc("ARC-Challenge", limit, args.seed, "Challenge")),
-        # ("openbookqa", lambda limit: load_openbookqa(limit, args.seed)),
-    ]
+    source_builders = {
+        "alpaca": lambda limit: download_alpaca(limit, args.seed),
+        "dolly": lambda limit: load_dolly(limit, args.seed),
+        "squad": lambda limit: load_squad(limit, args.seed),
+        "sciq": lambda limit: load_sciq(limit, args.seed),
+        "boolq": lambda limit: load_boolq(limit, args.seed),
+        "arc_easy": lambda limit: load_arc("ARC-Easy", limit, args.seed, "Easy"),
+        "arc_challenge": lambda limit: load_arc("ARC-Challenge", limit, args.seed, "Challenge"),
+        "openbookqa": lambda limit: load_openbookqa(limit, args.seed),
+    }
+    requested_sources = [source.strip() for source in args.sources.split(",") if source.strip()]
+    unknown_sources = sorted(set(requested_sources) - set(source_builders))
+    if unknown_sources:
+        print(f"Unknown sources: {', '.join(unknown_sources)}")
+        sys.exit(2)
 
     all_examples = []
     counts = Counter()
-    for source_name, builder in source_builders:
+    for source_name in requested_sources:
+        builder = source_builders[source_name]
         limit = config.sft_source_limits.get(source_name, 0)
         try:
             examples = builder(limit)
@@ -273,4 +285,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted while downloading SFT data.")
+        sys.exit(130)

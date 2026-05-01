@@ -94,11 +94,53 @@ class ChatSFTDataset(Dataset):
 
 
 def train_val_split(dataset: Dataset, val_fraction: float = 0.05, seed: int = 42):
-    """Deterministic random 95/5 split."""
+    """Deterministic grouped 95/5 split for chat datasets."""
     n = len(dataset)
     n_val = max(1, int(n * val_fraction))
+    groups = _example_groups(dataset)
+    if groups is not None:
+        rng = np.random.default_rng(seed)
+        group_ids = rng.permutation(len(groups)).tolist()
+        val_indices = []
+        train_indices = []
+        for group_id in group_ids:
+            target = val_indices if len(val_indices) < n_val else train_indices
+            target.extend(groups[group_id])
+        if train_indices and val_indices:
+            return torch.utils.data.Subset(dataset, train_indices), torch.utils.data.Subset(dataset, val_indices)
+
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(n, generator=generator).tolist()
     val_indices = indices[:n_val]
     train_indices = indices[n_val:]
     return torch.utils.data.Subset(dataset, train_indices), torch.utils.data.Subset(dataset, val_indices)
+
+
+def _raw_example_at(dataset, idx: int):
+    if hasattr(dataset, "examples"):
+        return dataset.examples[idx]
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        return _raw_example_at(dataset.dataset, int(dataset.indices[idx]))
+    return None
+
+
+def _example_signature(example: dict) -> str:
+    messages = example.get("messages", [])
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "system":
+            continue
+        content = " ".join(str(msg.get("content", "")).lower().split())
+        parts.append((role, content))
+    return json.dumps(parts, ensure_ascii=False, sort_keys=True)
+
+
+def _example_groups(dataset) -> list[list[int]] | None:
+    grouped: dict[str, list[int]] = {}
+    for idx in range(len(dataset)):
+        example = _raw_example_at(dataset, idx)
+        if not isinstance(example, dict):
+            return None
+        grouped.setdefault(_example_signature(example), []).append(idx)
+    return list(grouped.values())

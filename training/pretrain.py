@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from model.utils import count_parameters
-from runtime import RuntimeSettings, autocast_context, optimizer_kwargs
+from runtime import RuntimeSettings, autocast_context
+from training.optimizers import configure_torch_optimizer, set_optimizer_lr
 
 
 class ResumableBatchSampler:
@@ -124,6 +125,20 @@ def save_training_checkpoint(
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "optimizer_kind": getattr(optimizer, "optimizer_kind", config.pretrain_optimizer),
+        "optimizer_warning": "fallback_not_recommended"
+        if getattr(optimizer, "optimizer_kind", config.pretrain_optimizer) == "adamw"
+        else "",
+        "muon_hyperparameters": {
+            "momentum": config.muon_momentum,
+            "nesterov": config.muon_nesterov,
+            "ns_steps": config.muon_ns_steps,
+            "ns_coefficients": list(config.muon_ns_coefficients),
+            "eps": config.muon_eps,
+            "adjust_lr_fn": config.muon_adjust_lr_fn,
+            "qkv_split": config.muon_qkv_split,
+        },
+        "muon_verified": config.muon_verified,
         "step": global_step,
         "tokens_processed": tokens_processed,
         "best_val_loss": best_val_loss,
@@ -144,22 +159,6 @@ def get_lr(step: int, config: SpakieConfig) -> float:
         return min_lr
     progress = (step - config.pretrain_warmup_steps) / (config.pretrain_max_steps - config.pretrain_warmup_steps)
     return min_lr + 0.5 * (config.pretrain_lr - min_lr) * (1 + math.cos(math.pi * progress))
-
-
-def configure_optimizer(model: SpakieGPT, config: SpakieConfig, runtime: RuntimeSettings) -> torch.optim.AdamW:
-    """AdamW with weight decay only on 2D params (not biases, norms, embeddings)."""
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
-    groups = [
-        {"params": decay_params, "weight_decay": config.pretrain_weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ]
-    return torch.optim.AdamW(
-        groups,
-        lr=config.pretrain_lr,
-        betas=(0.9, 0.95),
-        **optimizer_kwargs(runtime),
-    )
 
 
 @torch.no_grad()
@@ -184,7 +183,14 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
              resume_state: dict[str, object] | None = None):
     model.to(runtime.device)
     model.train()
-    optimizer = configure_optimizer(model, config, runtime)
+    optimizer = configure_torch_optimizer(
+        model,
+        config,
+        runtime,
+        kind=config.pretrain_optimizer,
+        lr=config.pretrain_lr,
+        weight_decay=config.pretrain_weight_decay,
+    )
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     train_sampler = getattr(train_loader, "batch_sampler", None)
@@ -255,8 +261,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
 
             # Update LR
             lr = get_lr(global_step, config)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
+            set_optimizer_lr(optimizer, lr)
 
             # MPS bug: addcmul_/addcdiv_ silently fails on non-contiguous tensors (AdamW internals),
             # causing weights to stop updating. Force contiguous before the step.

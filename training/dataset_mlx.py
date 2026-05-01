@@ -83,12 +83,59 @@ class ChatSFTDatasetMLX:
 
 
 def train_val_split_mlx(dataset, val_fraction: float = 0.05, seed: int = 42):
-    """Deterministic random 95/5 split. Returns (train_indices, val_indices)."""
+    """Deterministic grouped split. Returns (train_indices, val_indices).
+
+    Synthetic SFT files often contain repeated prompts. Splitting by row leaks
+    those duplicates into validation and makes early stopping overconfident, so
+    chat datasets are grouped by their raw non-system messages before splitting.
+    """
     n = len(dataset)
     n_val = max(1, int(n * val_fraction))
+    groups = _example_groups(dataset)
+    if groups is not None:
+        rng = np.random.default_rng(seed)
+        group_ids = rng.permutation(len(groups)).tolist()
+        val_indices = []
+        train_indices = []
+        for group_id in group_ids:
+            target = val_indices if len(val_indices) < n_val else train_indices
+            target.extend(groups[group_id])
+        if train_indices and val_indices:
+            return train_indices, val_indices
+
     rng = np.random.default_rng(seed)
     indices = rng.permutation(n)
     return indices[n_val:].tolist(), indices[:n_val].tolist()
+
+
+def _raw_example_at(dataset, idx: int):
+    if hasattr(dataset, "examples"):
+        return dataset.examples[idx]
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        return _raw_example_at(dataset.dataset, int(dataset.indices[idx]))
+    return None
+
+
+def _example_signature(example: dict) -> str:
+    messages = example.get("messages", [])
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "system":
+            continue
+        content = " ".join(str(msg.get("content", "")).lower().split())
+        parts.append((role, content))
+    return json.dumps(parts, ensure_ascii=False, sort_keys=True)
+
+
+def _example_groups(dataset) -> list[list[int]] | None:
+    grouped: dict[str, list[int]] = {}
+    for idx in range(len(dataset)):
+        example = _raw_example_at(dataset, idx)
+        if not isinstance(example, dict):
+            return None
+        grouped.setdefault(_example_signature(example), []).append(idx)
+    return list(grouped.values())
 
 
 class SubsetView:

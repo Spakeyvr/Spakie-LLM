@@ -22,7 +22,8 @@ from runtime.mlx_backend import (
 )
 from training.dataset_mlx import ResumableBatchSamplerMLX, stack_batch
 from training.mlx_profile import MLXProfile, now
-from training.pretrain_mlx import DualAdamW, _accum_grads, _arrays_to_mx, _build_microbatch_step
+from training.optimizers_mlx import configure_mlx_optimizer
+from training.pretrain_mlx import _accum_grads, _arrays_to_mx, _build_microbatch_step
 from training.prefetch_mlx import BatchPrefetcher
 
 
@@ -50,10 +51,12 @@ def finetune_mlx(
         model.set_dtype(runtime.dtype)
     model.train()
 
-    optimizer = DualAdamW(
+    optimizer = configure_mlx_optimizer(
+        model,
+        config,
+        kind=config.sft_optimizer,
         learning_rate=config.sft_lr,
         weight_decay=config.sft_weight_decay,
-        betas=(0.9, 0.95),
     )
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -141,7 +144,8 @@ def finetune_mlx(
                         )
                         optimizer.set_lr(lr)
                         optimizer.update(model, clipped)
-                        mx.eval(model.parameters(), optimizer.decay.state, optimizer.nodecay.state)
+                        optimizer.eval_state()
+                        mx.eval(model.parameters())
                         if profiler.enabled:
                             profiler.add("opt_step", now() - opt_start)
 
@@ -215,6 +219,11 @@ def finetune_mlx(
                             "epoch": epoch + 1,
                             "val_loss": val_loss,
                             "preset_name": config.preset_name,
+                            "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+                            "optimizer_warning": "fallback_not_recommended"
+                            if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+                            else "",
+                            "muon_verified": config.muon_verified,
                         },
                     )
                     profiler.add("checkpoint", now() - checkpoint_start)
@@ -226,6 +235,11 @@ def finetune_mlx(
                             "epoch": epoch + 1,
                             "val_loss": val_loss,
                             "preset_name": config.preset_name,
+                            "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+                            "optimizer_warning": "fallback_not_recommended"
+                            if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+                            else "",
+                            "muon_verified": config.muon_verified,
                         },
                     )
                 print(f"  -> saved best SFT checkpoint (val_loss={val_loss:.4f})")
@@ -248,14 +262,32 @@ def finetune_mlx(
             _save_sft_checkpoint(
                 interrupt_path,
                 model,
-                meta={"step": global_step, "best_val_loss": best_val_loss, "preset_name": config.preset_name},
+                meta={
+                    "step": global_step,
+                    "best_val_loss": best_val_loss,
+                    "preset_name": config.preset_name,
+                    "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+                    "optimizer_warning": "fallback_not_recommended"
+                    if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+                    else "",
+                    "muon_verified": config.muon_verified,
+                },
             )
             profiler.add("checkpoint", now() - checkpoint_start)
         else:
             _save_sft_checkpoint(
                 interrupt_path,
                 model,
-                meta={"step": global_step, "best_val_loss": best_val_loss, "preset_name": config.preset_name},
+                meta={
+                    "step": global_step,
+                    "best_val_loss": best_val_loss,
+                    "preset_name": config.preset_name,
+                    "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+                    "optimizer_warning": "fallback_not_recommended"
+                    if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+                    else "",
+                    "muon_verified": config.muon_verified,
+                },
             )
         print(f"\nInterrupted during fine-tuning. Saved checkpoint to {interrupt_path}")
 

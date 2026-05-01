@@ -35,6 +35,7 @@ from training.dataset_mlx import (
     stack_batch,
 )
 from training.mlx_profile import MLXProfile, now
+from training.optimizers_mlx import configure_mlx_optimizer
 from training.prefetch_mlx import BatchPrefetcher
 
 
@@ -221,7 +222,7 @@ class AsyncCheckpointWriter:
 def _build_checkpoint_payload(
     *,
     model: SpakieGPTMLX,
-    optimizer: DualAdamW,
+    optimizer,
     config: SpakieConfig,
     global_step: int,
     tokens_processed: int,
@@ -231,18 +232,15 @@ def _build_checkpoint_payload(
     train_sampler: ResumableBatchSamplerMLX,
 ) -> tuple[dict[str, mx.array], dict]:
     model_flat = dict(tree_flatten(model.parameters()))
-    opt_decay_flat = dict(tree_flatten(optimizer.decay.state))
-    opt_nodecay_flat = dict(tree_flatten(optimizer.nodecay.state))
+    opt_state = optimizer.state_trees()
 
     flat: dict[str, mx.array] = {}
     for k, v in model_flat.items():
         flat[f"model.{k}"] = v
-    for k, v in opt_decay_flat.items():
-        if isinstance(v, mx.array):
-            flat[f"optimizer.decay.{k}"] = v
-    for k, v in opt_nodecay_flat.items():
-        if isinstance(v, mx.array):
-            flat[f"optimizer.nodecay.{k}"] = v
+    for section_name, section_tree in opt_state.items():
+        for k, v in tree_flatten(section_tree):
+            if isinstance(v, mx.array):
+                flat[f"optimizer.{section_name}.{k}"] = v
 
     sampler_state = train_sampler.state_dict(copy_indices=False)
     # Keep the large permutation out of JSON; dumping millions of ints as text
@@ -282,6 +280,20 @@ def _build_checkpoint_payload(
             "resume_exact": sampler_resume_exact,
         },
         "preset_name": config.preset_name,
+        "optimizer_kind": getattr(optimizer, "optimizer_kind", config.pretrain_optimizer),
+        "optimizer_warning": "fallback_not_recommended"
+        if getattr(optimizer, "optimizer_kind", config.pretrain_optimizer) == "adamw"
+        else "",
+        "muon_hyperparameters": {
+            "momentum": config.muon_momentum,
+            "nesterov": config.muon_nesterov,
+            "ns_steps": config.muon_ns_steps,
+            "ns_coefficients": list(config.muon_ns_coefficients),
+            "eps": config.muon_eps,
+            "adjust_lr_fn": config.muon_adjust_lr_fn,
+            "qkv_split": config.muon_qkv_split,
+        },
+        "muon_verified": config.muon_verified,
     }
     return flat, meta
 
@@ -290,7 +302,7 @@ def save_training_checkpoint_mlx(
     base_path: str,
     *,
     model: SpakieGPTMLX,
-    optimizer: DualAdamW,
+    optimizer,
     config: SpakieConfig,
     global_step: int,
     tokens_processed: int,
@@ -367,16 +379,14 @@ def load_training_checkpoint_mlx(base_path: str) -> dict:
     meta = load_meta_json(base_path + ".meta.json")
 
     model_flat: dict[str, mx.array] = {}
-    opt_decay_flat: dict[str, mx.array] = {}
-    opt_nodecay_flat: dict[str, mx.array] = {}
+    optimizer_sections: dict[str, dict[str, mx.array]] = {}
     sampler_indices = None
     for key, arr in flat.items():
         if key.startswith("model."):
             model_flat[key[len("model.") :]] = arr
-        elif key.startswith("optimizer.decay."):
-            opt_decay_flat[key[len("optimizer.decay.") :]] = arr
-        elif key.startswith("optimizer.nodecay."):
-            opt_nodecay_flat[key[len("optimizer.nodecay.") :]] = arr
+        elif key.startswith("optimizer."):
+            _, section, rest = key.split(".", 2)
+            optimizer_sections.setdefault(section, {})[rest] = arr
         elif key == "sampler.indices":
             sampler_indices = np.asarray(arr, dtype=np.int64)
 
@@ -388,8 +398,8 @@ def load_training_checkpoint_mlx(base_path: str) -> dict:
     return {
         "model": tree_unflatten(list(model_flat.items())),
         "optimizer": {
-            "decay": tree_unflatten(list(opt_decay_flat.items())),
-            "nodecay": tree_unflatten(list(opt_nodecay_flat.items())),
+            section: tree_unflatten(list(values.items()))
+            for section, values in optimizer_sections.items()
         },
         "meta": meta,
     }
@@ -442,10 +452,12 @@ def pretrain_mlx(
         model.set_dtype(runtime.dtype)
     model.train()
 
-    optimizer = DualAdamW(
+    optimizer = configure_mlx_optimizer(
+        model,
+        config,
+        kind=config.pretrain_optimizer,
         learning_rate=config.pretrain_lr,
         weight_decay=config.pretrain_weight_decay,
-        betas=(0.9, 0.95),
     )
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -462,7 +474,8 @@ def pretrain_mlx(
 
     if resume_state:
         model.update(resume_state["model"])
-        optimizer.load_state_trees(resume_state["optimizer"])
+        if "optimizer" in resume_state:
+            optimizer.load_state_trees(resume_state["optimizer"])
         meta = resume_state["meta"]
         best_val_loss = float(meta.get("best_val_loss", best_val_loss))
         global_step = int(meta.get("step", 0))
@@ -565,7 +578,8 @@ def pretrain_mlx(
             optimizer.set_lr(lr)
             optimizer.update(model, clipped_grads)
 
-            mx.eval(model.parameters(), optimizer.decay.state, optimizer.nodecay.state)
+            optimizer.eval_state()
+            mx.eval(model.parameters())
             accum_loss_val = None
             if profiler.enabled:
                 profiler.add("opt_step", now() - opt_start)
