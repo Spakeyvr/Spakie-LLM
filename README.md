@@ -1,6 +1,6 @@
 # Spakie-LLM
 
-A GPT-style language model built from scratch in PyTorch. The repo still trains on local `train.npy` / `val.npy` files, but now includes a scalable corpus pipeline aimed at building a roughly 2B-train-token pretraining run from a single-machine corpus workflow.
+Spakie-LLM is a GPT-style language model project with both PyTorch and MLX runtime paths. It includes tokenizer training, corpus scraping and preprocessing, pretraining, optional SFT fine-tuning, and chat inference from the same codebase.
 
 ## Setup
 
@@ -10,195 +10,155 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Install PyTorch using the official selector for your platform:
-- Apple Silicon / Mac: install a recent `torch` build with MPS support
-- NVIDIA CUDA: install the matching CUDA wheel for your toolkit
-- CPU-only: install the default CPU wheel
+PyTorch is the main dependency for the torch backend. On Apple Silicon, install an MPS-enabled build; on CUDA machines, install the matching CUDA wheel for your toolkit. MLX is enabled on Apple Silicon via `mlx>=0.31.1`.
 
-If you prefer, you can install PyTorch first and then install the rest:
+## Project Layout
+
+- `scripts/` - training, preprocessing, scraping, benchmark, and pipeline entry points
+- `training/` - dataset, optimizer, pretraining, and fine-tuning logic
+- `model/` - PyTorch and MLX Transformer implementations
+- `runtime/` - device, precision, and MLX runtime helpers
+- `tokenizer/` - SentencePiece tokenizer training and wrapper code
+- `inference/` - chat loops for both backends
+- `configs/default.py` - preset definitions and corpus planning defaults
+
+## Quick Start
+
+1. Train a tokenizer
 ```bash
-pip install torch
-pip install -r requirements.txt
+python3 tokenizer/train_tokenizer.py
 ```
 
-MLX support in this repo targets Apple Silicon and is validated against `mlx>=0.31.1`.
+2. Prepare data
+```bash
+python3 scripts/prepare_data.py
+```
+
+3. Train a model
+```bash
+python3 scripts/train.py --preset 300m --backend mlx --precision auto
+python3 scripts/train.py --preset 300m --backend torch --device auto --precision auto
+```
+
+4. Fine-tune on chat data
+```bash
+python3 scripts/finetune.py --backend mlx --precision auto
+python3 scripts/finetune.py --backend torch --device auto --precision auto
+```
+
+5. Chat with a checkpoint
+```bash
+python3 scripts/chat.py --backend mlx --precision auto
+python3 scripts/chat.py --backend torch --device auto --precision auto
+```
 
 ## Runtime Selection
 
-All runtime entrypoints support backend-aware device and precision flags:
+The torch entry points support:
+
 ```bash
 --device {auto,cuda,mps,cpu}
 --precision {auto,fp32,fp16,bf16}
 ```
 
 Default behavior is Mac-friendly:
+
 - `--device auto` prefers `cuda`, then `mps`, then `cpu`
 - `--precision auto` resolves to `bf16` on CUDA, `fp16` on MPS, and `fp32` on CPU
 
-Recommended Apple Silicon usage:
+For Apple Silicon, the repo also supports MLX-specific flags:
+
 ```bash
-python3 scripts/train.py --smoke --device auto --precision auto
-python3 scripts/finetune.py --smoke --device auto --precision auto
-python3 scripts/chat.py --device auto --precision auto
+--mlx-compile
+--mlx-prefetch
+--mlx-memory-gb <value>
+--mlx-wired-gb <value>
+--mlx-profile
 ```
 
-The scripts print the resolved device and precision at startup so you can confirm that Mac runs are using `mps` rather than silently falling back to CPU.
+## Data Sources
 
-For the MLX backend specifically, you can enable rolling timing buckets at existing report boundaries:
-```bash
-python3 scripts/train.py --backend mlx --mlx-profile
-python3 scripts/finetune.py --backend mlx --mlx-profile
-```
+You can add local `.md`, `.txt`, and `.jsonl` files under `data/raw/`, or use the built-in download and scrape scripts:
 
-## Usage
-
-### 1. Add or download training data
-Drop `.md` files into `data/raw/`.
-
-You can also scrape open datasets directly:
 ```bash
 python3 scripts/scrape_wiki.py
 python3 scripts/scrape_dictionary.py --max 5000
 python3 scripts/scrape_open_corpus.py
-```
-
-For the larger 2B-token pipeline, download resumable JSONL shards into `data/raw/large_corpus/`:
-```bash
 python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
-python3 scripts/download_pretrain_corpus.py --sources fineweb-edu,refinedweb,fineweb,c4,wikipedia_snapshot,stackexchange,open-web-math,arxiv,gutenberg,cosmopedia-v2 --target_tokens_estimate 2105263158 --resume --english_only
 ```
 
-The downloader writes per-source progress and shard manifests so interrupted runs can continue safely.
-`dolma` support remains in the script, but it is not part of the default `all` set because current Hugging Face `datasets` rejects its legacy script loader.
-The default source plan now includes supplemental streamable corpora (`fineweb`, `c4`, `open-web-math`, and `cosmopedia-v2`) so a 300m-preset corpus can reach the processed-token target without depending only on slower APIs such as Stack Exchange and arXiv.
+`scripts/prepare_data.py` streams documents, filters low-quality text, deduplicates near-identical documents, tokenizes in batches, and writes `data/processed/train.npy` and `data/processed/val.npy`.
 
-### 2. Train tokenizer
-```bash
-python3 tokenizer/train_tokenizer.py
-```
+If preparation is interrupted after token shards are written, resume with:
 
-### 3. Prepare data
-```bash
-python3 scripts/prepare_data.py
-```
-
-Useful options:
-```bash
-python3 scripts/prepare_data.py --dry_run
-python3 scripts/prepare_data.py --target_train_tokens 2000000000 --report_path data/processed/corpus_report.json
-python3 scripts/prepare_data.py --target_tokens 2105263158 --report_path data/processed/corpus_report.json
-python3 scripts/prepare_data.py --source_dirs large_corpus/fineweb-edu,large_corpus/gutenberg --dedup
-```
-
-`prepare_data.py` now:
-- streams documents from `.md`, `.txt`, and JSONL shards
-- performs document-level near-exact dedup
-- filters short, noisy, repeated-line, and boilerplate-heavy documents
-- tokenizes accepted documents in ordered multicore batches by default
-- writes token shards first, then merges them into `data/processed/train.npy` and `data/processed/val.npy`
-- emits a corpus report with per-source targets, train/val token totals, and remaining gap to target
-
-By default, `python3 scripts/prepare_data.py` uses a recommended number of
-SentencePiece tokenizer threads for the machine. On an 18-core CPU this defaults
-to 16 tokenizer threads, leaving a little headroom for I/O and system work. You
-can override it with `--tokenizer_threads`. This is a per-batch request passed to
-SentencePiece, not a promise that Activity Monitor will show 16 Python threads at
-all times; the surrounding file reading, JSON parsing, filtering, deduping, and
-shard writing still run in the main Python process.
-
-If preparation was interrupted after token shards were written, continue from the
-existing shards with:
 ```bash
 python3 scripts/prepare_data.py --resume
 ```
-Use the same source/filtering options as the interrupted run so the replay step
-can skip exactly the tokens already saved before appending new shards.
 
-### 4. Pretrain
+## Pretraining and SFT
+
+Pretraining:
+
 ```bash
-python3 scripts/train.py --preset 180m --device auto --precision auto
-python3 scripts/train.py --backend mlx --preset 92m --precision auto --mlx-profile
+python3 scripts/train.py --preset 92m --device auto --precision auto
+python3 scripts/train.py --preset 300m --backend mlx --precision auto --mlx-profile
 ```
 
-### 4b. Run the full pipeline
-Use the pipeline runner to check for processed data, run `prepare_data.py` if needed, then pretrain and launch SFT:
+Pipeline runner:
+
 ```bash
-python3 scripts/run_pipeline.py --preset 92m --backend mlx --max-steps 1000
-python3 scripts/run_pipeline.py --preset 180m --backend torch --device auto --precision auto --source-dirs large_corpus/fineweb-edu
+python3 scripts/run_pipeline.py --preset 300m --backend mlx --max-steps 1000
+python3 scripts/run_pipeline.py --preset 180m --backend torch --device auto --precision auto
 ```
 
-Useful options:
-```bash
-python3 scripts/run_pipeline.py --smoke
-python3 scripts/run_pipeline.py --force-prepare --prepare-target-train-tokens 2000000000
-python3 scripts/run_pipeline.py --max-steps 500 --train-jsonl data/chat/train.jsonl --max-examples 10000
-```
+Fine-tuning expects chat-style JSONL records like:
 
-The runner writes a timestamped log under `data/logs/` and prints elapsed time plus the best validation losses reported by pretraining and SFT.
-
-### 5. Fine-tune (optional)
-Add chat data to `data/chat/train.jsonl` in the format:
 ```json
 {"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
 
-Then run:
-```bash
-python3 scripts/finetune.py --device auto --precision auto
-python3 scripts/finetune.py --backend mlx --precision auto --mlx-profile
-```
+Chat data defaults to `data/chat/train.jsonl`.
 
-### 5b. Benchmark MLX training
-Use the benchmark harness to compare MLX step throughput without checkpoint writes:
-```bash
-python3 scripts/benchmark_mlx_training.py --task pretrain --preset 92m --steps 10 --precision auto
-python3 scripts/benchmark_mlx_training.py --task pretrain --preset 300m --steps 10 --real-data --precision auto
-python3 scripts/benchmark_mlx_training.py --task sft --preset 92m --steps 10 --synthetic --no-prefetch
-```
+## Checkpoints
 
-If local training data is missing, the benchmark script falls back to synthetic batches automatically.
+The chat and fine-tuning commands look for checkpoints under the preset checkpoint directory, with smoke-test outputs in `smoke_pretrain/` and `smoke_sft/`.
 
-### 6. Chat
+Useful commands:
+
 ```bash
-python3 scripts/chat.py --device auto --precision auto
-python3 scripts/chat.py --model sft_best --device auto --precision auto
 python3 scripts/chat.py --list-models --device auto --precision auto
-python3 scripts/chat.py --json_mode --device auto --precision auto
-python3 scripts/chat.py --temperature 0.5 --top_k 40 --device auto --precision auto
+python3 scripts/finetune.py --list-models --backend mlx
+python3 scripts/train.py --resume
 ```
+
+## Model Presets
+
+The repo currently supports these presets:
+
+| Preset | Layers | `d_model` | Heads | `d_ff` | Pretrain batch | Grad accum | Notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `92m` | 12 | 768 | 12 | 3072 | 64 | 1 | Smallest preset, good for smoke tests and quicker iteration |
+| `180m` | 16 | 896 | 14 | 3584 | 96 | 2 | Uses activation checkpointing |
+| `300m` | 24 | 1024 | 16 | 4096 | 64 | 2 | Default preset, uses activation checkpointing |
+
+Shared model defaults:
+
+- `vocab_size = 16384`
+- `max_seq_len = 512`
+- `dropout = 0.1`
+- learned positional embeddings
+- weight-tied LM head
+- GELU activations
+- scaled dot-product attention
 
 ## Mac Troubleshooting
 
-If you hit MPS backend limitations or memory pressure on macOS, try these optional environment variables before running a script:
+If you hit MPS backend limitations or memory pressure on macOS, these environment variables can help:
 
 ```bash
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 ```
-
-These are not set automatically by the repo. Use them only when you need to trade strict MPS execution or allocator limits for stability.
-
-## Architecture
-
-| Parameter | Value |
-|---|---|
-| vocab_size | 8,192 |
-| n_layers | 8 |
-| n_heads | 8 |
-| d_model | 512 |
-| d_ff | 2,048 |
-| max_seq_len | 512 |
-| dropout | 0.1 |
-
-Pre-norm Transformer with learned positional embeddings, weight-tied LM head, GELU activations, and `F.scaled_dot_product_attention` (FlashAttention when available).
-
-## Corpus Notes
-
-- The default train-token target is `2_000_000_000`.
-- With the default `0.95` train split, the derived processed-corpus target is `2,105,263,158` tokens.
-- The default `180m` pretraining path now derives its step budget from that token goal instead of using a fixed `10,000` steps.
-- Baseline from the existing checked-in corpus report before this change: `347,013,932` processed tokens, `535,723,151` estimated tokens from current raw text, and the old default `180m` run consumed `163,840,000` tokens total.
-- Storage is expected to stay in the tens to low hundreds of GB range by filtering early and writing resumable shards instead of duplicate full copies.
 
 ## Chat Template
 

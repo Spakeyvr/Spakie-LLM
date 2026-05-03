@@ -115,7 +115,7 @@ class SpakieConfig:
     preset_name: str = DEFAULT_PRESET
 
     # Model
-    vocab_size: int = 8192
+    vocab_size: int = 16384
     n_layers: int = 12
     n_heads: int = 12
     d_model: int = 768
