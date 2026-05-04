@@ -7,7 +7,7 @@ from dataclasses import field
 DEFAULT_PRESET = "300m"
 SUPPORTED_PRESETS = ("92m", "180m", "300m")
 CHAT_SYSTEM_PROMPT = "Answer clearly and factually. Keep explanations simple, direct, and truthful."
-DEFAULT_TARGET_TRAIN_TOKENS = 2_000_000_000
+DEFAULT_TARGET_TRAIN_TOKENS = 4_000_000_000
 CORPUS_SOURCE_ALIASES = {
     "c4": "c4_en",
     "cosmopedia": "cosmopedia_v2",
@@ -24,8 +24,8 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
     return {
         "fineweb-edu": {
             "kind": "web",
-            "target_tokens": 750_000_000,
-            "target_raw_chars": 3_000_000_000,
+            "target_tokens": 1_503_702_216,
+            "target_raw_chars": 6_014_808_864,
             "enabled": True,
         },
         "dolma": {
@@ -36,8 +36,8 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
         },
         "refinedweb": {
             "kind": "web",
-            "target_tokens": 125_000_000,
-            "target_raw_chars": 500_000_000,
+            "target_tokens": 400_000_000,
+            "target_raw_chars": 1_600_000_000,
             "enabled": True,
         },
         "fineweb_sample": {
@@ -48,44 +48,44 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
         },
         "c4_en": {
             "kind": "web",
-            "target_tokens": 125_000_000,
-            "target_raw_chars": 500_000_000,
+            "target_tokens": 433_526_316,
+            "target_raw_chars": 1_734_105_264,
             "enabled": True,
         },
         "gutenberg": {
             "kind": "books",
-            "target_tokens": 450_000_000,
-            "target_raw_chars": 1_800_000_000,
+            "target_tokens": 149_990_528,
+            "target_raw_chars": 599_962_112,
             "enabled": True,
         },
         "wikipedia_snapshot": {
             "kind": "reference",
-            "target_tokens": 150_000_000,
-            "target_raw_chars": 600_000_000,
+            "target_tokens": 177_054_094,
+            "target_raw_chars": 708_216_376,
             "enabled": True,
         },
         "stackexchange": {
             "kind": "technical",
-            "target_tokens": 200_000_000,
-            "target_raw_chars": 800_000_000,
+            "target_tokens": 1_834_586,
+            "target_raw_chars": 7_338_344,
             "enabled": True,
         },
         "openwebmath": {
             "kind": "technical",
-            "target_tokens": 175_000_000,
-            "target_raw_chars": 700_000_000,
+            "target_tokens": 197_913_572,
+            "target_raw_chars": 791_654_288,
             "enabled": True,
         },
         "arxiv": {
             "kind": "technical",
-            "target_tokens": 55_263_158,
-            "target_raw_chars": 221_052_632,
+            "target_tokens": 1_505_004,
+            "target_raw_chars": 6_020_016,
             "enabled": True,
         },
         "cosmopedia_v2": {
             "kind": "synthetic_education",
-            "target_tokens": 450_000_000,
-            "target_raw_chars": 1_800_000_000,
+            "target_tokens": 1_045_000_000,
+            "target_raw_chars": 4_180_000_000,
             "enabled": True,
         },
     }

@@ -121,7 +121,9 @@ HF_DATASETS: dict[str, dict] = {
         "text_fields": ("text",),
         "id_fields": ("prompt",),
         "url_fields": (),
-        "title_fields": ("format", "audience"),
+        # These fields are low-cardinality labels, not document titles. Using
+        # them for title-level dedup rejects almost the entire stream.
+        "title_fields": (),
         "license": "ODC-By",
         "kind": "synthetic_education",
     },
@@ -460,7 +462,10 @@ class SourceState:
     def should_stop(self) -> bool:
         return (
             self.progress["chars_written"] >= self.budget.target_chars
-            or self.progress["docs_written"] >= self.budget.target_docs
+            or (
+                self.budget.target_docs > 0
+                and self.progress["docs_written"] >= self.budget.target_docs
+            )
             or self.progress["estimated_tokens"] >= self.budget.target_tokens_estimate
         )
 
@@ -513,7 +518,7 @@ class SourceState:
 def build_budget(source_name: str, source_plan: dict[str, int | str | bool], max_docs: int) -> SourceBudget:
     target_chars = int(source_plan.get("target_raw_chars", 0))
     target_tokens = int(source_plan.get("target_tokens", 0))
-    target_docs = max_docs if max_docs > 0 else max(2_000, target_chars // 8_000)
+    target_docs = max_docs if max_docs > 0 else 0
     return SourceBudget(
         source_name=source_name,
         kind=str(source_plan.get("kind", "unknown")),
@@ -814,6 +819,9 @@ def main() -> None:
                     ingest_hf_source(source_name, state, english_only=args.english_only)
                 else:
                     SOURCE_HANDLERS[source_name](state, args.english_only)
+            except KeyboardInterrupt:
+                print("\nInterrupted while downloading corpus data. Progress has been saved.")
+                return
             except Exception as exc:
                 failures.append((source_name, str(exc)))
                 print(f"  source failed: {source_name} -> {exc}")
