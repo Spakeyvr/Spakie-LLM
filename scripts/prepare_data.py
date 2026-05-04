@@ -260,10 +260,18 @@ def merge_shards(
     train_fraction: float,
     dtype,
     *,
+    train_tokens_target: int | None = None,
     show_progress: bool = False,
 ) -> tuple[int, int]:
     total_tokens = sum(int(np.load(path, mmap_mode="r").shape[0]) for path in shard_paths)
     split_idx = int(total_tokens * train_fraction)
+    if train_tokens_target and train_tokens_target > split_idx:
+        if train_tokens_target > total_tokens:
+            raise ValueError(
+                f"Cannot allocate {train_tokens_target:,} train tokens from "
+                f"{total_tokens:,} processed tokens"
+            )
+        split_idx = train_tokens_target
 
     train_arr = np.lib.format.open_memmap(train_path, mode="w+", dtype=dtype, shape=(split_idx,))
     val_arr = np.lib.format.open_memmap(val_path, mode="w+", dtype=dtype, shape=(total_tokens - split_idx,))
@@ -656,6 +664,7 @@ def prepare_data(
         val_path,
         config.train_split_fraction,
         output_dtype,
+        train_tokens_target=config.target_train_tokens,
         show_progress=True,
     )
 
