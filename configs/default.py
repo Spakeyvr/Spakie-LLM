@@ -1,3 +1,4 @@
+from logging import config
 import math
 import os
 from dataclasses import dataclass
@@ -304,6 +305,7 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
         config.n_heads = 14
         config.d_ff = 3584
         config.activation_checkpointing = True
+        
         config.pretrain_batch_size = 96
         config.pretrain_grad_accum_steps = 2
         config.sft_batch_size = 2
@@ -311,6 +313,7 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
         config.sft_lr = 3e-5
         config.sft_epochs = 4
         config.refresh_derived_fields()
+
 
     elif preset == "300m":
         config.n_layers = 24
