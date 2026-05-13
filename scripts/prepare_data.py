@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
 import json
+import multiprocessing as mp
 import os
 import re
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import numpy as np
 from tqdm import tqdm
@@ -60,16 +60,52 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def normalize_for_hash(text: str) -> str:
-    text = clean_text(text).lower()
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+_SHINGLE_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
-def normalize_clean_text_for_hash(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def _iter_shingles(text: str, n: int):
+    words = _SHINGLE_WORD_RE.findall(text.lower())
+    if not words:
+        return
+    if len(words) < n:
+        yield " ".join(words)
+        return
+    for i in range(len(words) - n + 1):
+        yield " ".join(words[i:i + n])
+
+
+class NearDuplicateIndex:
+    """MinHash + LSH near-duplicate index.
+
+    Catches paraphrased copies and near-identical mirrors that exact-hash
+    dedup misses. A document is reported duplicate when its Jaccard similarity
+    on word-shingles is above ``threshold`` against any previously inserted
+    document.
+    """
+
+    def __init__(self, *, threshold: float, num_perm: int, shingle_size: int):
+        from datasketch import MinHash, MinHashLSH
+
+        self._MinHash = MinHash
+        self.lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+        self.num_perm = num_perm
+        self.shingle_size = max(1, shingle_size)
+        self._counter = 0
+
+    def is_duplicate(self, text: str) -> bool:
+        minhash = self._minhash_for(text)
+        if self.lsh.query(minhash):
+            return True
+        key = f"d{self._counter}"
+        self._counter += 1
+        self.lsh.insert(key, minhash)
+        return False
+
+    def _minhash_for(self, text: str):
+        minhash = self._MinHash(num_perm=self.num_perm)
+        for shingle in _iter_shingles(text, self.shingle_size):
+            minhash.update(shingle.encode("utf-8"))
+        return minhash
 
 
 def infer_source(root: Path, path: Path) -> str:
@@ -109,33 +145,131 @@ def iter_input_files(raw_root: Path, source_glob: str | None, source_dirs: list[
     return [Path(path) for path in unique_files]
 
 
+def _iter_file_documents(raw_root: Path, path: Path, progress: tqdm | None = None) -> Iterable[DocumentRecord]:
+    source = infer_source(raw_root, path)
+    if path.suffix.lower() == ".jsonl":
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if progress is not None:
+                    progress.update(len(line.encode("utf-8")))
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = payload.get("text", "")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                metadata = payload.get("meta", {})
+                metadata["line_number"] = line_number
+                yield DocumentRecord(source=source, path=str(path), text=text, metadata=metadata)
+    else:
+        with path.open("r", encoding="utf-8") as handle:
+            text = handle.read()
+        if progress is not None:
+            progress.update(path.stat().st_size)
+        yield DocumentRecord(source=source, path=str(path), text=text, metadata={})
+
+
 def iter_documents(raw_root: Path, files: list[Path], progress: tqdm | None = None) -> Iterable[DocumentRecord]:
     for path in files:
-        source = infer_source(raw_root, path)
-        if path.suffix.lower() == ".jsonl":
-            with path.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
-                    if progress is not None:
-                        progress.update(len(line.encode("utf-8")))
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    text = payload.get("text", "")
-                    if not isinstance(text, str) or not text.strip():
-                        continue
-                    metadata = payload.get("meta", {})
-                    metadata["line_number"] = line_number
-                    yield DocumentRecord(source=source, path=str(path), text=text, metadata=metadata)
-        else:
-            with path.open("r", encoding="utf-8") as handle:
-                text = handle.read()
-            if progress is not None:
-                progress.update(path.stat().st_size)
-            yield DocumentRecord(source=source, path=str(path), text=text, metadata={})
+        yield from _iter_file_documents(raw_root, path, progress=progress)
+
+
+# --- Parallel filtering ---------------------------------------------------
+# Workers run clean_text + should_keep_document in separate processes (Python
+# regex/string work is GIL-bound, so processes are required for true speedup).
+# The serial bits — dedup, source caps, tokenization, shard writes — stay in
+# the main process. NOTE: doc order is non-deterministic across runs with
+# workers > 1, so MinHash dedup may keep a different near-duplicate from a
+# cluster between runs (the total drop count is unchanged).
+
+_WORKER_CONFIG: SpakieConfig | None = None
+_WORKER_RAW_ROOT: Path | None = None
+
+
+def _worker_init(config: SpakieConfig, raw_root_str: str) -> None:
+    global _WORKER_CONFIG, _WORKER_RAW_ROOT
+    _WORKER_CONFIG = config
+    _WORKER_RAW_ROOT = Path(raw_root_str)
+
+
+def _worker_process_file(file_path_str: str) -> dict:
+    assert _WORKER_CONFIG is not None and _WORKER_RAW_ROOT is not None
+    config = _WORKER_CONFIG
+    raw_root = _WORKER_RAW_ROOT
+    path = Path(file_path_str)
+    file_bytes = path.stat().st_size
+    documents: list[tuple[str, int, bool, str | None, str | None]] = []
+    for doc in _iter_file_documents(raw_root, path):
+        raw_bytes = len(doc.text.encode("utf-8"))
+        text = clean_text(doc.text)
+        keep, reason = should_keep_document(text, config, doc.source)
+        documents.append((
+            doc.source,
+            raw_bytes,
+            keep,
+            None if keep else reason,
+            text if keep else None,
+        ))
+    return {"file_path": str(path), "file_bytes": file_bytes, "documents": documents}
+
+
+# Yielded tuple: (source, raw_bytes, kept, drop_reason_or_None, cleaned_text_or_None)
+FilteredDoc = tuple[str, int, bool, "str | None", "str | None"]
+
+
+def _doc_stream_serial(
+    raw_root: Path,
+    files: list[Path],
+    config: SpakieConfig,
+    progress: tqdm | None,
+) -> Iterator[FilteredDoc]:
+    for doc in iter_documents(raw_root, files, progress=progress):
+        raw_bytes = len(doc.text.encode("utf-8"))
+        text = clean_text(doc.text)
+        keep, reason = should_keep_document(text, config, doc.source)
+        yield (
+            doc.source,
+            raw_bytes,
+            keep,
+            None if keep else reason,
+            text if keep else None,
+        )
+
+
+def _doc_stream_parallel(
+    raw_root: Path,
+    files: list[Path],
+    config: SpakieConfig,
+    progress: tqdm | None,
+    workers: int,
+) -> Iterator[FilteredDoc]:
+    file_paths = [str(path) for path in files]
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        processes=workers,
+        initializer=_worker_init,
+        initargs=(config, str(raw_root)),
+    ) as pool:
+        try:
+            for result in pool.imap_unordered(_worker_process_file, file_paths):
+                if progress is not None:
+                    progress.update(result["file_bytes"])
+                for source, raw_bytes, kept, drop_reason, text in result["documents"]:
+                    yield source, raw_bytes, kept, drop_reason, text
+        except GeneratorExit:
+            pool.terminate()
+            raise
+
+
+def resolve_worker_count(requested: int | None) -> int:
+    if requested is not None and requested > 0:
+        return requested
+    cores = os.cpu_count() or 1
+    return max(1, cores // 2)
 
 
 def repeated_line_ratio(text: str) -> float:
@@ -359,6 +493,7 @@ def prepare_data(
     tokenizer_threads: int | None = None,
     tokenize_batch_size: int = DEFAULT_TOKENIZE_BATCH_SIZE,
     tokenize_batch_chars: int = DEFAULT_TOKENIZE_BATCH_CHARS,
+    workers: int | None = None,
 ) -> dict:
     if resume and dry_run:
         raise ValueError("--resume cannot be combined with --dry_run")
@@ -375,6 +510,7 @@ def prepare_data(
     tokenizer_threads = tokenizer_threads or recommended_tokenizer_threads()
     tokenize_batch_size = max(1, tokenize_batch_size)
     tokenize_batch_chars = max(1, tokenize_batch_chars)
+    worker_count = resolve_worker_count(workers)
 
     raw_root = Path(config.raw_data_dir).resolve()
     files = iter_input_files(raw_root, source_glob=source_glob, source_dirs=source_dirs)
@@ -394,7 +530,13 @@ def prepare_data(
         "raw_bytes": 0,
         "tokens_kept": 0,
     })
-    seen_hashes: set[str] = set()
+    dup_index: NearDuplicateIndex | None = None
+    if dedup:
+        dup_index = NearDuplicateIndex(
+            threshold=config.near_dup_jaccard_threshold,
+            num_perm=config.near_dup_num_perm,
+            shingle_size=config.near_dup_shingle_size,
+        )
 
     total_tokens = 0
     shard_paths: list[Path] = []
@@ -442,13 +584,10 @@ def prepare_data(
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"]["source_cap_reached"] += 1
                 continue
-            if dedup:
-                doc_hash = hashlib.sha1(normalize_clean_text_for_hash(item.text).encode("utf-8")).hexdigest()
-                if doc_hash in seen_hashes:
-                    stats["documents_dropped"] += 1
-                    stats["drop_reasons"]["duplicate"] += 1
-                    continue
-                seen_hashes.add(doc_hash)
+            if dup_index is not None and dup_index.is_duplicate(item.text):
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"]["near_duplicate"] += 1
+                continue
             stats["documents_kept"] += 1
             stats["chars_kept"] += len(item.text)
             if source_cap and stats["tokens_kept"] + len(token_ids) > source_cap:
@@ -489,6 +628,8 @@ def prepare_data(
             f"{tokenizer_threads} worker thread(s) per batch, batches up to "
             f"{tokenize_batch_size:,} docs / {tokenize_batch_chars:,} chars"
         )
+    if worker_count > 1:
+        print(f"Filter workers: {worker_count} (per-file parallelism)")
 
     interrupted = False
     docs_progress = tqdm(
@@ -498,32 +639,31 @@ def prepare_data(
         unit_scale=True,
         mininterval=0.5,
     )
+    if worker_count > 1:
+        doc_stream = _doc_stream_parallel(raw_root, files, config, docs_progress, worker_count)
+    else:
+        doc_stream = _doc_stream_serial(raw_root, files, config, docs_progress)
     try:
-        for doc in iter_documents(raw_root, files, progress=docs_progress):
-            stats = source_stats[doc.source]
+        for source, raw_bytes_doc, kept, drop_reason, text in doc_stream:
+            stats = source_stats[source]
             stats["documents_seen"] += 1
-            stats["raw_bytes"] += len(doc.text.encode("utf-8"))
+            stats["raw_bytes"] += raw_bytes_doc
 
-            text = clean_text(doc.text)
-            source_cap = int(source_plan.get(doc.source, {}).get("target_tokens", 0))
+            if not kept:
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"][drop_reason] += 1
+                continue
+
+            source_cap = int(source_plan.get(source, {}).get("target_tokens", 0))
             if source_cap and stats["tokens_kept"] >= source_cap:
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"]["source_cap_reached"] += 1
                 continue
 
-            keep, reason = should_keep_document(text, config, doc.source)
-            if not keep:
+            if dup_index is not None and dry_run and dup_index.is_duplicate(text):
                 stats["documents_dropped"] += 1
-                stats["drop_reasons"][reason] += 1
+                stats["drop_reasons"]["near_duplicate"] += 1
                 continue
-
-            if dedup and dry_run:
-                doc_hash = hashlib.sha1(normalize_clean_text_for_hash(text).encode("utf-8")).hexdigest()
-                if doc_hash in seen_hashes:
-                    stats["documents_dropped"] += 1
-                    stats["drop_reasons"]["duplicate"] += 1
-                    continue
-                seen_hashes.add(doc_hash)
 
             estimated_tokens = max(1, int(len(text) / config.estimated_chars_per_token))
             if dry_run:
@@ -536,7 +676,7 @@ def prepare_data(
                 stats["tokens_kept"] += estimated_tokens
                 total_tokens += estimated_tokens
             else:
-                pending.append(PendingTokenization(source=doc.source, text=text))
+                pending.append(PendingTokenization(source=source, text=text))
                 pending_chars += len(text)
                 if len(pending) >= tokenize_batch_size or pending_chars >= tokenize_batch_chars:
                     if flush_pending():
@@ -715,6 +855,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TOKENIZE_BATCH_CHARS,
         help="Maximum cleaned characters per tokenizer batch",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Filter worker processes for clean+filter+MinHash-stream stage "
+            "(0 = auto: half of CPU cores). Set to 1 to disable parallelism. "
+            "Output is non-deterministic when workers > 1 (dedup order varies)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -733,6 +883,7 @@ def main() -> None:
         tokenizer_threads=args.tokenizer_threads or None,
         tokenize_batch_size=args.tokenize_batch_size,
         tokenize_batch_chars=args.tokenize_batch_chars,
+        workers=args.workers or None,
     )
 
 

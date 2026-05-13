@@ -266,13 +266,27 @@ def run_mlx_pretrain(args, config):
         from training.pretrain_mlx import _json_restore
         sampler_state = dict(sampler_state)
         sampler_state["rng_state"] = _json_restore(sampler_state["rng_state"])
-        if sampler_state.get("resume_exact") is False:
+        saved_dataset_size = int(sampler_state.get("dataset_size", 0))
+        if saved_dataset_size != len(train_ds):
+            # Older checkpoints were taken when the dataset enumerated every
+            # token offset; the new non-overlapping layout has a different
+            # cardinality, so the saved permutation/position no longer maps.
             print(
-                "Sampler indices were omitted from the checkpoint because the "
-                "dataset is too large for one MLX array; resuming with a fresh "
-                "deterministic shuffle."
+                f"Sampler dataset_size changed ({saved_dataset_size:,} -> "
+                f"{len(train_ds):,}); starting a fresh sampler. Model and "
+                f"optimizer state still resume normally."
             )
-        train_sampler = ResumableBatchSamplerMLX.from_state_dict(sampler_state)
+            train_sampler = ResumableBatchSamplerMLX(
+                len(train_ds), config.pretrain_batch_size, drop_last=True, seed=0
+            )
+        else:
+            if sampler_state.get("resume_exact") is False:
+                print(
+                    "Sampler indices were omitted from the checkpoint because the "
+                    "dataset is too large for one MLX array; resuming with a fresh "
+                    "deterministic shuffle."
+                )
+            train_sampler = ResumableBatchSamplerMLX.from_state_dict(sampler_state)
     else:
         train_sampler = ResumableBatchSamplerMLX(
             len(train_ds), config.pretrain_batch_size, drop_last=True, seed=0

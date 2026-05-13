@@ -213,16 +213,65 @@ def pick_first(record: dict, fields: tuple[str, ...]) -> str:
     return ""
 
 
-def is_probably_english(text: str) -> bool:
+_LANGID_MODEL = None
+_LANGID_LOAD_ATTEMPTED = False
+
+
+def _load_langid_model(config: SpakieConfig):
+    """Lazy-load fastText lid.176 model, downloading it on first use."""
+    global _LANGID_MODEL, _LANGID_LOAD_ATTEMPTED
+    if _LANGID_MODEL is not None or _LANGID_LOAD_ATTEMPTED:
+        return _LANGID_MODEL
+    _LANGID_LOAD_ATTEMPTED = True
+    try:
+        import fasttext
+    except ImportError as exc:
+        print(f"  langid disabled: install fasttext to enable ({exc})")
+        return None
+    model_path = Path(config.langid_model_path)
+    if not model_path.exists():
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  Downloading fastText lid.176 model to {model_path}")
+        try:
+            response = api_get(config.langid_model_url, timeout=120)
+            model_path.write_bytes(response.content)
+        except Exception as exc:
+            print(f"  langid disabled: failed to download model ({exc})")
+            return None
+    try:
+        # fastText prints a deprecation warning on load; silence it.
+        fasttext.FastText.eprint = lambda *_args, **_kwargs: None
+        _LANGID_MODEL = fasttext.load_model(str(model_path))
+    except Exception as exc:
+        print(f"  langid disabled: failed to load model ({exc})")
+        return None
+    return _LANGID_MODEL
+
+
+def is_probably_english(text: str, config: SpakieConfig | None = None) -> bool:
     sample = text[:3000]
     if not sample:
         return False
+    # Cheap pre-check: must look like real prose, not gibberish or markup soup.
     letters = sum(ch.isalpha() for ch in sample)
-    ascii_letters = sum(("a" <= ch.lower() <= "z") for ch in sample)
     spaces = sample.count(" ")
     if letters < 100 or spaces < 20:
         return False
-    return ascii_letters / max(letters, 1) >= 0.75
+    config = config or SpakieConfig()
+    model = _load_langid_model(config)
+    if model is None:
+        # Fall back to ASCII-ratio heuristic if fastText is unavailable.
+        ascii_letters = sum(("a" <= ch.lower() <= "z") for ch in sample)
+        return ascii_letters / max(letters, 1) >= 0.75
+    # fastText langid is trained on single-line inputs; newlines crash predict.
+    flat = sample.replace("\n", " ").replace("\r", " ")
+    # Call the C++ binding directly to bypass fasttext 0.9.3's numpy 2.x bug
+    # in its Python wrapper (np.array(..., copy=False) is no longer allowed).
+    predictions = model.f.predict(flat, 1, 0.0, "strict")
+    if not predictions:
+        return False
+    score, label = predictions[0]
+    return label == "__label__en" and float(score) >= config.langid_min_confidence
 
 
 def looks_navigation_heavy(text: str) -> bool:
@@ -391,7 +440,7 @@ class JsonlShardWriter:
 
 
 class SourceState:
-    def __init__(self, source_dir: Path, budget: SourceBudget, resume: bool):
+    def __init__(self, source_dir: Path, budget: SourceBudget, resume: bool, config: SpakieConfig | None = None):
         self.source_dir = source_dir
         self.progress_path = source_dir / "progress.json"
         self.seen_ids_path = source_dir / "seen_ids.txt"
@@ -399,6 +448,7 @@ class SourceState:
         self.seen_titles_path = source_dir / "seen_titles.txt"
         self.budget = budget
         self.resume = resume
+        self.config = config or SpakieConfig()
         self.progress = self._load_progress()
         self.writer = JsonlShardWriter(source_dir, budget.source_name, shard_char_limit=5_000_000, progress=self.progress)
         self.seen_ids = self._load_seen(self.seen_ids_path)
@@ -473,7 +523,7 @@ class SourceState:
         text = normalize_text(record.get("text", ""))
         if len(text) < 400 or looks_navigation_heavy(text):
             return False
-        if english_only and not is_probably_english(text):
+        if english_only and not is_probably_english(text, self.config):
             return False
 
         doc_id = str(record.get("id", "")).strip()
@@ -806,7 +856,7 @@ def main() -> None:
             reset_source_dir(source_dir)
 
         budget = build_budget(source_name, source_plan[source_name], args.max_docs)
-        state = SourceState(source_dir, budget, resume=args.resume)
+        state = SourceState(source_dir, budget, resume=args.resume, config=config)
         print(
             f"\n[{source_name}] kind={budget.kind} "
             f"target_chars={budget.target_chars:,} "

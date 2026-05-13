@@ -94,7 +94,7 @@ Backend mirror map:
 
 Shared infrastructure:
 - `configs/default.py` — `SpakieConfig` dataclass + `get_preset_config()` for presets `92m`, `180m`, `300m`. Also defines the corpus source plan, near-dedup/langid filtering knobs, and derived fields (`pretrain_max_steps`, `target_processed_tokens`) refreshed via `refresh_derived_fields()`.
-- `runtime/backends.py` — Torch device/precision resolution (`auto` → cuda > mps > cpu; precision `auto` → bf16/cuda, fp16/mps, fp32/cpu) and autocast helpers.
+- `runtime/backends.py` — Torch device/precision resolution (`auto` → cuda > mps > cpu; precision `auto` → bf16/cuda, bf16/mps, fp32/cpu) and autocast helpers.
 - `runtime/mlx_backend.py` — MLX-specific runtime helpers (compile, prefetch, wired/memory limits).
 - `training/muon_core.py` — Backend-agnostic Muon helpers (parameter classification, Newton–Schulz coefficients, BF16 tolerance constants, optimizer/adjust-lr choices, AdamW fallback warning).
 - `tokenizer/spakie.model` — Trained SentencePiece tokenizer (vocab_size 16384). Required by all downstream stages.

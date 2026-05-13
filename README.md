@@ -64,7 +64,7 @@ The torch entry points support:
 Default behavior is Mac-friendly:
 
 - `--device auto` prefers `cuda`, then `mps`, then `cpu`
-- `--precision auto` resolves to `bf16` on CUDA, `fp16` on MPS, and `fp32` on CPU
+- `--precision auto` resolves to `bf16` on CUDA, `bf16` on MPS, and `fp32` on CPU
 
 For Apple Silicon, the repo also supports MLX-specific flags:
 

@@ -1,8 +1,9 @@
-"""Build a mixed SFT dataset geared toward factual QA and simple helpful dialogue.
+"""Download SFT source datasets into per-source JSONL files under data/chat_raw/.
 
-The default mix intentionally favors question answering and grounded
-explanations over generic instruction-following so small local models can
-answer basic questions more reliably.
+Each source writes its own file (e.g. data/chat_raw/alpaca.jsonl) containing
+only user/assistant message pairs — no system prompt. Merging, deduplication,
+and system-prompt injection happen later in scripts/prepare_sft.py, which also
+picks up any custom JSONL files you drop into data/chat_raw/ yourself.
 """
 
 from __future__ import annotations
@@ -10,9 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
-from collections import Counter
 
 from datasets import load_dataset
 
@@ -20,25 +19,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 
 
-SYSTEM_PROMPT = "Answer clearly and factually. Keep explanations simple, direct, and truthful."
-
-
 def trim(text: str) -> str:
     return " ".join(str(text).split()).strip()
 
 
-def make_example(user_text: str, assistant_text: str, *, include_system: bool = True) -> dict | None:
+def make_example(user_text: str, assistant_text: str) -> dict | None:
     user_text = trim(user_text)
     assistant_text = trim(assistant_text)
     if not user_text or not assistant_text:
         return None
-
-    messages = []
-    if include_system:
-        messages.append({"role": "system", "content": SYSTEM_PROMPT})
-    messages.append({"role": "user", "content": user_text})
-    messages.append({"role": "assistant", "content": assistant_text})
-    return {"messages": messages}
+    return {
+        "messages": [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": assistant_text},
+        ]
+    }
 
 
 def take_rows(dataset, limit: int, seed: int):
@@ -201,43 +196,33 @@ def load_openbookqa(limit: int, seed: int) -> list[dict]:
     return examples
 
 
-def dedup_examples(examples: list[dict]) -> list[dict]:
-    unique = []
-    seen = set()
-    for example in examples:
-        signature = tuple((msg["role"], msg["content"]) for msg in example["messages"])
-        if signature in seen:
-            continue
-        seen.add(signature)
-        unique.append(example)
-    return unique
+def write_jsonl(path: str, examples: list[dict]) -> None:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        for example in examples:
+            handle.write(json.dumps(example, ensure_ascii=False) + "\n")
+    os.replace(tmp_path, path)
 
 
 def main() -> None:
     config = SpakieConfig()
-    parser = argparse.ArgumentParser(description="Build the canonical SFT dataset")
-    parser.add_argument(
-        "--max",
-        type=int,
-        default=config.sft_download_max_examples,
-        help=f"Max total examples (0 = all, default: {config.sft_download_max_examples})",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Shuffle seed")
-    parser.add_argument(
-        "--output-name",
-        type=str,
-        default="train.jsonl",
-        help="Output filename inside data/chat/",
-    )
+    parser = argparse.ArgumentParser(description="Download SFT sources to data/chat_raw/")
+    parser.add_argument("--seed", type=int, default=42, help="Shuffle seed for per-source caps")
     parser.add_argument(
         "--sources",
         type=str,
         default="alpaca,dolly,squad,sciq,boolq,arc_easy,arc_challenge,openbookqa",
-        help="Comma-separated SFT sources to include",
+        help="Comma-separated SFT sources to download",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=config.chat_raw_dir,
+        help=f"Directory for per-source raw JSONL files (default: {config.chat_raw_dir})",
     )
     args = parser.parse_args()
 
-    os.makedirs(config.chat_data_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     source_builders = {
         "alpaca": lambda limit: download_alpaca(limit, args.seed),
@@ -255,33 +240,20 @@ def main() -> None:
         print(f"Unknown sources: {', '.join(unknown_sources)}")
         sys.exit(2)
 
-    all_examples = []
-    counts = Counter()
     for source_name in requested_sources:
         builder = source_builders[source_name]
         limit = config.sft_source_limits.get(source_name, 0)
         try:
             examples = builder(limit)
-            all_examples.extend(examples)
-            counts[source_name] = len(examples)
-            print(f"  {source_name}: {len(examples):,} examples")
         except Exception as exc:
             print(f"  skipping {source_name}: {exc}")
+            continue
+        out_path = os.path.join(args.output_dir, f"{source_name}.jsonl")
+        write_jsonl(out_path, examples)
+        print(f"  {source_name}: {len(examples):,} examples -> {out_path}")
 
-    all_examples = dedup_examples(all_examples)
-    random.Random(args.seed).shuffle(all_examples)
-
-    if args.max > 0:
-        all_examples = all_examples[:args.max]
-
-    out_path = os.path.join(config.chat_data_dir, args.output_name)
-    with open(out_path, "w", encoding="utf-8") as handle:
-        for example in all_examples:
-            handle.write(json.dumps(example, ensure_ascii=False) + "\n")
-
-    print(f"Saved {len(all_examples):,} examples to {out_path}")
-    for source_name in sorted(counts):
-        print(f"  {source_name}: {counts[source_name]:,}")
+    print(f"\nRaw SFT files written to {args.output_dir}/.")
+    print("Next: run `python3 scripts/prepare_sft.py` to merge into data/chat/train.jsonl.")
 
 
 if __name__ == "__main__":

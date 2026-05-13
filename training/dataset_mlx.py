@@ -13,17 +13,25 @@ from tokenizer.train_tokenizer import SpakieTokenizer
 
 
 class PretrainDatasetMLX:
-    """Memory-mapped numpy dataset for pretraining (returns numpy arrays)."""
+    """Memory-mapped numpy dataset for pretraining (returns numpy arrays).
+
+    Sequences are non-overlapping `seq_len`-token windows packed back-to-back,
+    matching standard LM pretraining (GPT-2/Llama style). The previous design
+    treated every token offset as a separate sequence, which produced ~N
+    indices for an N-token corpus and overflowed MLX's int32 dim cap on
+    multi-billion-token corpora — preventing exact sampler resume.
+    """
 
     def __init__(self, npy_path: str, seq_len: int):
         self.data = np.load(npy_path, mmap_mode="r")
         self.seq_len = seq_len
 
     def __len__(self) -> int:
-        return max(0, len(self.data) - self.seq_len)
+        return max(0, (len(self.data) - 1) // self.seq_len)
 
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
-        chunk = np.asarray(self.data[idx : idx + self.seq_len + 1], dtype=np.int32)
+        start = idx * self.seq_len
+        chunk = np.asarray(self.data[start : start + self.seq_len + 1], dtype=np.int32)
         return chunk[:-1], chunk[1:]
 
 

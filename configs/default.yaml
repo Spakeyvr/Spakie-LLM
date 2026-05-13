@@ -1,0 +1,205 @@
+default_preset: "300m"
+supported_presets: ["92m", "180m", "300m"]
+chat_system_prompt: "Answer clearly and factually. Keep explanations simple, direct, and truthful."
+
+corpus_source_aliases:
+  c4: c4_en
+  cosmopedia: cosmopedia_v2
+  cosmopedia-v2: cosmopedia_v2
+  fineweb: fineweb_sample
+  fineweb-sample: fineweb_sample
+  open-web-math: openwebmath
+  open_web_math: openwebmath
+  wikipedia: wikipedia_snapshot
+
+defaults:
+  # Model
+  vocab_size: 16384
+  n_layers: 12
+  n_heads: 12
+  d_model: 768
+  d_ff: 3072
+  max_seq_len: 512
+  dropout: 0.1
+  bias: false
+  activation_checkpointing: false
+
+  # Pretraining
+  pretrain_batch_size: 128
+  pretrain_grad_accum_steps: 2
+  pretrain_lr: 6.0e-4
+  pretrain_target_tokens: 0
+  pretrain_max_steps: 0
+  pretrain_warmup_steps: 200
+  pretrain_weight_decay: 0.1
+  pretrain_grad_clip: 1.0
+  pretrain_eval_interval: 250
+  pretrain_eval_batches: 20
+  pretrain_patience: 5
+  pretrain_optimizer: muon
+
+  # SFT
+  sft_batch_size: 8
+  sft_grad_accum_steps: 2
+  sft_lr: 4.0e-5
+  sft_epochs: 3
+  sft_weight_decay: 0.05
+  sft_grad_clip: 1.0
+  sft_patience: 5
+  sft_download_max_examples: 72000
+  sft_optimizer: muon
+
+  # Optimizer (Muon)
+  allow_adamw_fallback: false
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  muon_ns_coefficients: [3.4445, -4.7750, 2.0315]
+  muon_eps: 1.0e-7
+  muon_adjust_lr_fn: match_rms_adamw
+  muon_qkv_split: true
+  muon_verified: false
+
+  # Generation
+  temperature: 0.1
+  top_k: 1
+  top_p: 1.0
+
+  # Paths
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+  chat_data_dir: data/chat
+  chat_raw_dir: data/chat_raw
+  eval_data_dir: data/eval
+  tokenizer_prefix: tokenizer/spakie
+  checkpoint_root_dir: checkpoints
+  checkpoint_dir: ""
+
+  # Corpus planning
+  target_train_tokens: 4000000000
+  target_processed_tokens: 0
+  large_corpus_dir: data/raw/large_corpus
+  corpus_report_path: data/processed/corpus_report.json
+  token_shard_dir: data/processed/shards
+  token_shard_size: 5000000
+  min_doc_chars: 400
+  max_repeated_line_ratio: 0.25
+  max_noise_ratio: 0.35
+  train_split_fraction: 0.95
+  estimated_chars_per_token: 4.0
+
+  # Near-duplicate detection (MinHash + LSH)
+  near_dup_jaccard_threshold: 0.8
+  near_dup_num_perm: 128
+  near_dup_shingle_size: 5
+
+  # fastText language identification (lid.176 auto-downloaded on first use)
+  langid_min_confidence: 0.65
+  langid_model_path: data/models/lid.176.ftz
+  langid_model_url: https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+
+presets:
+  92m:
+    pretrain_batch_size: 64
+    pretrain_grad_accum_steps: 1
+
+  180m:
+    n_layers: 16
+    d_model: 896
+    n_heads: 14
+    d_ff: 3584
+    activation_checkpointing: true
+    pretrain_batch_size: 96
+    pretrain_grad_accum_steps: 2
+    sft_batch_size: 2
+    sft_grad_accum_steps: 8
+    sft_lr: 3.0e-5
+    sft_epochs: 4
+
+  300m:
+    n_layers: 24
+    d_model: 1024
+    n_heads: 16
+    d_ff: 4096
+    activation_checkpointing: true
+    pretrain_batch_size: 64
+    pretrain_grad_accum_steps: 2
+    pretrain_lr: 6.0e-4
+    sft_batch_size: 16
+    sft_grad_accum_steps: 2
+
+source_min_doc_chars:
+  wikipedia_snapshot: 200
+  wikipedia: 200
+  arxiv: 220
+  stackexchange: 180
+  openwebmath: 180
+  open_corpus: 180
+  dictionary: 80
+
+sft_source_limits:
+  alpaca: 16000
+  dolly: 10000
+  squad: 12000
+  sciq: 8000
+  boolq: 8000
+  arc_easy: 8000
+  arc_challenge: 5000
+  openbookqa: 5000
+
+corpus_source_plan:
+  fineweb-edu:
+    kind: web
+    target_tokens: 1503702216
+    target_raw_chars: 6014808864
+    enabled: true
+  dolma:
+    kind: web
+    target_tokens: 450000000
+    target_raw_chars: 1800000000
+    enabled: false
+  refinedweb:
+    kind: web
+    target_tokens: 400000000
+    target_raw_chars: 1600000000
+    enabled: true
+  fineweb_sample:
+    kind: web
+    target_tokens: 300000000
+    target_raw_chars: 1200000000
+    enabled: true
+  c4_en:
+    kind: web
+    target_tokens: 433526316
+    target_raw_chars: 1734105264
+    enabled: true
+  gutenberg:
+    kind: books
+    target_tokens: 149990528
+    target_raw_chars: 599962112
+    enabled: true
+  wikipedia_snapshot:
+    kind: reference
+    target_tokens: 177054094
+    target_raw_chars: 708216376
+    enabled: true
+  stackexchange:
+    kind: technical
+    target_tokens: 1834586
+    target_raw_chars: 7338344
+    enabled: true
+  openwebmath:
+    kind: technical
+    target_tokens: 197913572
+    target_raw_chars: 791654288
+    enabled: true
+  arxiv:
+    kind: technical
+    target_tokens: 1505004
+    target_raw_chars: 6020016
+    enabled: true
+  cosmopedia_v2:
+    kind: synthetic_education
+    target_tokens: 1045000000
+    target_raw_chars: 4180000000
+    enabled: true

@@ -31,8 +31,8 @@ class RuntimeResolutionTests(unittest.TestCase):
             runtime = resolve_runtime_settings("auto", "auto")
         self.assertEqual(runtime.device.type, "mps")
 
-    def test_auto_precision_maps_to_fp16_on_mps_and_fp32_on_cpu(self):
-        self.assertEqual(resolve_precision("auto", torch.device("mps")), "fp16")
+    def test_auto_precision_maps_to_bf16_on_mps_and_fp32_on_cpu(self):
+        self.assertEqual(resolve_precision("auto", torch.device("mps")), "bf16")
         self.assertEqual(resolve_precision("auto", torch.device("cpu")), "fp32")
 
     def test_dataloader_uses_pin_memory_only_on_cuda(self):

@@ -1,95 +1,23 @@
-from logging import config
 import math
 import os
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
 
 
-DEFAULT_PRESET = "300m"
-SUPPORTED_PRESETS = ("92m", "180m", "300m")
-CHAT_SYSTEM_PROMPT = "Answer clearly and factually. Keep explanations simple, direct, and truthful."
-DEFAULT_TARGET_TRAIN_TOKENS = 4_000_000_000
-CORPUS_SOURCE_ALIASES = {
-    "c4": "c4_en",
-    "cosmopedia": "cosmopedia_v2",
-    "cosmopedia-v2": "cosmopedia_v2",
-    "fineweb": "fineweb_sample",
-    "fineweb-sample": "fineweb_sample",
-    "open-web-math": "openwebmath",
-    "open_web_math": "openwebmath",
-    "wikipedia": "wikipedia_snapshot",
-}
+_CFG = yaml.safe_load((Path(__file__).parent / "default.yaml").read_text())
+_D = _CFG["defaults"]
+
+DEFAULT_PRESET: str = _CFG["default_preset"]
+SUPPORTED_PRESETS: tuple[str, ...] = tuple(_CFG["supported_presets"])
+CHAT_SYSTEM_PROMPT: str = _CFG["chat_system_prompt"]
+DEFAULT_TARGET_TRAIN_TOKENS: int = _D["target_train_tokens"]
+CORPUS_SOURCE_ALIASES: dict[str, str] = _CFG["corpus_source_aliases"]
 
 
 def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
-    return {
-        "fineweb-edu": {
-            "kind": "web",
-            "target_tokens": 1_503_702_216,
-            "target_raw_chars": 6_014_808_864,
-            "enabled": True,
-        },
-        "dolma": {
-            "kind": "web",
-            "target_tokens": 450_000_000,
-            "target_raw_chars": 1_800_000_000,
-            "enabled": False,
-        },
-        "refinedweb": {
-            "kind": "web",
-            "target_tokens": 400_000_000,
-            "target_raw_chars": 1_600_000_000,
-            "enabled": True,
-        },
-        "fineweb_sample": {
-            "kind": "web",
-            "target_tokens": 300_000_000,
-            "target_raw_chars": 1_200_000_000,
-            "enabled": True,
-        },
-        "c4_en": {
-            "kind": "web",
-            "target_tokens": 433_526_316,
-            "target_raw_chars": 1_734_105_264,
-            "enabled": True,
-        },
-        "gutenberg": {
-            "kind": "books",
-            "target_tokens": 149_990_528,
-            "target_raw_chars": 599_962_112,
-            "enabled": True,
-        },
-        "wikipedia_snapshot": {
-            "kind": "reference",
-            "target_tokens": 177_054_094,
-            "target_raw_chars": 708_216_376,
-            "enabled": True,
-        },
-        "stackexchange": {
-            "kind": "technical",
-            "target_tokens": 1_834_586,
-            "target_raw_chars": 7_338_344,
-            "enabled": True,
-        },
-        "openwebmath": {
-            "kind": "technical",
-            "target_tokens": 197_913_572,
-            "target_raw_chars": 791_654_288,
-            "enabled": True,
-        },
-        "arxiv": {
-            "kind": "technical",
-            "target_tokens": 1_505_004,
-            "target_raw_chars": 6_020_016,
-            "enabled": True,
-        },
-        "cosmopedia_v2": {
-            "kind": "synthetic_education",
-            "target_tokens": 1_045_000_000,
-            "target_raw_chars": 4_180_000_000,
-            "enabled": True,
-        },
-    }
+    return {k: dict(v) for k, v in _CFG["corpus_source_plan"].items()}
 
 
 def normalize_corpus_source(source_name: str) -> str:
@@ -116,98 +44,98 @@ class SpakieConfig:
     preset_name: str = DEFAULT_PRESET
 
     # Model
-    vocab_size: int = 16384
-    n_layers: int = 12
-    n_heads: int = 12
-    d_model: int = 768
-    d_ff: int = 3072
-    max_seq_len: int = 512
-    dropout: float = 0.1
-    bias: bool = False
-    activation_checkpointing: bool = False
+    vocab_size: int = _D["vocab_size"]
+    n_layers: int = _D["n_layers"]
+    n_heads: int = _D["n_heads"]
+    d_model: int = _D["d_model"]
+    d_ff: int = _D["d_ff"]
+    max_seq_len: int = _D["max_seq_len"]
+    dropout: float = _D["dropout"]
+    bias: bool = _D["bias"]
+    activation_checkpointing: bool = _D["activation_checkpointing"]
 
     # Pretraining
-    pretrain_batch_size: int = 128
-    pretrain_grad_accum_steps: int = 2
-    pretrain_lr: float = 6e-4  # scaled for 8x larger effective batch vs original 16×4
-    pretrain_target_tokens: int = 0
-    pretrain_max_steps: int = 0
-    pretrain_warmup_steps: int = 200
-    pretrain_weight_decay: float = 0.1
-    pretrain_grad_clip: float = 1.0
-    pretrain_eval_interval: int = 250
-    pretrain_eval_batches: int = 20
-    pretrain_patience: int = 5
-    pretrain_optimizer: str = "muon"
+    pretrain_batch_size: int = _D["pretrain_batch_size"]
+    pretrain_grad_accum_steps: int = _D["pretrain_grad_accum_steps"]
+    pretrain_lr: float = _D["pretrain_lr"]
+    pretrain_target_tokens: int = _D["pretrain_target_tokens"]
+    pretrain_max_steps: int = _D["pretrain_max_steps"]
+    pretrain_warmup_steps: int = _D["pretrain_warmup_steps"]
+    pretrain_weight_decay: float = _D["pretrain_weight_decay"]
+    pretrain_grad_clip: float = _D["pretrain_grad_clip"]
+    pretrain_eval_interval: int = _D["pretrain_eval_interval"]
+    pretrain_eval_batches: int = _D["pretrain_eval_batches"]
+    pretrain_patience: int = _D["pretrain_patience"]
+    pretrain_optimizer: str = _D["pretrain_optimizer"]
 
     # SFT
-    sft_batch_size: int = 8
-    sft_grad_accum_steps: int = 2
-    sft_lr: float = 4e-5
-    sft_epochs: int = 3
-    sft_weight_decay: float = 0.05
-    sft_grad_clip: float = 1.0
-    sft_patience: int = 5
-    sft_download_max_examples: int = 72_000
-    sft_optimizer: str = "muon"
+    sft_batch_size: int = _D["sft_batch_size"]
+    sft_grad_accum_steps: int = _D["sft_grad_accum_steps"]
+    sft_lr: float = _D["sft_lr"]
+    sft_epochs: int = _D["sft_epochs"]
+    sft_weight_decay: float = _D["sft_weight_decay"]
+    sft_grad_clip: float = _D["sft_grad_clip"]
+    sft_patience: int = _D["sft_patience"]
+    sft_download_max_examples: int = _D["sft_download_max_examples"]
+    sft_optimizer: str = _D["sft_optimizer"]
 
     # Optimizer
-    allow_adamw_fallback: bool = False
-    muon_momentum: float = 0.95
-    muon_nesterov: bool = True
-    muon_ns_steps: int = 5
-    muon_ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
-    muon_eps: float = 1e-7
-    muon_adjust_lr_fn: str = "match_rms_adamw"
-    muon_qkv_split: bool = True
-    muon_verified: bool = False
+    allow_adamw_fallback: bool = _D["allow_adamw_fallback"]
+    muon_momentum: float = _D["muon_momentum"]
+    muon_nesterov: bool = _D["muon_nesterov"]
+    muon_ns_steps: int = _D["muon_ns_steps"]
+    muon_ns_coefficients: tuple[float, float, float] = tuple(_D["muon_ns_coefficients"])
+    muon_eps: float = _D["muon_eps"]
+    muon_adjust_lr_fn: str = _D["muon_adjust_lr_fn"]
+    muon_qkv_split: bool = _D["muon_qkv_split"]
+    muon_verified: bool = _D["muon_verified"]
 
     # Generation
-    temperature: float = 0.1
-    top_k: int = 1
-    top_p: float = 1.0
+    temperature: float = _D["temperature"]
+    top_k: int = _D["top_k"]
+    top_p: float = _D["top_p"]
 
     # Paths
-    raw_data_dir: str = "data/raw"
-    processed_data_dir: str = "data/processed"
-    chat_data_dir: str = "data/chat"
-    eval_data_dir: str = "data/eval"
-    tokenizer_prefix: str = "tokenizer/spakie"
-    checkpoint_root_dir: str = "checkpoints"
-    checkpoint_dir: str = ""
+    raw_data_dir: str = _D["raw_data_dir"]
+    processed_data_dir: str = _D["processed_data_dir"]
+    chat_data_dir: str = _D["chat_data_dir"]
+    chat_raw_dir: str = _D["chat_raw_dir"]
+    eval_data_dir: str = _D["eval_data_dir"]
+    tokenizer_prefix: str = _D["tokenizer_prefix"]
+    checkpoint_root_dir: str = _D["checkpoint_root_dir"]
+    checkpoint_dir: str = _D["checkpoint_dir"]
 
     # Corpus planning
-    target_train_tokens: int = DEFAULT_TARGET_TRAIN_TOKENS
-    target_processed_tokens: int = 0
-    large_corpus_dir: str = "data/raw/large_corpus"
-    corpus_report_path: str = "data/processed/corpus_report.json"
-    token_shard_dir: str = "data/processed/shards"
-    token_shard_size: int = 5_000_000
-    min_doc_chars: int = 400
-    source_min_doc_chars: dict[str, int] = field(default_factory=lambda: {
-        "wikipedia_snapshot": 200,
-        "wikipedia": 200,
-        "arxiv": 220,
-        "stackexchange": 180,
-        "openwebmath": 180,
-        "open_corpus": 180,
-        "dictionary": 80,
-    })
-    max_repeated_line_ratio: float = 0.25
-    max_noise_ratio: float = 0.35
-    train_split_fraction: float = 0.95
-    estimated_chars_per_token: float = 4.0
+    target_train_tokens: int = _D["target_train_tokens"]
+    target_processed_tokens: int = _D["target_processed_tokens"]
+    large_corpus_dir: str = _D["large_corpus_dir"]
+    corpus_report_path: str = _D["corpus_report_path"]
+    token_shard_dir: str = _D["token_shard_dir"]
+    token_shard_size: int = _D["token_shard_size"]
+    min_doc_chars: int = _D["min_doc_chars"]
+    source_min_doc_chars: dict[str, int] = field(
+        default_factory=lambda: dict(_CFG["source_min_doc_chars"])
+    )
+    max_repeated_line_ratio: float = _D["max_repeated_line_ratio"]
+    max_noise_ratio: float = _D["max_noise_ratio"]
+    train_split_fraction: float = _D["train_split_fraction"]
+    estimated_chars_per_token: float = _D["estimated_chars_per_token"]
+
+    # Near-duplicate detection (MinHash + LSH). Catches paraphrased copies and
+    # near-identical mirrors that exact-hash dedup misses.
+    near_dup_jaccard_threshold: float = _D["near_dup_jaccard_threshold"]
+    near_dup_num_perm: int = _D["near_dup_num_perm"]
+    near_dup_shingle_size: int = _D["near_dup_shingle_size"]
+
+    # fastText language identification (replaces ASCII-ratio heuristic).
+    # The lid.176 model is downloaded on first use and cached at this path.
+    langid_min_confidence: float = _D["langid_min_confidence"]
+    langid_model_path: str = _D["langid_model_path"]
+    langid_model_url: str = _D["langid_model_url"]
     corpus_source_plan: dict[str, dict[str, int | str | bool]] = field(default_factory=default_corpus_source_plan)
-    sft_source_limits: dict[str, int] = field(default_factory=lambda: {
-        "alpaca": 16_000,
-        "dolly": 10_000,
-        "squad": 12_000,
-        "sciq": 8_000,
-        "boolq": 8_000,
-        "arc_easy": 8_000,
-        "arc_challenge": 5_000,
-        "openbookqa": 5_000,
-    })
+    sft_source_limits: dict[str, int] = field(
+        default_factory=lambda: dict(_CFG["sft_source_limits"])
+    )
 
     def __post_init__(self):
         self.preset_name = normalize_preset_name(self.preset_name)
@@ -294,45 +222,12 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
     preset = normalize_preset_name(preset_name)
     config = SpakieConfig(preset_name=preset)
 
-    if preset == "92m":
-        config.pretrain_batch_size = 64
-        config.pretrain_grad_accum_steps = 1
-        config.refresh_derived_fields()
+    for key, value in _CFG["presets"].get(preset, {}).items():
+        if key == "muon_ns_coefficients":
+            value = tuple(value)
+        setattr(config, key, value)
 
-    elif preset == "180m":
-        config.n_layers = 16
-        config.d_model = 896
-        config.n_heads = 14
-        config.d_ff = 3584
-        config.activation_checkpointing = True
-        
-        config.pretrain_batch_size = 96
-        config.pretrain_grad_accum_steps = 2
-        config.sft_batch_size = 2
-        config.sft_grad_accum_steps = 8
-        config.sft_lr = 3e-5
-        config.sft_epochs = 4
-        config.refresh_derived_fields()
-
-
-    elif preset == "300m":
-        config.n_layers = 24
-        config.d_model = 1024
-        config.n_heads = 16
-        config.d_ff = 4096
-        # Activation checkpointing trades a small amount of recompute for ~30%
-        # activation memory, which lets us double pretrain_batch_size and halve
-        # grad-accum while holding tokens/step constant (64 * 2 * 512 = 65_536,
-        # identical to the previous 32 * 4 * 512). Halving the accum loop halves
-        # per-step Python overhead, which compounds with mx.compile wins.
-        config.activation_checkpointing = True
-        config.pretrain_batch_size = 64
-        config.pretrain_grad_accum_steps = 2
-        config.pretrain_lr = 6e-4
-        config.sft_batch_size = 16
-        config.sft_grad_accum_steps = 2
-        config.refresh_derived_fields()
-
+    config.refresh_derived_fields()
     return config
 
 

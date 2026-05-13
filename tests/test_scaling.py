@@ -52,8 +52,8 @@ class ScalingConfigTests(unittest.TestCase):
             sum(int(entry["target_tokens"]) for entry in source_plan.values()),
             config.target_processed_tokens,
         )
-        self.assertEqual(config.target_train_tokens, 2_000_000_000)
-        self.assertEqual(config.pretrain_target_tokens, 2_000_000_000)
+        self.assertEqual(config.target_train_tokens, 4_000_000_000)
+        self.assertEqual(config.pretrain_target_tokens, 4_000_000_000)
 
     def test_parse_sources_all_and_aliases(self):
         config = SpakieConfig()
@@ -144,11 +144,11 @@ class ScalingConfigTests(unittest.TestCase):
                 patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer),
                 patch.object(prepare_data, "should_keep_document", side_effect=KeyboardInterrupt),
             ):
-                report = prepare_data.prepare_data(config=config, dry_run=True)
+                report = prepare_data.prepare_data(config=config, dry_run=True, workers=1)
 
             self.assertTrue(report_path.exists())
             self.assertEqual(report["processed_tokens"], 0)
-            self.assertEqual(report["source_stats"]["fineweb-edu"]["documents_seen"], 1)
+            self.assertEqual(report["source_stats"]["fineweb-edu"]["documents_seen"], 0)
 
     def test_token_shard_writer_preserves_token_order_across_boundaries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -189,7 +189,7 @@ class ScalingConfigTests(unittest.TestCase):
                     processed_data_dir=str(root / name / "processed"),
                     corpus_report_path=str(root / name / "processed" / "corpus_report.json"),
                     token_shard_dir=str(root / name / "processed" / "shards"),
-                    target_train_tokens=1_000,
+                    target_train_tokens=10,
                     min_doc_chars=1,
                     token_shard_size=7,
                     source_min_doc_chars={"fineweb-edu": 1},
@@ -252,7 +252,7 @@ class ScalingConfigTests(unittest.TestCase):
                     processed_data_dir=str(root / name / "processed"),
                     corpus_report_path=str(root / name / "processed" / "corpus_report.json"),
                     token_shard_dir=str(root / name / "processed" / "shards"),
-                    target_train_tokens=1_000,
+                    target_train_tokens=10,
                     min_doc_chars=1,
                     token_shard_size=11,
                     source_min_doc_chars={"fineweb-edu": 1},
@@ -301,12 +301,12 @@ class ScalingConfigTests(unittest.TestCase):
 
     def test_pretrain_budget_derives_steps_for_presets(self):
         config_92m = get_preset_config("92m")
-        self.assertEqual(config_92m.pretrain_tokens_per_step(), 32_768)
-        self.assertEqual(config_92m.pretrain_max_steps, math.ceil(2_000_000_000 / 32_768))
+        self.assertEqual(config_92m.pretrain_tokens_per_step(), 32_768)   # 64 * 1 * 512
+        self.assertEqual(config_92m.pretrain_max_steps, math.ceil(4_000_000_000 / 32_768))
 
         config_180m = get_preset_config("180m")
-        self.assertEqual(config_180m.pretrain_tokens_per_step(), 16_384)
-        self.assertEqual(config_180m.pretrain_max_steps, math.ceil(2_000_000_000 / 16_384))
+        self.assertEqual(config_180m.pretrain_tokens_per_step(), 98_304)  # 96 * 2 * 512
+        self.assertEqual(config_180m.pretrain_max_steps, math.ceil(4_000_000_000 / 98_304))
         self.assertFalse(config_180m.should_use_pretrain_early_stopping())
 
 

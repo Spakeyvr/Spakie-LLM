@@ -25,6 +25,7 @@ build/
 .idea/
 *.swp
 *.swo
+.claude/
 
 # OS
 Thumbs.db

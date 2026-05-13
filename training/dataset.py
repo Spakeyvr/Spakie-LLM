@@ -21,10 +21,11 @@ class PretrainDataset(Dataset):
         self.seq_len = seq_len
 
     def __len__(self):
-        return max(0, len(self.data) - self.seq_len)
+        return max(0, (len(self.data) - 1) // self.seq_len)
 
     def __getitem__(self, idx):
-        chunk = self.data[idx : idx + self.seq_len + 1].astype(np.int64)
+        start = idx * self.seq_len
+        chunk = self.data[start : start + self.seq_len + 1].astype(np.int64)
         x = torch.from_numpy(chunk[:-1].copy())
         y = torch.from_numpy(chunk[1:].copy())
         return x, y
