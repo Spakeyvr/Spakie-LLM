@@ -151,12 +151,23 @@ def save_training_checkpoint(
 
 
 def get_lr(step: int, config: SpakieConfig) -> float:
-    """Cosine schedule with linear warmup, decaying to 10% of peak."""
+    """Learning rate at `step`. See training/pretrain_mlx.py:get_lr for the
+    schedule semantics (cosine | trapezoid). Must stay numerically identical
+    to the MLX path so backends share a learning curve.
+    """
     min_lr = config.pretrain_lr * 0.1
     if step < config.pretrain_warmup_steps:
-        return config.pretrain_lr * step / config.pretrain_warmup_steps
+        return config.pretrain_lr * step / max(config.pretrain_warmup_steps, 1)
     if step >= config.pretrain_max_steps:
         return min_lr
+    schedule = getattr(config, "pretrain_lr_schedule", "cosine")
+    if schedule == "trapezoid":
+        decay_frac = max(0.0, min(1.0, getattr(config, "pretrain_trapezoid_decay_frac", 0.2)))
+        decay_start = int(config.pretrain_max_steps * (1.0 - decay_frac))
+        if step < decay_start:
+            return config.pretrain_lr
+        progress = (step - decay_start) / max(config.pretrain_max_steps - decay_start, 1)
+        return config.pretrain_lr - progress * (config.pretrain_lr - min_lr)
     progress = (step - config.pretrain_warmup_steps) / (config.pretrain_max_steps - config.pretrain_warmup_steps)
     return min_lr + 0.5 * (config.pretrain_lr - min_lr) * (1 + math.cos(math.pi * progress))
 

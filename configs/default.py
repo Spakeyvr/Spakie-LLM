@@ -67,6 +67,8 @@ class SpakieConfig:
     pretrain_eval_batches: int = _D["pretrain_eval_batches"]
     pretrain_patience: int = _D["pretrain_patience"]
     pretrain_optimizer: str = _D["pretrain_optimizer"]
+    pretrain_lr_schedule: str = _D.get("pretrain_lr_schedule", "cosine")
+    pretrain_trapezoid_decay_frac: float = _D.get("pretrain_trapezoid_decay_frac", 0.2)
 
     # SFT
     sft_batch_size: int = _D["sft_batch_size"]

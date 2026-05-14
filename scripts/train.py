@@ -401,6 +401,18 @@ def main():
         default="match_rms_adamw",
         help="Muon LR adjustment. match_rms_adamw reuses AdamW-tuned LR/WD.",
     )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("cosine", "trapezoid"),
+        default="",
+        help="Override pretrain LR schedule (default: cosine)",
+    )
+    parser.add_argument(
+        "--trapezoid-decay-frac",
+        type=float,
+        default=-1.0,
+        help="Fraction of training at the end used for linear decay (trapezoid schedule)",
+    )
     parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
     parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum")
     parser.add_argument(
@@ -455,6 +467,10 @@ def main():
 
     config = get_preset_config(args.preset)
     apply_optimizer_args(config, args)
+    if args.lr_schedule:
+        config.pretrain_lr_schedule = args.lr_schedule
+    if args.trapezoid_decay_frac >= 0:
+        config.pretrain_trapezoid_decay_frac = args.trapezoid_decay_frac
     if args.output_dir:
         config.checkpoint_dir = args.output_dir
     if args.eval_interval > 0:
