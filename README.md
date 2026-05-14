@@ -1,6 +1,6 @@
 # Spakie-LLM
 
-Spakie-LLM is a GPT-style language model project with both PyTorch and MLX runtime paths. It includes tokenizer training, corpus scraping and preprocessing, pretraining, optional SFT fine-tuning, and chat inference from the same codebase.
+Spakie-LLM is a GPT-style language model project with parallel PyTorch and MLX runtime paths. It includes tokenizer training, corpus download/scraping and preprocessing, pretraining, SFT fine-tuning, checkpointed chat inference, and basic evaluation tooling from the same codebase.
 
 ## Setup
 
@@ -10,67 +10,82 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-PyTorch is the main dependency for the torch backend. On Apple Silicon, install an MPS-enabled build; on CUDA machines, install the matching CUDA wheel for your toolkit. MLX is enabled on Apple Silicon via `mlx>=0.31.1`.
+PyTorch is the main dependency for the torch backend. On Apple Silicon, MLX is installed via the conditional `mlx>=0.31.1` requirement; on CUDA machines, install a PyTorch wheel that matches your CUDA toolkit if the default wheel is not appropriate.
 
 ## Project Layout
 
-- `scripts/` - training, preprocessing, scraping, benchmark, and pipeline entry points
+- `scripts/` - training, preprocessing, scraping, data download, evaluation, benchmark, and pipeline entry points
 - `training/` - dataset, optimizer, pretraining, and fine-tuning logic
 - `model/` - PyTorch and MLX Transformer implementations
 - `runtime/` - device, precision, and MLX runtime helpers
 - `tokenizer/` - SentencePiece tokenizer training and wrapper code
-- `inference/` - chat loops for both backends
-- `configs/default.py` - preset definitions and corpus planning defaults
+- `inference/` - chat and generation loops for both backends
+- `configs/default.py` and `configs/default.yaml` - preset definitions, paths, optimizer defaults, and corpus planning defaults
+- `tests/` - `unittest` coverage for runtime resolution, config scaling, Muon, and MLX/PyTorch parity
 
 ## Quick Start
 
-1. Train a tokenizer
+1. Train a tokenizer from files under `data/raw/`:
+
 ```bash
 python3 tokenizer/train_tokenizer.py
 ```
 
-2. Prepare data
+2. Download or add pretraining data:
+
+```bash
+python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
+```
+
+3. Prepare pretraining arrays:
+
 ```bash
 python3 scripts/prepare_data.py
 ```
 
-3. Train a model
+4. Train a model:
+
 ```bash
 python3 scripts/train.py --preset 300m --backend mlx --precision auto
 python3 scripts/train.py --preset 300m --backend torch --device auto --precision auto
 ```
 
-4. Fine-tune on chat data
+5. Build SFT data and fine-tune:
+
 ```bash
+python3 scripts/download_sft_data.py
+python3 scripts/prepare_sft.py
 python3 scripts/finetune.py --backend mlx --precision auto
-python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
-5. Chat with a checkpoint
+6. Chat with a checkpoint:
+
 ```bash
 python3 scripts/chat.py --backend mlx --precision auto
 python3 scripts/chat.py --backend torch --device auto --precision auto
 ```
 
+`scripts/train.py` defaults to `--backend mlx --preset 92m`. The shared config default preset and pipeline default are `300m`.
+
 ## Runtime Selection
 
-The torch entry points support:
+Torch entry points support:
 
 ```bash
 --device {auto,cuda,mps,cpu}
 --precision {auto,fp32,fp16,bf16}
 ```
 
-Default behavior is Mac-friendly:
+Default runtime behavior:
 
 - `--device auto` prefers `cuda`, then `mps`, then `cpu`
 - `--precision auto` resolves to `bf16` on CUDA, `bf16` on MPS, and `fp32` on CPU
 
-For Apple Silicon, the repo also supports MLX-specific flags:
+MLX training and fine-tuning support:
 
 ```bash
---mlx-compile
---mlx-prefetch
+--mlx-compile / --no-mlx-compile
+--mlx-prefetch / --no-mlx-prefetch
 --mlx-memory-gb <value>
 --mlx-wired-gb <value>
 --mlx-profile
@@ -87,12 +102,16 @@ python3 scripts/scrape_open_corpus.py
 python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
 ```
 
-`scripts/prepare_data.py` streams documents, filters low-quality text, deduplicates near-identical documents, tokenizes in batches, and writes `data/processed/train.npy` and `data/processed/val.npy`.
+`scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies quality filters, fastText language ID, and MinHash/LSH near-deduplication, tokenizes in batches, writes token shards under `data/processed/shards/`, and merges them into `data/processed/train.npy` and `data/processed/val.npy`.
 
-If preparation is interrupted after token shards are written, resume with:
+Useful prepare commands:
 
 ```bash
 python3 scripts/prepare_data.py --resume
+python3 scripts/prepare_data.py --dry_run
+python3 scripts/prepare_data.py --target_train_tokens 100000000
+python3 scripts/prepare_data.py --source_dirs large_corpus,wiki
+python3 scripts/prepare_data.py --workers 1
 ```
 
 ## Pretraining and SFT
@@ -100,8 +119,22 @@ python3 scripts/prepare_data.py --resume
 Pretraining:
 
 ```bash
-python3 scripts/train.py --preset 92m --device auto --precision auto
+python3 scripts/train.py --preset 92m --backend mlx --precision auto --smoke
 python3 scripts/train.py --preset 300m --backend mlx --precision auto --mlx-profile
+python3 scripts/train.py --preset 300m --backend torch --device auto --precision auto
+```
+
+Useful training options:
+
+```bash
+--max-steps <steps>
+--target_tokens <tokens>
+--resume
+--resume-from <checkpoint>
+--additional-steps <steps>
+--output-dir <dir>
+--eval-interval <steps>
+--eval-batches <batches>
 ```
 
 Pipeline runner:
@@ -109,6 +142,7 @@ Pipeline runner:
 ```bash
 python3 scripts/run_pipeline.py --preset 300m --backend mlx --max-steps 1000
 python3 scripts/run_pipeline.py --preset 180m --backend torch --device auto --precision auto
+python3 scripts/run_pipeline.py --preset 300m --backend mlx --skip-sft
 ```
 
 Fine-tuning expects chat-style JSONL records like:
@@ -117,43 +151,129 @@ Fine-tuning expects chat-style JSONL records like:
 {"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
 
-Chat data defaults to `data/chat/train.jsonl`.
+SFT source data is downloaded to `data/chat_raw/` and merged into `data/chat/train.jsonl`:
 
-## Checkpoints
+```bash
+python3 scripts/download_sft_data.py
+python3 scripts/prepare_sft.py
+python3 scripts/prepare_sft.py --no-system
+python3 scripts/finetune.py --backend mlx --precision auto
+python3 scripts/finetune.py --backend torch --device auto --precision auto
+```
 
-The chat and fine-tuning commands look for checkpoints under the preset checkpoint directory, with smoke-test outputs in `smoke_pretrain/` and `smoke_sft/`.
+For a small targeted SFT/eval set instead of downloaded SFT sources:
+
+```bash
+python3 scripts/build_targeted_data.py
+```
+
+This writes directly to `data/chat/train.jsonl` and `data/eval/`.
+
+Useful SFT options:
+
+```bash
+--train-jsonl <path>
+--source-checkpoint <checkpoint>
+--output-name <filename>
+--max-examples <count>
+--epochs <count>
+--lr <value>
+--list-models
+--no-model-prompt
+```
+
+## Optimizer
+
+The default optimizer is Muon, with AdamW fallback only when explicitly allowed:
+
+```bash
+python3 scripts/train.py --optimizer muon
+python3 scripts/train.py --optimizer adamw --allow-adamw-fallback
+python3 scripts/verify_muon.py
+```
+
+Muon options include `--muon-adjust-lr-fn {match_rms_adamw,original,none}`, `--muon-ns-steps`, `--muon-momentum`, `--muon-nesterov / --no-muon-nesterov`, and `--muon-qkv-split / --no-muon-qkv-split`.
+
+## Checkpoints and Chat
+
+Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. `pretrain_interrupt.pt` is the rolling checkpoint used by `scripts/train.py --resume`.
 
 Useful commands:
 
 ```bash
 python3 scripts/chat.py --list-models --device auto --precision auto
+python3 scripts/chat.py --model 1 --backend mlx --no-model-prompt
+python3 scripts/chat.py --checkpoint checkpoints/300m/best.pt --backend mlx
+python3 scripts/chat.py --json_mode --system "Answer as JSON."
 python3 scripts/finetune.py --list-models --backend mlx
 python3 scripts/train.py --resume
 ```
+
+The default chat tokenizer path is `tokenizer/spakie.model`.
+
+## Evaluation and Tests
+
+Run the basic QA evaluator:
+
+```bash
+python3 scripts/build_targeted_data.py
+python3 scripts/eval_basic_qa.py --backend mlx --preset 300m
+python3 scripts/eval_basic_qa.py --backend torch --device auto --precision auto
+```
+
+Run the unit tests:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Notable tests:
+
+- `tests/test_muon.py` - Muon optimizer math, parameter classification, and BF16 tolerance bounds
+- `tests/test_mlx_parity.py` - numerical parity between PyTorch and MLX transformer paths
+- `tests/test_scaling.py` - preset/config invariants and data preparation behavior
+- `tests/test_runtime.py` - device/precision auto-resolution
 
 ## Model Presets
 
 The repo currently supports these presets:
 
-| Preset | Layers | `d_model` | Heads | `d_ff` | Pretrain batch | Grad accum | Notes |
-|---|---:|---:|---:|---:|---:|---:|---|
-| `92m` | 12 | 768 | 12 | 3072 | 64 | 1 | Smallest preset, good for smoke tests and quicker iteration |
-| `180m` | 16 | 896 | 14 | 3584 | 96 | 2 | Uses activation checkpointing |
-| `300m` | 24 | 1024 | 16 | 4096 | 64 | 2 | Default preset, uses activation checkpointing |
+| Preset | Layers | `d_model` | Heads | `d_ff` | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `92m` | 12 | 768 | 12 | 3072 | 64 | 1 | 16 | 2 | Smallest preset, good for smoke tests and quicker iteration |
+| `180m` | 16 | 896 | 14 | 3584 | 96 | 2 | 32 | 8 | Mid-size preset |
+| `300m` | 24 | 1024 | 16 | 4096 | 64 | 2 | 16 | 2 | Config and pipeline default preset |
 
 Shared model defaults:
 
 - `vocab_size = 16384`
 - `max_seq_len = 512`
 - `dropout = 0.1`
+- `bias = false`
 - learned positional embeddings
 - weight-tied LM head
 - GELU activations
 - scaled dot-product attention
+- activation checkpointing disabled by default for all current presets
+
+## Architecture Notes
+
+The codebase has two parallel backends that share configs, tokenizer, checkpoints, and CLI entry points.
+
+| Concern | Torch | MLX |
+|---|---|---|
+| Model | `model/transformer.py` | `model/transformer_mlx.py` |
+| Dataset | `training/dataset.py` | `training/dataset_mlx.py` |
+| Pretrain loop | `training/pretrain.py` | `training/pretrain_mlx.py` |
+| SFT loop | `training/finetune.py` | `training/finetune_mlx.py` |
+| Optimizer | `training/optimizers.py` | `training/optimizers_mlx.py` |
+| Chat / generate | `inference/chat.py`, `inference/generate.py` | `inference/chat_mlx.py`, `inference/generate_mlx.py` |
+
+When changing model behavior or training logic, keep the Torch and MLX paths aligned and re-run the parity tests.
 
 ## Mac Troubleshooting
 
-If you hit MPS backend limitations or memory pressure on macOS, these environment variables can help:
+If torch+MPS hits unsupported ops or memory pressure on macOS, these environment variables can help:
 
 ```bash
 export PYTORCH_ENABLE_MPS_FALLBACK=1
@@ -162,7 +282,7 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 
 ## Chat Template
 
-```
+```text
 <|system|>You are Spakie, a helpful assistant.<eos>
 <|user|>What is Python?<eos>
 <|assistant|>Python is a programming language.<eos>
