@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import signal
 import sys
 import time
 
@@ -24,14 +25,15 @@ from training.dataset_mlx import (
     stack_batch,
 )
 from training.mlx_profile import MLXProfile, now
+from training.optimizers_mlx import configure_mlx_optimizer
 from training.prefetch_mlx import BatchPrefetcher
 from training.pretrain_mlx import (
-    DualAdamW,
     _accum_grads,
     _arrays_to_mx,
     _build_microbatch_step,
     get_lr,
 )
+from training.muon_core import OPTIMIZER_CHOICES
 
 
 class SyntheticSequenceDataset:
@@ -215,7 +217,7 @@ def _benchmark_steps(
             clipped_grads, _ = clip_grads(accum_grads, grad_clip)
         optimizer.set_lr(lr_fn(step_idx))
         optimizer.update(model, clipped_grads)
-        mx.eval(model.parameters(), optimizer.decay.state, optimizer.nodecay.state, accum_loss)
+        mx.eval(model.parameters(), optimizer.state_trees(), accum_loss)
         loss_value = float(accum_loss.item())
         if active_profiler.enabled:
             active_profiler.add("opt_step", now() - opt_start)
@@ -250,6 +252,20 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=0, help="Override task batch size")
     parser.add_argument("--grad-accum", type=int, default=0, help="Override task grad accumulation")
     parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default=None,
+        help="Optimizer to benchmark (default: task config)",
+    )
+    parser.add_argument("--muon-ns-steps", type=int, default=None, help="Override Muon Newton-Schulz iteration count")
+    parser.add_argument(
+        "--muon-qkv-split",
+        dest="muon_qkv_split",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently",
+    )
+    parser.add_argument(
         "--compile",
         dest="compile",
         action=argparse.BooleanOptionalAction,
@@ -269,6 +285,13 @@ def main() -> None:
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
+    if args.optimizer:
+        config.pretrain_optimizer = args.optimizer
+        config.sft_optimizer = args.optimizer
+    if args.muon_ns_steps is not None:
+        config.muon_ns_steps = args.muon_ns_steps
+    if args.muon_qkv_split is not None:
+        config.muon_qkv_split = args.muon_qkv_split
     hparams = _resolve_task_hparams(config, args.task, args)
     batch_size = int(hparams["batch_size"])
     grad_accum = int(hparams["grad_accum"])
@@ -283,10 +306,12 @@ def main() -> None:
         model.set_dtype(runtime.dtype)
     model.train()
 
-    optimizer = DualAdamW(
+    optimizer = configure_mlx_optimizer(
+        model,
+        config,
+        kind=config.pretrain_optimizer if args.task == "pretrain" else config.sft_optimizer,
         learning_rate=float(hparams["lr"]),
         weight_decay=float(hparams["weight_decay"]),
-        betas=(0.9, 0.95),
     )
 
     total_steps = max(args.steps, 1)
@@ -298,24 +323,42 @@ def main() -> None:
     print(f"Data: {data_source}")
     print(f"Batch size: {batch_size}")
     print(f"Grad accum: {grad_accum}")
+    print(f"Optimizer: {optimizer.optimizer_kind}")
     print(f"Compile: {args.compile}")
     print(f"Prefetch: {args.prefetch}")
     print(f"Warmup steps: {args.warmup_steps}")
     print(f"Timed steps: {args.steps}")
 
-    elapsed, tokens_processed, last_loss, profiler = _benchmark_steps(
-        model=model,
-        dataset=dataset,
-        batch_size=batch_size,
-        grad_accum=grad_accum,
-        lr_fn=lr_fn,
-        grad_clip=float(hparams["grad_clip"]),
-        optimizer=optimizer,
-        steps=args.steps,
-        warmup_steps=args.warmup_steps,
-        use_compile=args.compile,
-        use_prefetch=args.prefetch,
-    )
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    stop_requested = False
+
+    def handle_sigint(signum, frame):
+        nonlocal stop_requested
+        if stop_requested:
+            raise KeyboardInterrupt
+        stop_requested = True
+        print("\nStop requested. Finishing the current benchmark step...")
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    try:
+        elapsed, tokens_processed, last_loss, profiler = _benchmark_steps(
+            model=model,
+            dataset=dataset,
+            batch_size=batch_size,
+            grad_accum=grad_accum,
+            lr_fn=lr_fn,
+            grad_clip=float(hparams["grad_clip"]),
+            optimizer=optimizer,
+            steps=args.steps,
+            warmup_steps=args.warmup_steps,
+            use_compile=args.compile,
+            use_prefetch=args.prefetch,
+        )
+    except KeyboardInterrupt:
+        print("Benchmark interrupted before results were available.")
+        return
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
     step_ms = (elapsed / max(args.steps, 1)) * 1000.0
     tok_per_sec = tokens_processed / elapsed if elapsed > 0 else 0.0

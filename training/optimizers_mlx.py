@@ -21,6 +21,13 @@ def _subset_tree_by_names(tree, names: set[str]):
     return tree_unflatten([(k, v) for k, v in tree_flatten(tree) if k in names and v is not None])
 
 
+def _split_tree_by_ndim(tree, *, split_ndim: int = 2):
+    flat = tree_flatten(tree)
+    high = [(k, v) for k, v in flat if v is not None and len(v.shape) >= split_ndim]
+    low = [(k, v) for k, v in flat if v is not None and len(v.shape) < split_ndim]
+    return tree_unflatten(high), tree_unflatten(low)
+
+
 def _flatten_arrays(tree) -> dict[str, mx.array]:
     return {k: v for k, v in tree_flatten(tree) if isinstance(v, mx.array)}
 
@@ -71,11 +78,9 @@ class DualAdamW:
         self.nodecay.learning_rate = lr
 
     def update(self, model, grads) -> None:
-        flat = tree_flatten(grads)
-        decay_names = {k for k, v in flat if v is not None and v.ndim >= 2}
-        nodecay_names = {k for k, v in flat if v is not None and v.ndim < 2}
-        self.decay.update(model, _subset_tree_by_names(grads, decay_names))
-        self.nodecay.update(model, _subset_tree_by_names(grads, nodecay_names))
+        decay_grads, nodecay_grads = _split_tree_by_ndim(grads)
+        self.decay.update(model, decay_grads)
+        self.nodecay.update(model, nodecay_grads)
 
     def state_trees(self) -> dict:
         return {"decay": self.decay.state, "nodecay": self.nodecay.state}

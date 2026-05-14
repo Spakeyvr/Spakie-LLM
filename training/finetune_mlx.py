@@ -144,8 +144,7 @@ def finetune_mlx(
                         )
                         optimizer.set_lr(lr)
                         optimizer.update(model, clipped)
-                        optimizer.eval_state()
-                        mx.eval(model.parameters())
+                        mx.eval(model.parameters(), optimizer.state_trees())
                         if profiler.enabled:
                             profiler.add("opt_step", now() - opt_start)
 
