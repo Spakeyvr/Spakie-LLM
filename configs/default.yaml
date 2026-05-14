@@ -39,7 +39,7 @@ defaults:
   pretrain_optimizer: muon
 
   # SFT
-  sft_batch_size: 8
+  sft_batch_size: 16
   sft_grad_accum_steps: 2
   sft_lr: 4.0e-5
   sft_epochs: 3
@@ -76,7 +76,7 @@ defaults:
   checkpoint_dir: ""
 
   # Corpus planning
-  target_train_tokens: 4000000000
+  target_train_tokens: 6000000000
   target_processed_tokens: 0
   large_corpus_dir: data/raw/large_corpus
   corpus_report_path: data/processed/corpus_report.json

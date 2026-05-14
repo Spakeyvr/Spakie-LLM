@@ -14,14 +14,17 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import queue
 import re
 import shutil
-from collections import defaultdict
-from dataclasses import dataclass
+import threading
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
 import numpy as np
+import xxhash
 from tqdm import tqdm
 
 import sys
@@ -50,6 +53,10 @@ class DocumentRecord:
 class PendingTokenization:
     source: str
     text: str
+    # When dedup is enabled these are pre-computed by the worker (or serial
+    # path) and only used by the main process for fast dedup lookups.
+    exact_hash: int | None = None
+    signature: np.ndarray | None = None
 
 
 # Lines that are pure navigation chrome — matched whole-line, case-insensitive.
@@ -119,13 +126,45 @@ def _iter_shingles(text: str, n: int):
         yield " ".join(words[i:i + n])
 
 
+# xxh32 over the shingle bytes — drop-in replacement for datasketch's default
+# sha1_hash32, ~3-5x faster and equally well-distributed for MinHash purposes.
+def _xxh32_hashfunc(b: bytes) -> int:
+    return xxhash.xxh32_intdigest(b)
+
+
+def compute_minhash_signature(
+    text: str, *, num_perm: int, shingle_size: int
+) -> np.ndarray:
+    """Build a MinHash signature for ``text`` and return its raw hashvalues.
+
+    The returned uint64 array can be shipped across process boundaries and
+    reconstructed into a MinHash object via ``MinHash(num_perm=..., hashvalues=...)``.
+    """
+    from datasketch import MinHash
+
+    minhash = MinHash(num_perm=num_perm, hashfunc=_xxh32_hashfunc)
+    for shingle in _iter_shingles(text, max(1, shingle_size)):
+        minhash.update(shingle.encode("utf-8"))
+    return minhash.hashvalues
+
+
+def compute_exact_hash(text: str) -> int:
+    """xxh64 of the cleaned text, used for byte-identical dedup before MinHash."""
+    return xxhash.xxh64_intdigest(text.encode("utf-8"))
+
+
 class NearDuplicateIndex:
-    """MinHash + LSH near-duplicate index.
+    """MinHash + LSH near-duplicate index with optional exact-hash fast path.
 
     Catches paraphrased copies and near-identical mirrors that exact-hash
     dedup misses. A document is reported duplicate when its Jaccard similarity
     on word-shingles is above ``threshold`` against any previously inserted
     document.
+
+    Workers compute MinHash signatures + exact hashes in parallel and ship
+    them to this index; ``query_signature`` only runs the (cheap) LSH lookup
+    on the main process, so the expensive shingling/hashing is no longer the
+    serial bottleneck.
     """
 
     def __init__(self, *, threshold: float, num_perm: int, shingle_size: int):
@@ -136,21 +175,43 @@ class NearDuplicateIndex:
         self.num_perm = num_perm
         self.shingle_size = max(1, shingle_size)
         self._counter = 0
+        self._exact_hashes: set[int] = set()
 
+    # Convenience wrapper for the serial path: hash + signature + LSH check.
     def is_duplicate(self, text: str) -> bool:
-        minhash = self._minhash_for(text)
+        exact_hash = compute_exact_hash(text)
+        if exact_hash in self._exact_hashes:
+            return True
+        signature = compute_minhash_signature(
+            text, num_perm=self.num_perm, shingle_size=self.shingle_size
+        )
+        return self._check_and_insert(exact_hash, signature)
+
+    def is_duplicate_exact(self, exact_hash: int) -> bool:
+        """Return True if this xxh64 hash has been seen before. Does not insert."""
+        return exact_hash in self._exact_hashes
+
+    def query_signature(self, exact_hash: int, signature: np.ndarray) -> bool:
+        """Return True if signature collides with a previously inserted doc.
+
+        Inserts on miss. Caller is expected to have already checked the
+        exact-hash fast path; we still record the exact hash on miss so a
+        later byte-identical doc short-circuits.
+        """
+        if exact_hash in self._exact_hashes:
+            return True
+        return self._check_and_insert(exact_hash, signature)
+
+    def _check_and_insert(self, exact_hash: int, signature: np.ndarray) -> bool:
+        minhash = self._MinHash(num_perm=self.num_perm, hashvalues=signature)
         if self.lsh.query(minhash):
+            self._exact_hashes.add(exact_hash)
             return True
         key = f"d{self._counter}"
         self._counter += 1
         self.lsh.insert(key, minhash)
+        self._exact_hashes.add(exact_hash)
         return False
-
-    def _minhash_for(self, text: str):
-        minhash = self._MinHash(num_perm=self.num_perm)
-        for shingle in _iter_shingles(text, self.shingle_size):
-            minhash.update(shingle.encode("utf-8"))
-        return minhash
 
 
 def infer_source(root: Path, path: Path) -> str:
@@ -233,37 +294,67 @@ def iter_documents(raw_root: Path, files: list[Path], progress: tqdm | None = No
 
 _WORKER_CONFIG: SpakieConfig | None = None
 _WORKER_RAW_ROOT: Path | None = None
+_WORKER_DEDUP_ENABLED: bool = False
+_WORKER_NUM_PERM: int = 128
+_WORKER_SHINGLE_SIZE: int = 5
 
 
-def _worker_init(config: SpakieConfig, raw_root_str: str) -> None:
+def _worker_init(
+    config: SpakieConfig,
+    raw_root_str: str,
+    dedup_enabled: bool,
+    num_perm: int,
+    shingle_size: int,
+) -> None:
     global _WORKER_CONFIG, _WORKER_RAW_ROOT
+    global _WORKER_DEDUP_ENABLED, _WORKER_NUM_PERM, _WORKER_SHINGLE_SIZE
     _WORKER_CONFIG = config
     _WORKER_RAW_ROOT = Path(raw_root_str)
+    _WORKER_DEDUP_ENABLED = dedup_enabled
+    _WORKER_NUM_PERM = num_perm
+    _WORKER_SHINGLE_SIZE = shingle_size
 
 
 def _worker_process_file(file_path_str: str) -> dict:
     assert _WORKER_CONFIG is not None and _WORKER_RAW_ROOT is not None
     config = _WORKER_CONFIG
     raw_root = _WORKER_RAW_ROOT
+    dedup_enabled = _WORKER_DEDUP_ENABLED
+    num_perm = _WORKER_NUM_PERM
+    shingle_size = _WORKER_SHINGLE_SIZE
     path = Path(file_path_str)
     file_bytes = path.stat().st_size
-    documents: list[tuple[str, int, bool, str | None, str | None]] = []
+    documents: list[FilteredDoc] = []
     for doc in _iter_file_documents(raw_root, path):
         raw_bytes = len(doc.text.encode("utf-8"))
         text = clean_text(doc.text)
         keep, reason = should_keep_document(text, config, doc.source)
+        if keep and dedup_enabled:
+            exact_hash = compute_exact_hash(text)
+            signature = compute_minhash_signature(
+                text, num_perm=num_perm, shingle_size=shingle_size
+            )
+        else:
+            exact_hash = None
+            signature = None
         documents.append((
             doc.source,
             raw_bytes,
             keep,
             None if keep else reason,
             text if keep else None,
+            exact_hash,
+            signature,
         ))
     return {"file_path": str(path), "file_bytes": file_bytes, "documents": documents}
 
 
-# Yielded tuple: (source, raw_bytes, kept, drop_reason_or_None, cleaned_text_or_None)
-FilteredDoc = tuple[str, int, bool, "str | None", "str | None"]
+# Yielded tuple:
+#   (source, raw_bytes, kept, drop_reason_or_None, cleaned_text_or_None,
+#    exact_hash_or_None, signature_hashvalues_or_None)
+FilteredDoc = tuple[
+    str, int, bool, "str | None", "str | None", "int | None", "np.ndarray | None"
+]
 
 
 def _doc_stream_serial(
@@ -271,17 +362,31 @@ def _doc_stream_serial(
     files: list[Path],
     config: SpakieConfig,
     progress: tqdm | None,
+    *,
+    dedup_enabled: bool,
+    num_perm: int,
+    shingle_size: int,
 ) -> Iterator[FilteredDoc]:
     for doc in iter_documents(raw_root, files, progress=progress):
         raw_bytes = len(doc.text.encode("utf-8"))
         text = clean_text(doc.text)
         keep, reason = should_keep_document(text, config, doc.source)
+        if keep and dedup_enabled:
+            exact_hash = compute_exact_hash(text)
+            signature = compute_minhash_signature(
+                text, num_perm=num_perm, shingle_size=shingle_size
+            )
+        else:
+            exact_hash = None
+            signature = None
         yield (
             doc.source,
             raw_bytes,
             keep,
             None if keep else reason,
             text if keep else None,
+            exact_hash,
+            signature,
         )
 
 
@@ -291,20 +396,24 @@ def _doc_stream_parallel(
     config: SpakieConfig,
     progress: tqdm | None,
     workers: int,
+    *,
+    dedup_enabled: bool,
+    num_perm: int,
+    shingle_size: int,
 ) -> Iterator[FilteredDoc]:
     file_paths = [str(path) for path in files]
     ctx = mp.get_context("spawn")
     with ctx.Pool(
         processes=workers,
         initializer=_worker_init,
-        initargs=(config, str(raw_root)),
+        initargs=(config, str(raw_root), dedup_enabled, num_perm, shingle_size),
     ) as pool:
         try:
             for result in pool.imap_unordered(_worker_process_file, file_paths):
                 if progress is not None:
                     progress.update(result["file_bytes"])
-                for source, raw_bytes, kept, drop_reason, text in result["documents"]:
-                    yield source, raw_bytes, kept, drop_reason, text
+                for entry in result["documents"]:
+                    yield entry
         except GeneratorExit:
             pool.terminate()
             raise
@@ -359,6 +468,10 @@ _EMAIL_RE = re.compile(r"\b\S+@\S+\.\S+\b")
 
 def mean_word_length(text: str) -> float:
     words = _SHINGLE_WORD_RE.findall(text)
+    return _mean_word_length_from_words(words)
+
+
+def _mean_word_length_from_words(words: list[str]) -> float:
     if not words:
         return 0.0
     return sum(len(w) for w in words) / len(words)
@@ -366,12 +479,19 @@ def mean_word_length(text: str) -> float:
 
 def stopword_hit_count(text: str, max_words: int = 200) -> int:
     words = _SHINGLE_WORD_RE.findall(text.lower())[:max_words]
+    return _stopword_hit_count_from_words(words)
+
+
+def _stopword_hit_count_from_words(words: list[str]) -> int:
     return sum(1 for w in words if w in _CORE_STOPWORDS)
 
 
 def symbol_word_ratio(text: str) -> float:
     words = _SHINGLE_WORD_RE.findall(text)
-    word_count = len(words)
+    return _symbol_word_ratio_from_words(text, len(words))
+
+
+def _symbol_word_ratio_from_words(text: str, word_count: int) -> float:
     if word_count == 0:
         return 1.0
     hash_count = text.count("#")
@@ -391,11 +511,11 @@ def top_char_share(text: str) -> float:
     return max(counts.values()) / total
 
 
-def _word_ngram_counts(words: list[str], n: int) -> dict[str, int]:
-    counts: dict[str, int] = defaultdict(int)
-    for i in range(len(words) - n + 1):
-        counts[" ".join(words[i:i + n])] += 1
-    return counts
+def _word_ngram_counts(words: list[str], n: int) -> Counter:
+    if n <= 0 or len(words) < n:
+        return Counter()
+    # Counter over tuples is materially faster than building joined strings.
+    return Counter(zip(*(words[i:] for i in range(n))))
 
 
 # Below ~50 words, n-gram char-share metrics are degenerate (the single longest
@@ -403,26 +523,41 @@ def _word_ngram_counts(words: list[str], n: int) -> dict[str, int]:
 _MIN_WORDS_FOR_NGRAM_METRIC = 50
 
 
+def _ngram_str_len(ngram_tuple: tuple[str, ...]) -> int:
+    # Length of the n-gram if it were joined with single spaces.
+    return sum(len(w) for w in ngram_tuple) + max(0, len(ngram_tuple) - 1)
+
+
 def top_ngram_char_share(text: str, n: int) -> float:
     """Gopher-style: characters in the single most common word n-gram, over total chars."""
     words = _SHINGLE_WORD_RE.findall(text.lower())
+    return _top_ngram_char_share_from_words(words, n, len(text))
+
+
+def _top_ngram_char_share_from_words(words: list[str], n: int, text_len: int) -> float:
     if len(words) < _MIN_WORDS_FOR_NGRAM_METRIC:
         return 0.0
     counts = _word_ngram_counts(words, n)
     if not counts:
         return 0.0
     top_ngram, top_count = max(counts.items(), key=lambda kv: kv[1])
-    return (len(top_ngram) * top_count) / max(len(text), 1)
+    return (_ngram_str_len(top_ngram) * top_count) / max(text_len, 1)
 
 
 def dup_ngram_char_share(text: str, n: int) -> float:
     """Gopher-style: characters covered by any word n-gram appearing more than once."""
     words = _SHINGLE_WORD_RE.findall(text.lower())
+    return _dup_ngram_char_share_from_words(words, n, len(text))
+
+
+def _dup_ngram_char_share_from_words(words: list[str], n: int, text_len: int) -> float:
     if len(words) < _MIN_WORDS_FOR_NGRAM_METRIC:
         return 0.0
     counts = _word_ngram_counts(words, n)
-    dup_chars = sum(len(ngram) * count for ngram, count in counts.items() if count > 1)
-    return dup_chars / max(len(text), 1)
+    dup_chars = sum(
+        _ngram_str_len(ngram) * count for ngram, count in counts.items() if count > 1
+    )
+    return dup_chars / max(text_len, 1)
 
 
 def url_email_line_ratio(text: str) -> float:
@@ -535,11 +670,19 @@ def merge_shards(
     split_idx = int(total_tokens * train_fraction)
     if train_tokens_target and train_tokens_target > split_idx:
         if train_tokens_target > total_tokens:
-            raise ValueError(
-                f"Cannot allocate {train_tokens_target:,} train tokens from "
-                f"{total_tokens:,} processed tokens"
+            # Don't throw away a long, expensive prepare run just because the
+            # corpus came up short of the configured train target. Fall back
+            # to the natural train_fraction split and warn loudly so the user
+            # knows to expand the corpus (or lower target_train_tokens) before
+            # the next run.
+            print(
+                f"WARNING: requested {train_tokens_target:,} train tokens but only "
+                f"{total_tokens:,} processed tokens are available. Falling back to "
+                f"train_fraction={train_fraction:.4f} -> "
+                f"{split_idx:,} train / {total_tokens - split_idx:,} val tokens."
             )
-        split_idx = train_tokens_target
+        else:
+            split_idx = train_tokens_target
 
     train_arr = np.lib.format.open_memmap(train_path, mode="w+", dtype=dtype, shape=(split_idx,))
     val_arr = np.lib.format.open_memmap(val_path, mode="w+", dtype=dtype, shape=(total_tokens - split_idx,))
@@ -579,12 +722,22 @@ def merge_shards(
 def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[bool, str]:
     if len(text) < min_doc_chars_for_source(config, source):
         return False, "too_short"
-    mwl = mean_word_length(text)
+
+    # Compute the lowercased word list exactly once and reuse it across every
+    # downstream feature. Previously each helper re-lowered the text and
+    # re-ran `_SHINGLE_WORD_RE.findall`, which dominated the filter cost on
+    # long docs (~6x redundant scans per kept doc).
+    lowered = text.lower()
+    words_lower = _SHINGLE_WORD_RE.findall(lowered)
+    word_count = len(words_lower)
+    text_len = len(text)
+
+    mwl = _mean_word_length_from_words(words_lower)
     if mwl < config.mean_word_length_min or mwl > config.mean_word_length_max:
         return False, "bad_word_length"
-    if stopword_hit_count(text) < config.min_stopword_count:
+    if _stopword_hit_count_from_words(words_lower[:200]) < config.min_stopword_count:
         return False, "low_stopwords"
-    if symbol_word_ratio(text) > config.max_symbol_word_ratio:
+    if _symbol_word_ratio_from_words(text, word_count) > config.max_symbol_word_ratio:
         return False, "symbol_heavy"
     if noise_ratio(text) > config.max_noise_ratio:
         return False, "too_noisy"
@@ -592,17 +745,97 @@ def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[
         return False, "repeated_lines"
     if url_email_line_ratio(text) > config.max_url_email_line_ratio:
         return False, "link_farm"
-    if top_ngram_char_share(text, 2) > config.max_top_2gram_char_share:
+    if _top_ngram_char_share_from_words(words_lower, 2, text_len) > config.max_top_2gram_char_share:
         return False, "repetitive_2gram"
-    if top_ngram_char_share(text, 3) > config.max_top_3gram_char_share:
+    if _top_ngram_char_share_from_words(words_lower, 3, text_len) > config.max_top_3gram_char_share:
         return False, "repetitive_3gram"
-    if dup_ngram_char_share(text, 5) > config.max_dup_5gram_char_share:
+    if _dup_ngram_char_share_from_words(words_lower, 5, text_len) > config.max_dup_5gram_char_share:
         return False, "duplicate_5gram"
     if top_char_share(text) > config.max_top_char_share:
         return False, "char_repetition"
     if looks_boilerplate_heavy(text):
         return False, "boilerplate"
     return True, "kept"
+
+
+class TokenizerPipeline:
+    """Background-thread SentencePiece encoder.
+
+    Decouples the producer loop (worker IPC + dedup) from the cost of batched
+    tokenization. The producer submits filled batches; a single daemon thread
+    runs ``tokenizer.encode_batch`` (which releases the GIL) and pushes the
+    encoded ids back. The producer drains finished batches opportunistically
+    between submissions, so worker IPC stays saturated while encoding runs in
+    parallel on native SentencePiece threads.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, tokenizer, num_threads: int, *, queue_depth: int = 2):
+        self.tokenizer = tokenizer
+        self.num_threads = num_threads
+        self._in_q: queue.Queue = queue.Queue(maxsize=queue_depth)
+        self._out_q: queue.Queue = queue.Queue()
+        self._error: BaseException | None = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name="tokenizer-pipeline", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, batch: list[PendingTokenization]) -> None:
+        if self._error is not None:
+            raise self._error
+        if self._closed:
+            raise RuntimeError("TokenizerPipeline.submit after close_input")
+        self._in_q.put(batch)
+
+    def try_get_ready(self) -> tuple[list[PendingTokenization], list[list[int]]] | None:
+        try:
+            item = self._out_q.get_nowait()
+        except queue.Empty:
+            return None
+        if item is self._SENTINEL:
+            return None
+        return item
+
+    def get_ready_blocking(
+        self,
+    ) -> tuple[list[PendingTokenization], list[list[int]]] | None:
+        item = self._out_q.get()
+        if item is self._SENTINEL:
+            if self._error is not None:
+                raise self._error
+            return None
+        return item
+
+    def close_input(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._in_q.put(self._SENTINEL)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                batch = self._in_q.get()
+                if batch is self._SENTINEL:
+                    self._out_q.put(self._SENTINEL)
+                    return
+                if not batch:
+                    continue
+                texts = [item.text for item in batch]
+                if self.num_threads == 1 or len(texts) == 1:
+                    eos_id = self.tokenizer.eos_id
+                    encoded = [self.tokenizer.encode(t) + [eos_id] for t in texts]
+                else:
+                    encoded = self.tokenizer.encode_batch(
+                        texts, add_eos=True, num_threads=self.num_threads
+                    )
+                self._out_q.put((batch, encoded))
+        except BaseException as exc:
+            self._error = exc
+            self._out_q.put(self._SENTINEL)
 
 
 def build_report(
@@ -716,35 +949,31 @@ def prepare_data(
     pending_chars = 0
     resume_tokens_remaining = resume_tokens
 
-    def flush_pending() -> bool:
-        nonlocal pending, pending_chars, total_tokens, resume_tokens_remaining
-        if not pending:
-            return False
+    pipeline: TokenizerPipeline | None = None
+    # Bound concurrency to 1 in-flight batch: while the encoder works on
+    # batch N, the producer fills batch N+1. Draining is strictly FIFO and
+    # always blocking, which keeps the accept/drop sequence deterministic
+    # across runs (resume relies on byte-for-byte reproducibility) without
+    # giving up the producer/encoder overlap.
+    PIPELINE_DEPTH = 1
+    in_flight = 0
 
-        texts = [item.text for item in pending]
-        if tokenizer_threads == 1 or len(texts) == 1:
-            encoded_batch = [tokenizer.encode(text) + [tokenizer.eos_id] for text in texts]
-        else:
-            encoded_batch = tokenizer.encode_batch(texts, add_eos=True, num_threads=tokenizer_threads)
-
+    def process_encoded_batch(
+        batch: list[PendingTokenization], encoded_batch: list[list[int]]
+    ) -> bool:
+        nonlocal total_tokens, resume_tokens_remaining
         reached_target = False
-        for item, token_ids in zip(pending, encoded_batch):
+        for item, token_ids in zip(batch, encoded_batch):
             stats = source_stats[item.source]
             source_cap = int(source_plan.get(item.source, {}).get("target_tokens", 0))
-            if source_cap and stats["tokens_kept"] >= source_cap:
-                stats["documents_dropped"] += 1
-                stats["drop_reasons"]["source_cap_reached"] += 1
-                continue
-            if dup_index is not None and dup_index.is_duplicate(item.text):
-                stats["documents_dropped"] += 1
-                stats["drop_reasons"]["near_duplicate"] += 1
-                continue
-            stats["documents_kept"] += 1
-            stats["chars_kept"] += len(item.text)
+            # Dedup already ran in the producer loop, so we only need the
+            # post-tokenization source-cap check here.
             if source_cap and stats["tokens_kept"] + len(token_ids) > source_cap:
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"]["source_cap_reached"] += 1
                 continue
+            stats["documents_kept"] += 1
+            stats["chars_kept"] += len(item.text)
             stats["tokens_kept"] += len(token_ids)
             total_tokens += len(token_ids)
             if resume_tokens_remaining:
@@ -760,10 +989,45 @@ def prepare_data(
                 print(f"Reached target token budget: {total_tokens:,}")
                 reached_target = True
                 break
+        return reached_target
 
+    def submit_pending() -> bool:
+        """Drain in-flight batches down to ``PIPELINE_DEPTH-1`` (blocking,
+        FIFO), then submit ``pending``. Returns True if target was reached
+        during the drain."""
+        nonlocal pending, pending_chars, in_flight
+        if not pending:
+            return False
+        assert pipeline is not None
+        while in_flight >= PIPELINE_DEPTH:
+            ready = pipeline.get_ready_blocking()
+            in_flight -= 1
+            if ready is not None and process_encoded_batch(*ready):
+                pending = []
+                pending_chars = 0
+                return True
+        pipeline.submit(pending)
+        in_flight += 1
         pending = []
         pending_chars = 0
-        return reached_target
+        return False
+
+    def drain_all() -> None:
+        """Drain every remaining in-flight batch, blocking FIFO."""
+        nonlocal in_flight
+        assert pipeline is not None
+        while in_flight > 0:
+            ready = pipeline.get_ready_blocking()
+            in_flight -= 1
+            if ready is None:
+                continue
+            if process_encoded_batch(*ready):
+                # Target reached; drop the rest of the in-flight work.
+                break
+        # Eat any leftover results so the daemon thread isn't blocked on put.
+        while in_flight > 0:
+            pipeline.get_ready_blocking()
+            in_flight -= 1
 
     if not dry_run:
         if resume:
@@ -790,12 +1054,32 @@ def prepare_data(
         unit_scale=True,
         mininterval=0.5,
     )
+    stream_kwargs = {
+        "dedup_enabled": dedup,
+        "num_perm": config.near_dup_num_perm,
+        "shingle_size": config.near_dup_shingle_size,
+    }
     if worker_count > 1:
-        doc_stream = _doc_stream_parallel(raw_root, files, config, docs_progress, worker_count)
+        doc_stream = _doc_stream_parallel(
+            raw_root, files, config, docs_progress, worker_count, **stream_kwargs
+        )
     else:
-        doc_stream = _doc_stream_serial(raw_root, files, config, docs_progress)
+        doc_stream = _doc_stream_serial(
+            raw_root, files, config, docs_progress, **stream_kwargs
+        )
+
+    if not dry_run:
+        pipeline = TokenizerPipeline(tokenizer, tokenizer_threads)
     try:
-        for source, raw_bytes_doc, kept, drop_reason, text in doc_stream:
+        for (
+            source,
+            raw_bytes_doc,
+            kept,
+            drop_reason,
+            text,
+            exact_hash,
+            signature,
+        ) in doc_stream:
             stats = source_stats[source]
             stats["documents_seen"] += 1
             stats["raw_bytes"] += raw_bytes_doc
@@ -811,13 +1095,22 @@ def prepare_data(
                 stats["drop_reasons"]["source_cap_reached"] += 1
                 continue
 
-            if dup_index is not None and dry_run and dup_index.is_duplicate(text):
-                stats["documents_dropped"] += 1
-                stats["drop_reasons"]["near_duplicate"] += 1
-                continue
+            # Dedup runs in the producer loop now (was previously post-encode)
+            # so we don't burn tokenizer cycles on near-duplicates. Workers
+            # already computed exact_hash + signature in parallel.
+            if dup_index is not None:
+                assert exact_hash is not None and signature is not None
+                if dup_index.is_duplicate_exact(exact_hash):
+                    stats["documents_dropped"] += 1
+                    stats["drop_reasons"]["exact_duplicate"] += 1
+                    continue
+                if dup_index.query_signature(exact_hash, signature):
+                    stats["documents_dropped"] += 1
+                    stats["drop_reasons"]["near_duplicate"] += 1
+                    continue
 
-            estimated_tokens = max(1, int(len(text) / config.estimated_chars_per_token))
             if dry_run:
+                estimated_tokens = max(1, int(len(text) / config.estimated_chars_per_token))
                 stats["documents_kept"] += 1
                 stats["chars_kept"] += len(text)
                 if source_cap and stats["tokens_kept"] + estimated_tokens > source_cap:
@@ -827,10 +1120,15 @@ def prepare_data(
                 stats["tokens_kept"] += estimated_tokens
                 total_tokens += estimated_tokens
             else:
-                pending.append(PendingTokenization(source=source, text=text))
+                pending.append(PendingTokenization(
+                    source=source,
+                    text=text,
+                    exact_hash=exact_hash,
+                    signature=signature,
+                ))
                 pending_chars += len(text)
                 if len(pending) >= tokenize_batch_size or pending_chars >= tokenize_batch_chars:
-                    if flush_pending():
+                    if submit_pending():
                         break
 
             if stats["documents_seen"] % 25 == 0:
@@ -860,8 +1158,12 @@ def prepare_data(
         )
 
     if not dry_run:
+        assert pipeline is not None
         if pending and not interrupted:
-            flush_pending()
+            submit_pending()
+        if not interrupted:
+            drain_all()
+        pipeline.close_input()
         shard_paths = writer.close()
 
     normalized_source_stats = {}

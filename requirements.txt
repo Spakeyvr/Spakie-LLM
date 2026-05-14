@@ -7,4 +7,5 @@ requests
 datasets>=2.19.0
 fasttext>=0.9.2
 datasketch>=1.6.5
+xxhash>=3.0.0
 mlx>=0.31.1 ; sys_platform == "darwin" and platform_machine == "arm64"
