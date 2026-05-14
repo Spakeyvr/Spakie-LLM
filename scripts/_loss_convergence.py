@@ -62,8 +62,7 @@ def setup_model_and_opt(preset, seed, *, lr, wd, optimizer_kind, ns_steps, perhe
     config.pretrain_warmup_steps = warmup
     config.pretrain_max_steps = max_steps
     config.dropout = 0.0
-    if perhead:
-        setattr(config, "muon_perhead_qkv_split", True)
+    config.muon_qkv_split = bool(perhead)
     runtime = resolve_mlx_runtime("bf16")
     mx.random.seed(seed)
     np.random.seed(seed)
