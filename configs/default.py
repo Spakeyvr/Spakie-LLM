@@ -118,6 +118,15 @@ class SpakieConfig:
     )
     max_repeated_line_ratio: float = _D["max_repeated_line_ratio"]
     max_noise_ratio: float = _D["max_noise_ratio"]
+    mean_word_length_min: float = _D["mean_word_length_min"]
+    mean_word_length_max: float = _D["mean_word_length_max"]
+    min_stopword_count: int = _D["min_stopword_count"]
+    max_symbol_word_ratio: float = _D["max_symbol_word_ratio"]
+    max_top_2gram_char_share: float = _D["max_top_2gram_char_share"]
+    max_top_3gram_char_share: float = _D["max_top_3gram_char_share"]
+    max_dup_5gram_char_share: float = _D["max_dup_5gram_char_share"]
+    max_top_char_share: float = _D["max_top_char_share"]
+    max_url_email_line_ratio: float = _D["max_url_email_line_ratio"]
     train_split_fraction: float = _D["train_split_fraction"]
     estimated_chars_per_token: float = _D["estimated_chars_per_token"]
 

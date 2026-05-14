@@ -78,8 +78,9 @@ class ScalingConfigTests(unittest.TestCase):
             sample = raw_dir / "sample.jsonl"
             sample.write_text(json.dumps({
                 "text": (
-                    "This is a clean test document repeated enough times to exceed the minimum threshold. "
-                    "This is a clean test document repeated enough times to exceed the minimum threshold."
+                    "The history of computing begins with early mechanical devices that helped people perform "
+                    "arithmetic. Over time these machines grew more sophisticated and eventually became the "
+                    "programmable computers we recognize today."
                 )
             }) + "\n", encoding="utf-8")
 
@@ -173,12 +174,12 @@ class ScalingConfigTests(unittest.TestCase):
             raw_dir = root / "raw" / "large_corpus" / "fineweb-edu"
             raw_dir.mkdir(parents=True, exist_ok=True)
             rows = [
-                {"text": "alpha beta gamma"},
-                {"text": "delta epsilon zeta"},
-                {"text": "alpha beta gamma"},
-                {"text": "eta theta iota"},
-                {"text": "kappa lambda mu"},
-                {"text": "nu xi omicron"},
+                {"text": "The morning fog rolled across the bay and softened every distant outline."},
+                {"text": "She arranged the books on the shelf so each spine caught the afternoon light."},
+                {"text": "The morning fog rolled across the bay and softened every distant outline."},
+                {"text": "Travelers waited on the platform, watching the slow arrival of the night express."},
+                {"text": "He measured the flour twice before adding it to the warm bowl of yeast."},
+                {"text": "Children laughed in the courtyard as the kite climbed above the brick chimneys."},
             ]
             sample = raw_dir / "sample.jsonl"
             sample.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
@@ -236,12 +237,12 @@ class ScalingConfigTests(unittest.TestCase):
             raw_dir = root / "raw" / "large_corpus" / "fineweb-edu"
             raw_dir.mkdir(parents=True, exist_ok=True)
             rows = [
-                {"text": "alpha beta gamma"},
-                {"text": "delta epsilon zeta"},
-                {"text": "eta theta iota"},
-                {"text": "kappa lambda mu"},
-                {"text": "nu xi omicron"},
-                {"text": "pi rho sigma"},
+                {"text": "The cat sat on the mat."},
+                {"text": "Birds fly to the tall tree."},
+                {"text": "Sun and stars light the sky."},
+                {"text": "He walked home in the rain."},
+                {"text": "Books are stacked on the shelf."},
+                {"text": "The wind blew across the lake."},
             ]
             sample = raw_dir / "sample.jsonl"
             sample.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")

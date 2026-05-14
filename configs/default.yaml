@@ -85,6 +85,19 @@ defaults:
   min_doc_chars: 400
   max_repeated_line_ratio: 0.25
   max_noise_ratio: 0.35
+
+  # Tier 1 quality filters (Gopher-style + heuristics)
+  mean_word_length_min: 3.0
+  mean_word_length_max: 10.0
+  min_stopword_count: 2
+  max_symbol_word_ratio: 0.10
+  max_top_2gram_char_share: 0.20
+  max_top_3gram_char_share: 0.18
+  max_dup_5gram_char_share: 0.15
+  max_top_char_share: 0.30
+
+  # Tier 2 quality filter
+  max_url_email_line_ratio: 0.30
   train_split_fraction: 0.95
   estimated_chars_per_token: 4.0
 

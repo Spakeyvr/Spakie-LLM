@@ -52,10 +52,55 @@ class PendingTokenization:
     text: str
 
 
+# Lines that are pure navigation chrome — matched whole-line, case-insensitive.
+# Kept narrow and literal to avoid stripping legitimate content.
+_NAV_LINE_RE = re.compile(
+    r"^\s*("
+    r"navigation|contents|jump to navigation|jump to search|jump to:"
+    r"|from wikipedia,? the free encyclopedia"
+    r"|retrieved from"
+    r"|this page was last edited"
+    r"|navigation menu"
+    r"|main page|special pages|permanent link|page information"
+    r"|what links here|related changes|upload file"
+    r"|print/export|in other projects"
+    r"|edit this page|talk|log in|log out|create account"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# Wikipedia/citation residue: [edit], [1], [42], [citation needed], [note 3], [nb 2].
+# Constrained to short bracketed tokens so we don't strip URLs or date stamps.
+_CITATION_RE = re.compile(
+    r"\[(?:edit|citation needed|note\s+\d+|nb\s+\d+|\d{1,3})\]",
+    re.IGNORECASE,
+)
+
+# Lines that look like JavaScript/CSS residue from failed HTML extraction.
+# Anchored to line start so prose mentioning "function" or "var" is untouched.
+_JS_CSS_LINE_RE = re.compile(
+    r"^\s*("
+    r"function(\s+\w+)?\s*\([^)]*\)\s*\{"
+    r"|(?:var|let|const)\s+\w+\s*="
+    r"|\};?\s*$"
+    r"|@media\s+"
+    r"|@import\s+"
+    r"|<!--"
+    r"|//\s*<!\[CDATA\["
+    r")"
+)
+
+
 def clean_text(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
+    text = _CITATION_RE.sub("", text)
     text = re.sub(r"\r\n?", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
+    lines = [
+        ln for ln in text.splitlines()
+        if not _NAV_LINE_RE.match(ln) and not _JS_CSS_LINE_RE.match(ln)
+    ]
+    text = "\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -295,8 +340,97 @@ def looks_boilerplate_heavy(text: str) -> bool:
     markers = (
         "privacy policy", "terms of service", "cookie policy", "all rights reserved",
         "sign in", "subscribe", "javascript required", "skip to content",
+        "jump to navigation", "jump to search", "navigation menu",
+        "click here to download", "click here to print",
     )
     return sum(marker in lower for marker in markers) >= 2
+
+
+# Small, high-frequency English stopword set. Real prose hits several of these
+# in any 200-word window; SEO spam, tag clouds, and link farms hit ~zero.
+_CORE_STOPWORDS = frozenset({
+    "the", "be", "to", "of", "and", "that", "have", "with",
+    "is", "are", "was", "were", "in", "for", "on", "as",
+})
+
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"\b\S+@\S+\.\S+\b")
+
+
+def mean_word_length(text: str) -> float:
+    words = _SHINGLE_WORD_RE.findall(text)
+    if not words:
+        return 0.0
+    return sum(len(w) for w in words) / len(words)
+
+
+def stopword_hit_count(text: str, max_words: int = 200) -> int:
+    words = _SHINGLE_WORD_RE.findall(text.lower())[:max_words]
+    return sum(1 for w in words if w in _CORE_STOPWORDS)
+
+
+def symbol_word_ratio(text: str) -> float:
+    words = _SHINGLE_WORD_RE.findall(text)
+    word_count = len(words)
+    if word_count == 0:
+        return 1.0
+    hash_count = text.count("#")
+    ellipsis_count = text.count("...") + text.count("…")
+    return (hash_count + ellipsis_count) / word_count
+
+
+def top_char_share(text: str) -> float:
+    counts: dict[str, int] = defaultdict(int)
+    total = 0
+    for ch in text:
+        if not ch.isspace():
+            counts[ch] += 1
+            total += 1
+    if total == 0:
+        return 0.0
+    return max(counts.values()) / total
+
+
+def _word_ngram_counts(words: list[str], n: int) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for i in range(len(words) - n + 1):
+        counts[" ".join(words[i:i + n])] += 1
+    return counts
+
+
+# Below ~50 words, n-gram char-share metrics are degenerate (the single longest
+# n-gram dominates a tiny denominator). Skip rather than falsely reject.
+_MIN_WORDS_FOR_NGRAM_METRIC = 50
+
+
+def top_ngram_char_share(text: str, n: int) -> float:
+    """Gopher-style: characters in the single most common word n-gram, over total chars."""
+    words = _SHINGLE_WORD_RE.findall(text.lower())
+    if len(words) < _MIN_WORDS_FOR_NGRAM_METRIC:
+        return 0.0
+    counts = _word_ngram_counts(words, n)
+    if not counts:
+        return 0.0
+    top_ngram, top_count = max(counts.items(), key=lambda kv: kv[1])
+    return (len(top_ngram) * top_count) / max(len(text), 1)
+
+
+def dup_ngram_char_share(text: str, n: int) -> float:
+    """Gopher-style: characters covered by any word n-gram appearing more than once."""
+    words = _SHINGLE_WORD_RE.findall(text.lower())
+    if len(words) < _MIN_WORDS_FOR_NGRAM_METRIC:
+        return 0.0
+    counts = _word_ngram_counts(words, n)
+    dup_chars = sum(len(ngram) * count for ngram, count in counts.items() if count > 1)
+    return dup_chars / max(len(text), 1)
+
+
+def url_email_line_ratio(text: str) -> float:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return 0.0
+    flagged = sum(1 for ln in lines if _URL_RE.search(ln) or _EMAIL_RE.search(ln))
+    return flagged / len(lines)
 
 
 def pick_token_dtype(tokenizer: SpakieTokenizer):
@@ -445,10 +579,27 @@ def merge_shards(
 def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[bool, str]:
     if len(text) < min_doc_chars_for_source(config, source):
         return False, "too_short"
-    if repeated_line_ratio(text) > config.max_repeated_line_ratio:
-        return False, "repeated_lines"
+    mwl = mean_word_length(text)
+    if mwl < config.mean_word_length_min or mwl > config.mean_word_length_max:
+        return False, "bad_word_length"
+    if stopword_hit_count(text) < config.min_stopword_count:
+        return False, "low_stopwords"
+    if symbol_word_ratio(text) > config.max_symbol_word_ratio:
+        return False, "symbol_heavy"
     if noise_ratio(text) > config.max_noise_ratio:
         return False, "too_noisy"
+    if repeated_line_ratio(text) > config.max_repeated_line_ratio:
+        return False, "repeated_lines"
+    if url_email_line_ratio(text) > config.max_url_email_line_ratio:
+        return False, "link_farm"
+    if top_ngram_char_share(text, 2) > config.max_top_2gram_char_share:
+        return False, "repetitive_2gram"
+    if top_ngram_char_share(text, 3) > config.max_top_3gram_char_share:
+        return False, "repetitive_3gram"
+    if dup_ngram_char_share(text, 5) > config.max_dup_5gram_char_share:
+        return False, "duplicate_5gram"
+    if top_char_share(text) > config.max_top_char_share:
+        return False, "char_repetition"
     if looks_boilerplate_heavy(text):
         return False, "boilerplate"
     return True, "kept"
