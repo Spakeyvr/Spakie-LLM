@@ -100,7 +100,14 @@ class SpakieGPTMLX(nn.Module):
         self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = [TransformerBlockMLX(config) for _ in range(config.n_layers)]
-        self._checkpoint_blocks = [nn_utils.checkpoint(block) for block in self.blocks]
+        # Wrap blocks for activation checkpointing only when the preset asks
+        # for it. Building the wrappers eagerly is cheap, but keeping them only
+        # when used avoids surprising aliasing in module-state traversals.
+        self._checkpoint_blocks = (
+            [nn_utils.checkpoint(block) for block in self.blocks]
+            if config.activation_checkpointing
+            else None
+        )
         self.ln_f = nn.LayerNorm(config.d_model, bias=config.bias)
 
         # lm_head shares weights with tok_emb — we don't allocate a separate matrix;
@@ -160,6 +167,7 @@ class SpakieGPTMLX(nn.Module):
         *,
         cache_offset: int = 0,
         return_cache: bool = False,
+        ignore_index: int | None = -100,
     ):
         B, T = idx.shape
         assert T + cache_offset <= self.config.max_seq_len, (
@@ -182,21 +190,69 @@ class SpakieGPTMLX(nn.Module):
                     new_caches.append(nc)
 
         x = self.ln_f(x)
-        # Tied lm_head: project with tok_emb.weight^T.
-        logits = x @ self.tok_emb.weight.T
+        W = self.tok_emb.weight  # tied lm_head: (vocab_size, d_model)
 
-        loss = None
-        if targets is not None:
-            # Mask out ignore_index (-100). Replace with 0 so gather is safe; weight=0 there.
-            mask = (targets != -100).astype(logits.dtype)
-            safe_targets = mx.where(targets != -100, targets, mx.zeros_like(targets))
-            per_tok = nn.losses.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                safe_targets.reshape(-1),
-                reduction="none",
+        # When `targets` is provided in training, we don't need the full
+        # (B, T, vocab_size) logits tensor — only the per-token loss. At
+        # vocab_size=16384 and B*T~50k that tensor is ~1.6 GB in bf16,
+        # which is the dominant chunk of memory traffic for fwd+bwd. Compute
+        # the matmul + cross-entropy in chunks along (B*T) so the peak
+        # logits tensor stays small; this is purely a compute/memory
+        # optimization (not a numerical change) and is skipped whenever the
+        # caller actually wants logits back (inference, no targets).
+        if targets is None or return_cache or cache is not None:
+            logits = x @ W.T
+            loss = None
+            if targets is not None:
+                flat_logits = logits.reshape(-1, logits.shape[-1])
+                flat_targets = targets.reshape(-1)
+                loss = _ce_with_optional_mask(
+                    flat_logits, flat_targets, ignore_index, logits.dtype
+                )
+            return logits, loss, new_caches
+
+        flat_x = x.reshape(-1, x.shape[-1])
+        flat_targets = targets.reshape(-1)
+        N = flat_x.shape[0]
+        chunk = self.config.loss_chunk_size or N
+        if chunk <= 0 or chunk >= N:
+            flat_logits = flat_x @ W.T
+            loss = _ce_with_optional_mask(
+                flat_logits, flat_targets, ignore_index, flat_logits.dtype
             )
-            mask_flat = mask.reshape(-1)
-            denom = mx.maximum(mask_flat.sum(), mx.array(1.0, dtype=mask_flat.dtype))
-            loss = (per_tok * mask_flat).sum() / denom
+            return None, loss, new_caches
 
-        return logits, loss, new_caches
+        loss_sum = mx.zeros((), dtype=mx.float32)
+        valid_count = mx.zeros((), dtype=mx.float32)
+        for i in range(0, N, chunk):
+            j = min(i + chunk, N)
+            cx = flat_x[i:j]
+            ct = flat_targets[i:j]
+            clogits = cx @ W.T
+            if ignore_index is None:
+                cl = nn.losses.cross_entropy(clogits, ct, reduction="sum").astype(mx.float32)
+                loss_sum = loss_sum + cl
+                valid_count = valid_count + mx.array(float(j - i), dtype=mx.float32)
+            else:
+                cmask = (ct != ignore_index).astype(clogits.dtype)
+                csafe = mx.where(ct != ignore_index, ct, mx.zeros_like(ct))
+                cper = nn.losses.cross_entropy(clogits, csafe, reduction="none")
+                loss_sum = loss_sum + (cper * cmask).sum().astype(mx.float32)
+                valid_count = valid_count + cmask.sum().astype(mx.float32)
+        denom = mx.maximum(valid_count, mx.array(1.0, dtype=mx.float32))
+        return None, loss_sum / denom, new_caches
+
+
+def _ce_with_optional_mask(
+    flat_logits: mx.array,
+    flat_targets: mx.array,
+    ignore_index: int | None,
+    logits_dtype,
+) -> mx.array:
+    if ignore_index is None:
+        return nn.losses.cross_entropy(flat_logits, flat_targets, reduction="mean")
+    mask = (flat_targets != ignore_index).astype(logits_dtype)
+    safe = mx.where(flat_targets != ignore_index, flat_targets, mx.zeros_like(flat_targets))
+    per_tok = nn.losses.cross_entropy(flat_logits, safe, reduction="none")
+    denom = mx.maximum(mask.sum(), mx.array(1.0, dtype=mask.dtype))
+    return (per_tok * mask).sum() / denom

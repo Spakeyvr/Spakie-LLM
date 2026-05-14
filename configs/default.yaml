@@ -23,6 +23,12 @@ defaults:
   dropout: 0.1
   bias: false
   activation_checkpointing: false
+  # Chunk size for the lm_head matmul + cross-entropy in the MLX training
+  # path. 0 (default) skips chunking and computes flat 2-D logits + CE in one
+  # go — measured fastest across 92m / 180m / 300m on Apple Silicon at
+  # vocab_size=16384. Larger chunks may help on hardware with tight memory
+  # budgets; benchmark before changing.
+  loss_chunk_size: 0
 
   # Pretraining
   pretrain_batch_size: 128

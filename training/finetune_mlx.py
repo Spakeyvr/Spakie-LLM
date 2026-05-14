@@ -83,6 +83,7 @@ def finetune_mlx(
             epoch_loss = 0.0
             n_micro = 0
             accum_grads = None
+            accum_loss_lazy = mx.array(0.0, dtype=mx.float32)
             micro_in_step = 0
 
             pbar = tqdm(
@@ -119,15 +120,16 @@ def finetune_mlx(
                     if profiler.enabled:
                         step_start = now()
                         loss, grads = microbatch_step(x, y)
+                        mx.eval(loss, grads)
+                        profiler.add("forward_backward", now() - step_start)
                     else:
                         loss, grads = microbatch_step(x, y)
                     accum_grads = _accum_grads(accum_grads, grads)
-                    # Flush lazy graph per microbatch (prevents unbounded trace growth).
-                    mx.eval(accum_grads)
-                    if profiler.enabled:
-                        profiler.add("forward_backward", now() - step_start)
-                    # loss is pre-scaled by accum_scale; recover unscaled for display.
-                    epoch_loss += float(loss.item()) * config.sft_grad_accum_steps
+                    # loss is pre-scaled by accum_scale; sum lazily and only
+                    # materialize at end of the optimizer step (or for postfix
+                    # every accum_steps microbatches). Avoids forcing a CPU↔GPU
+                    # sync between microbatches.
+                    accum_loss_lazy = accum_loss_lazy + loss.astype(mx.float32)
                     n_micro += 1
                     micro_in_step += 1
 
@@ -148,11 +150,17 @@ def finetune_mlx(
                         if profiler.enabled:
                             profiler.add("opt_step", now() - opt_start)
 
+                        # accum_loss_lazy = sum of accum_steps pre-scaled losses
+                        # = mean per-microbatch unscaled loss. Times accum_steps
+                        # gives the sum of unscaled losses for this optimizer step,
+                        # matching the previous per-microbatch accumulation.
+                        step_sum_loss = float(accum_loss_lazy.item()) * config.sft_grad_accum_steps
+                        epoch_loss += step_sum_loss
                         accum_grads = None
+                        accum_loss_lazy = mx.array(0.0, dtype=mx.float32)
                         micro_in_step = 0
                         global_step += 1
-
-                    pbar.set_postfix(loss=f"{epoch_loss / max(n_micro, 1):.4f}")
+                        pbar.set_postfix(loss=f"{epoch_loss / max(n_micro, 1):.4f}")
             finally:
                 if prefetcher is not None:
                     prefetcher.close()

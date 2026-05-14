@@ -53,6 +53,10 @@ class SpakieConfig:
     dropout: float = _D["dropout"]
     bias: bool = _D["bias"]
     activation_checkpointing: bool = _D["activation_checkpointing"]
+    # When > 0 and < B*T, compute logits + cross-entropy in chunks of this many
+    # tokens during training, avoiding the (B*T, vocab_size) materialization.
+    # 0 disables chunking. Only used in the MLX backend's training path.
+    loss_chunk_size: int = _D.get("loss_chunk_size", 0)
 
     # Pretraining
     pretrain_batch_size: int = _D["pretrain_batch_size"]

@@ -113,21 +113,31 @@ def get_lr(step: int, config: SpakieConfig) -> float:
     return min_lr + 0.5 * (config.pretrain_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def _build_loss_and_grad(model: SpakieGPTMLX, accum_scale: float):
+def _build_loss_and_grad(
+    model: SpakieGPTMLX, accum_scale: float, *, ignore_index: int | None
+):
     """Build value_and_grad with the grad-accum scale baked into the loss.
 
     Pre-scaling here means grads come out already divided by accum_steps — no
     Python-side tree_map needed between microbatches, which keeps the lazy
-    graph small.
+    graph small. `ignore_index=None` skips the SFT-style mask path entirely —
+    use this for pretraining where targets never contain -100; it avoids
+    materializing two extra (B*T) tensors per microbatch.
     """
     def loss_fn(model, x, y):
-        _, loss, _ = model(x, y, return_cache=False)
+        _, loss, _ = model(x, y, return_cache=False, ignore_index=ignore_index)
         return loss * accum_scale
 
     return nn.value_and_grad(model, loss_fn)
 
 
-def _build_microbatch_step(model: SpakieGPTMLX, accum_scale: float, *, compile_step: bool):
+def _build_microbatch_step(
+    model: SpakieGPTMLX,
+    accum_scale: float,
+    *,
+    compile_step: bool,
+    ignore_index: int | None = -100,
+):
     """Return a callable `step(x, y) -> (loss, grads)`.
 
     With `compile_step=True`, the forward+backward is wrapped in `mx.compile`
@@ -136,7 +146,7 @@ def _build_microbatch_step(model: SpakieGPTMLX, accum_scale: float, *, compile_s
     a Python float means it becomes a compile-time constant — no recompile
     per step.
     """
-    value_and_grad = _build_loss_and_grad(model, accum_scale)
+    value_and_grad = _build_loss_and_grad(model, accum_scale, ignore_index=ignore_index)
 
     if not compile_step:
         def step(x, y):
@@ -440,7 +450,7 @@ def evaluate(
             x_np, y_np = stack_batch(val_dataset, batch_indices)
             x = mx.array(x_np)
             y = mx.array(y_np)
-            _, loss, _ = model(x, y, return_cache=False)
+            _, loss, _ = model(x, y, return_cache=False, ignore_index=None)
             mx.eval(loss)
             total += float(loss.item())
             count += 1
@@ -503,7 +513,11 @@ def pretrain_mlx(
     )
 
     accum_scale = 1.0 / config.pretrain_grad_accum_steps
-    microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
+    # Pretraining never emits ignore_index tokens; skip the mask path to avoid
+    # two extra (B*T) tensors per microbatch and a softer backward graph.
+    microbatch_step = _build_microbatch_step(
+        model, accum_scale, compile_step=use_compile, ignore_index=None
+    )
 
     ckpt_writer = AsyncCheckpointWriter()
     profiler = MLXProfile(enabled=profile)
@@ -570,17 +584,17 @@ def pretrain_mlx(
                 if profiler.enabled:
                     step_start = now()
                     loss, grads = microbatch_step(x, y)
+                    # Sync only when profiling, to attribute time to forward_backward.
+                    # In normal runs we let the graph extend across all microbatches
+                    # so the GPU can pipeline fwd/bwd of microbatch N+1 behind the
+                    # tail of microbatch N — the materialization point becomes the
+                    # single mx.eval after the optimizer update.
+                    mx.eval(loss, grads)
+                    profiler.add("forward_backward", now() - step_start)
                 else:
                     loss, grads = microbatch_step(x, y)
                 accum_grads = _accum_grads(accum_grads, grads)
                 accum_loss = accum_loss + loss.astype(mx.float32)
-                # Materialize per microbatch: without this, the lazy graph grows
-                # across the whole accumulation window and first-step tracing
-                # overhead dominates — that's the MLX equivalent of forgetting
-                # to call .backward() on each microbatch.
-                mx.eval(accum_grads, accum_loss)
-                if profiler.enabled:
-                    profiler.add("forward_backward", now() - step_start)
                 tokens_processed += x.size
 
             if profiler.enabled:
