@@ -108,10 +108,10 @@ presets:
     d_model: 896
     n_heads: 14
     d_ff: 3584
-    activation_checkpointing: true
+    activation_checkpointing: false
     pretrain_batch_size: 96
     pretrain_grad_accum_steps: 2
-    sft_batch_size: 2
+    sft_batch_size: 32
     sft_grad_accum_steps: 8
     sft_lr: 3.0e-5
     sft_epochs: 4
@@ -121,7 +121,7 @@ presets:
     d_model: 1024
     n_heads: 16
     d_ff: 4096
-    activation_checkpointing: true
+    activation_checkpointing: false
     pretrain_batch_size: 64
     pretrain_grad_accum_steps: 2
     pretrain_lr: 6.0e-4
