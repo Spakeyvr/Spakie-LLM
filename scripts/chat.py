@@ -13,6 +13,26 @@ _TORCH_EXTS = (".pt",)
 _MLX_EXTS = (".safetensors",)
 
 
+def infer_checkpoint_mode(ckpt_path: str) -> str:
+    """Infer prompt mode from the checkpoint filename."""
+    stem = os.path.splitext(os.path.basename(ckpt_path))[0].lower()
+    return "continue" if stem.startswith("pretrain_") else "chat"
+
+
+def apply_mode_defaults(args) -> None:
+    """Fill sampling defaults after auto mode has been resolved."""
+    if args.mode == "continue":
+        args.temperature = 0.8 if args.temperature is None else args.temperature
+        args.top_k = 50 if args.top_k is None else args.top_k
+        args.top_p = 0.9 if args.top_p is None else args.top_p
+        args.repetition_penalty = 1.0 if args.repetition_penalty is None else args.repetition_penalty
+    else:
+        args.temperature = 0.1 if args.temperature is None else args.temperature
+        args.top_k = 1 if args.top_k is None else args.top_k
+        args.top_p = 1.0 if args.top_p is None else args.top_p
+        args.repetition_penalty = 1.2 if args.repetition_penalty is None else args.repetition_penalty
+
+
 def list_available_models(backend: str, preset_name: str | None = None) -> list[tuple[str, str]]:
     """Return (preset, checkpoint_path) pairs for runnable models."""
     preset_names = [preset_name] if preset_name else list(SUPPORTED_PRESETS)
@@ -131,7 +151,7 @@ def run_torch_chat(args, config, ckpt_path):
     from model.transformer import SpakieGPT
     from runtime import resolve_runtime_settings
     from tokenizer.train_tokenizer import SpakieTokenizer
-    from inference.chat import chat_loop
+    from inference.chat import chat_loop, continuation_loop
 
     runtime = resolve_runtime_settings(args.device, args.precision)
     device = runtime.device
@@ -151,15 +171,28 @@ def run_torch_chat(args, config, ckpt_path):
     tok_path = args.tokenizer or (config.tokenizer_prefix + ".model")
     tokenizer = SpakieTokenizer(tok_path)
 
-    print(f"JSON mode: {args.json_mode}")
-    chat_loop(
-        model, tokenizer, config, runtime,
-        system_msg=args.system,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        json_mode=args.json_mode,
-    )
+    if args.mode == "continue":
+        continuation_loop(
+            model, tokenizer, config, runtime,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
+            show_special_tokens=args.show_special_tokens,
+        )
+    else:
+        print(f"JSON mode: {args.json_mode}")
+        chat_loop(
+            model, tokenizer, config, runtime,
+            system_msg=args.system,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            json_mode=args.json_mode,
+            max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
+        )
 
 
 def run_mlx_chat(args, config, ckpt_path):
@@ -168,7 +201,7 @@ def run_mlx_chat(args, config, ckpt_path):
     from model.transformer_mlx import SpakieGPTMLX
     from runtime.mlx_backend import load_safetensors, resolve_mlx_runtime
     from tokenizer.train_tokenizer import SpakieTokenizer
-    from inference.chat_mlx import chat_loop as chat_loop_mlx
+    from inference.chat_mlx import chat_loop as chat_loop_mlx, continuation_loop as continuation_loop_mlx
 
     runtime = resolve_mlx_runtime(args.precision)
     print(f"Backend: mlx")
@@ -191,15 +224,28 @@ def run_mlx_chat(args, config, ckpt_path):
     tok_path = args.tokenizer or (config.tokenizer_prefix + ".model")
     tokenizer = SpakieTokenizer(tok_path)
 
-    print(f"JSON mode: {args.json_mode}")
-    chat_loop_mlx(
-        model, tokenizer, config,
-        system_msg=args.system,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        json_mode=args.json_mode,
-    )
+    if args.mode == "continue":
+        continuation_loop_mlx(
+            model, tokenizer, config,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
+            show_special_tokens=args.show_special_tokens,
+        )
+    else:
+        print(f"JSON mode: {args.json_mode}")
+        chat_loop_mlx(
+            model, tokenizer, config,
+            system_msg=args.system,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            json_mode=args.json_mode,
+            max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
+        )
 
 
 def main():
@@ -208,6 +254,8 @@ def main():
                         help="Model preset to use (default: search all presets with checkpoints)")
     parser.add_argument("--backend", choices=("torch", "mlx"), default="mlx",
                         help="Inference backend")
+    parser.add_argument("--mode", choices=("auto", "chat", "continue"), default="auto",
+                        help="Prompt mode: auto uses raw continuation for pretrain_* checkpoints")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to checkpoint (default: most recent in checkpoints/)")
     parser.add_argument("--model", type=str, default=None,
@@ -218,9 +266,15 @@ def main():
                         help="Skip the interactive model picker and use the default checkpoint")
     parser.add_argument("--tokenizer", type=str, default=None,
                         help="Path to tokenizer model (default: tokenizer/spakie.model)")
-    parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--top_k", type=int, default=1)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top_k", type=int, default=None)
+    parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=256,
+                        help="Maximum tokens to generate per response")
+    parser.add_argument("--repetition-penalty", type=float, default=None,
+                        help="Penalty for repeating generated tokens")
+    parser.add_argument("--show-special-tokens", action="store_true",
+                        help="Show generated special tokens in continuation mode")
     parser.add_argument("--json_mode", action="store_true", help="Enable JSON output mode")
     parser.add_argument("--system", type=str, default=CHAT_SYSTEM_PROMPT,
                         help="Optional system message")
@@ -259,8 +313,13 @@ def main():
         print("Error: could not determine the preset for the selected checkpoint. Pass --preset explicitly.")
         sys.exit(1)
 
+    if args.mode == "auto":
+        args.mode = infer_checkpoint_mode(ckpt_path)
+    apply_mode_defaults(args)
+
     config = get_preset_config(selected_preset)
     print(f"Preset: {config.preset_name}")
+    print(f"Mode: {args.mode}")
 
     if args.backend == "mlx":
         run_mlx_chat(args, config, ckpt_path)

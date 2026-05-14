@@ -24,7 +24,8 @@ def build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg
 def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig,
               runtime: RuntimeSettings, system_msg: str = DEFAULT_SYSTEM,
               temperature: float = 0.1, top_k: int = 1, top_p: float = 1.0,
-              json_mode: bool = False):
+              json_mode: bool = False, max_new_tokens: int = 256,
+              repetition_penalty: float = 1.2):
     """Interactive chat REPL."""
     history = []
     print(f"\nSpakie Chat (type '/quit' to exit, '/clear' to reset)")
@@ -68,9 +69,49 @@ def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig
         else:
             response_ids = generate(
                 model, tokenizer, prompt_ids,
-                temperature=temperature, top_k=top_k, top_p=top_p, runtime=runtime,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                runtime=runtime,
             )
             response_text = tokenizer.decode(response_ids)
 
         print(f"Spakie: {response_text}\n")
         history.append({"role": "assistant", "content": response_text})
+
+
+def continuation_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig,
+                      runtime: RuntimeSettings, temperature: float = 0.8,
+                      top_k: int = 50, top_p: float = 0.9,
+                      max_new_tokens: int = 256,
+                      repetition_penalty: float = 1.0,
+                      show_special_tokens: bool = False):
+    """Interactive raw text continuation REPL for pretrained checkpoints."""
+    print("\nSpakie Continuation (type '/quit' to exit)")
+
+    while True:
+        try:
+            prompt = input("Text: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+
+        if not prompt.strip():
+            continue
+        if prompt.strip().lower() == "/quit":
+            print("Bye!")
+            break
+
+        prompt_ids = tokenizer.encode(prompt)
+        prompt_ids = prompt_ids[-max(1, config.max_seq_len - max_new_tokens):]
+        response_ids = generate(
+            model, tokenizer, prompt_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            runtime=runtime,
+            stop_on_special_tokens=False,
+            ban_special_tokens=False,
+        )
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=not show_special_tokens)
+        print(f"{response_text}\n")

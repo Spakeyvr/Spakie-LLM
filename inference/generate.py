@@ -41,7 +41,9 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
              top_k: int = 50, top_p: float = 0.9,
              repetition_penalty: float = 1.2,
              runtime: RuntimeSettings | None = None,
-             device: torch.device | str | None = None) -> list[int]:
+             device: torch.device | str | None = None,
+             stop_on_special_tokens: bool = True,
+             ban_special_tokens: bool = True) -> list[int]:
     """Autoregressive generation. Returns generated token IDs (excluding prompt)."""
     model.eval()
     if runtime is None:
@@ -78,17 +80,17 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
                 else:
                     next_logits[0, token_id] *= repetition_penalty
 
-        # Ban special/role tokens from being generated
-        next_logits[0, tokenizer.user_id] = float("-inf")
-        next_logits[0, tokenizer.assistant_id] = float("-inf")
-        next_logits[0, tokenizer.system_id] = float("-inf")
-        next_logits[0, tokenizer.json_id] = float("-inf")
-        next_logits[0, tokenizer.pad_id] = float("-inf")
+        if ban_special_tokens:
+            next_logits[0, tokenizer.user_id] = float("-inf")
+            next_logits[0, tokenizer.assistant_id] = float("-inf")
+            next_logits[0, tokenizer.system_id] = float("-inf")
+            next_logits[0, tokenizer.json_id] = float("-inf")
+            next_logits[0, tokenizer.pad_id] = float("-inf")
 
         next_id = sample_top_k_top_p(next_logits, temperature, top_k, top_p)
 
         token = next_id.item()
-        if token in stop_tokens:
+        if stop_on_special_tokens and token in stop_tokens:
             break
 
         generated.append(token)

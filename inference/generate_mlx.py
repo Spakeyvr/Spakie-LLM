@@ -62,6 +62,8 @@ def generate(
     top_k: int = 50,
     top_p: float = 0.9,
     repetition_penalty: float = 1.2,
+    stop_on_special_tokens: bool = True,
+    ban_special_tokens: bool = True,
 ) -> list[int]:
     model.eval()
     generated: list[int] = []
@@ -97,12 +99,13 @@ def generate(
                 v = last[tok]
                 last[tok] = v / penalty if v > 0 else v * penalty
 
-        for tok in banned:
-            last[tok] = -np.inf
+        if ban_special_tokens:
+            for tok in banned:
+                last[tok] = -np.inf
 
         filtered = _apply_top_k_top_p_np(last, temperature, top_k, top_p)
         token = _sample_host(filtered)
-        if token in stop_tokens:
+        if stop_on_special_tokens and token in stop_tokens:
             break
         generated.append(token)
         token_counts[token] += 1
