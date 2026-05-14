@@ -17,11 +17,49 @@ import glob
 import json
 import os
 import random
+import re
 import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import CHAT_SYSTEM_PROMPT, SpakieConfig
+
+
+# Templated prefixes injected by scripts/download_sft_data.py (squad, sciq, boolq, arc, openbookqa).
+# Matched only at the start of a user message so we never eat legitimate content.
+_TEMPLATE_PREFIX_RE = re.compile(r"^\s*(?:Question|Q)\s*:\s*", re.IGNORECASE)
+_TEMPLATE_BLOCK_RE = re.compile(
+    r"(?:\n+\s*|\s+)(?:Context|Reference|Passage|Choices)\s*:\s*",
+    re.IGNORECASE,
+)
+_TEMPLATE_TRAILER_RE = re.compile(
+    r"\n*\s*(?:Answer\s+(?:yes\s+or\s+no\s+)?(?:clearly|using\s+the\s+context|the\s+question)\.?|"
+    r"Select\s+the\s+correct\s+answer\.?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_question_template(content: str) -> str:
+    """Strip 'Question: ... Context: ... Answer clearly.' scaffolding from a user turn.
+
+    Reorders to '<context>\n\n<question>' so the model still learns context-aware Q&A
+    without learning that 'Question:' is a required trigger word.
+    """
+    if not _TEMPLATE_PREFIX_RE.match(content):
+        return content
+
+    body = _TEMPLATE_PREFIX_RE.sub("", content, count=1)
+    body = _TEMPLATE_TRAILER_RE.sub("", body)
+
+    match = _TEMPLATE_BLOCK_RE.search(body)
+    if match is None:
+        return body.strip()
+
+    question = body[: match.start()].strip()
+    context = body[match.end():].strip()
+    if not question or not context:
+        return body.strip()
+    return f"{context}\n\n{question}"
 
 
 def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
@@ -45,6 +83,8 @@ def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
         if role == "system":
             continue
         content = content.strip()
+        if role == "user":
+            content = strip_question_template(content)
         if not content:
             return None
         cleaned.append({"role": role, "content": content})
