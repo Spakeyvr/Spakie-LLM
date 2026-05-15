@@ -161,6 +161,14 @@ python3 scripts/finetune.py --backend mlx --precision auto
 python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
+The default SFT download includes Alpaca Clean, Dolly, HuggingFaceH4/no_robots,
+HuggingFaceTB/smoltalk, SQuAD, SciQ, BoolQ, ARC, and OpenBookQA. To download
+only selected sources:
+
+```bash
+python3 scripts/download_sft_data.py --sources smoltalk,no_robots,dolly
+```
+
 For a small targeted SFT/eval set instead of downloaded SFT sources:
 
 ```bash

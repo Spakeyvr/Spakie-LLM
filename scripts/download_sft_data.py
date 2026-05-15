@@ -42,6 +42,36 @@ def take_rows(dataset, limit: int, seed: int):
     return dataset.shuffle(seed=seed).select(range(limit))
 
 
+def clean_chat_messages(messages: object, *, fold_system_into_user: bool = False) -> list[dict]:
+    if not isinstance(messages, list):
+        return []
+
+    cleaned = []
+    system_parts = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            return []
+        role = msg.get("role")
+        content = trim(msg.get("content", ""))
+        if role == "system":
+            if fold_system_into_user and content:
+                system_parts.append(content)
+            continue
+        if role not in ("user", "assistant") or not content:
+            return []
+        if cleaned and cleaned[-1]["role"] == role:
+            return []
+        if role == "user" and system_parts:
+            system_text = "\n\n".join(system_parts)
+            content = f"{system_text}\n\n{content}"
+            system_parts = []
+        cleaned.append({"role": role, "content": content})
+
+    if not cleaned or cleaned[0]["role"] != "user" or cleaned[-1]["role"] != "assistant":
+        return []
+    return cleaned
+
+
 def download_alpaca(limit: int, seed: int) -> list[dict]:
     print("Loading Alpaca Clean...")
     dataset = load_dataset("yahma/alpaca-cleaned", split="train")
@@ -75,6 +105,34 @@ def load_dolly(limit: int, seed: int) -> list[dict]:
         example = make_example(user_text, response)
         if example is not None:
             examples.append(example)
+    return examples
+
+
+def load_no_robots(limit: int, seed: int) -> list[dict]:
+    print("Loading No Robots...")
+    dataset = load_dataset("HuggingFaceH4/no_robots", split="train")
+    rows = take_rows(dataset, limit, seed)
+    examples = []
+    for row in rows:
+        cleaned = clean_chat_messages(row.get("messages"))
+        if cleaned:
+            examples.append({"messages": cleaned})
+    return examples
+
+
+def load_smoltalk(limit: int, seed: int) -> list[dict]:
+    print("Loading SmolTalk...")
+    dataset = load_dataset("HuggingFaceTB/smoltalk", "all", split="train", streaming=True)
+    if limit > 0:
+        rows = dataset.shuffle(seed=seed, buffer_size=10_000).take(limit)
+    else:
+        rows = dataset
+
+    examples = []
+    for row in rows:
+        cleaned = clean_chat_messages(row.get("messages"), fold_system_into_user=True)
+        if cleaned:
+            examples.append({"messages": cleaned})
     return examples
 
 
@@ -211,7 +269,7 @@ def main() -> None:
     parser.add_argument(
         "--sources",
         type=str,
-        default="alpaca,dolly,squad,sciq,boolq,arc_easy,arc_challenge,openbookqa",
+        default="alpaca,dolly,no_robots,smoltalk,squad,sciq,boolq,arc_easy,arc_challenge,openbookqa",
         help="Comma-separated SFT sources to download",
     )
     parser.add_argument(
@@ -227,6 +285,8 @@ def main() -> None:
     source_builders = {
         "alpaca": lambda limit: download_alpaca(limit, args.seed),
         "dolly": lambda limit: load_dolly(limit, args.seed),
+        "no_robots": lambda limit: load_no_robots(limit, args.seed),
+        "smoltalk": lambda limit: load_smoltalk(limit, args.seed),
         "squad": lambda limit: load_squad(limit, args.seed),
         "sciq": lambda limit: load_sciq(limit, args.seed),
         "boolq": lambda limit: load_boolq(limit, args.seed),
