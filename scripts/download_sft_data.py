@@ -170,6 +170,23 @@ def load_sciq(limit: int, seed: int) -> list[dict]:
     return examples
 
 
+def load_triviaqa(limit: int, seed: int) -> list[dict]:
+    print("Loading TriviaQA...")
+    dataset = load_dataset("trivia_qa", "rc.nocontext", split="train")
+    rows = take_rows(dataset, limit, seed)
+    examples = []
+    for row in rows:
+        question = trim(row.get("question", ""))
+        answer_dict = row.get("answer", {})
+        answer = trim(answer_dict.get("value", "")) if isinstance(answer_dict, dict) else ""
+        if not question or not answer:
+            continue
+        example = make_example(question, answer)
+        if example is not None:
+            examples.append(example)
+    return examples
+
+
 def load_boolq(limit: int, seed: int) -> list[dict]:
     print("Loading BoolQ...")
     dataset = load_dataset("google/boolq", split="train")
@@ -269,7 +286,7 @@ def main() -> None:
     parser.add_argument(
         "--sources",
         type=str,
-        default="alpaca,dolly,no_robots,smoltalk,squad,sciq,boolq,arc_easy,arc_challenge,openbookqa",
+        default="alpaca,dolly,no_robots,smoltalk,squad,triviaqa,arc_challenge,openbookqa",
         help="Comma-separated SFT sources to download",
     )
     parser.add_argument(
@@ -288,9 +305,7 @@ def main() -> None:
         "no_robots": lambda limit: load_no_robots(limit, args.seed),
         "smoltalk": lambda limit: load_smoltalk(limit, args.seed),
         "squad": lambda limit: load_squad(limit, args.seed),
-        "sciq": lambda limit: load_sciq(limit, args.seed),
-        "boolq": lambda limit: load_boolq(limit, args.seed),
-        "arc_easy": lambda limit: load_arc("ARC-Easy", limit, args.seed, "Easy"),
+        "triviaqa": lambda limit: load_triviaqa(limit, args.seed),
         "arc_challenge": lambda limit: load_arc("ARC-Challenge", limit, args.seed, "Challenge"),
         "openbookqa": lambda limit: load_openbookqa(limit, args.seed),
     }

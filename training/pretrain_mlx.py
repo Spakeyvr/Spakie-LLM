@@ -584,17 +584,18 @@ def pretrain_mlx(
                 if profiler.enabled:
                     step_start = now()
                     loss, grads = microbatch_step(x, y)
-                    # Sync only when profiling, to attribute time to forward_backward.
-                    # In normal runs we let the graph extend across all microbatches
-                    # so the GPU can pipeline fwd/bwd of microbatch N+1 behind the
-                    # tail of microbatch N — the materialization point becomes the
-                    # single mx.eval after the optimizer update.
                     mx.eval(loss, grads)
                     profiler.add("forward_backward", now() - step_start)
                 else:
                     loss, grads = microbatch_step(x, y)
                 accum_grads = _accum_grads(accum_grads, grads)
                 accum_loss = accum_loss + loss.astype(mx.float32)
+                # Materialize after each microbatch so MLX frees the per-microbatch
+                # activation/intermediate graph. Deferring the eval until after the
+                # optimizer step holds every microbatch's full fwd+bwd graph in
+                # memory simultaneously — fine for grad_accum=1 (92m), catastrophic
+                # for grad_accum>=2 (180m+).
+                mx.eval(accum_grads, accum_loss)
                 tokens_processed += x.size
 
             if profiler.enabled:
@@ -673,9 +674,13 @@ def pretrain_mlx(
                     token_progress = (
                         f" | tokens {tokens_processed:,}/{target_tokens:,} ({progress_pct:.1f}%)"
                     )
+                active_gb = mx.get_active_memory() / 1024**3
+                cache_gb = mx.get_cache_memory() / 1024**3
+                peak_gb = mx.get_peak_memory() / 1024**3
                 pbar.write(
                     f"step {global_step} | train_loss {accum_loss_val:.4f} | val_loss {val_loss:.4f} | "
-                    f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}{token_progress}"
+                    f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}{token_progress} | "
+                    f"mem active {active_gb:.1f}GB cache {cache_gb:.1f}GB peak {peak_gb:.1f}GB"
                 )
 
                 if val_loss < best_val_loss:

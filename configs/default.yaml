@@ -43,12 +43,12 @@ defaults:
   pretrain_eval_batches: 20
   pretrain_patience: 5
   pretrain_optimizer: muon
-  # Learning-rate schedule. "cosine" matches the prior behavior; "trapezoid"
-  # is warmup -> constant-at-peak -> linear-decay (controlled by
-  # pretrain_trapezoid_decay_frac). On a controlled synthetic next-token
-  # task at 92m (60 steps, 3 seeds), trapezoid drove final loss ~2.5%
-  # lower than cosine for the same compute (0.762 vs 0.782 mean).
-  pretrain_lr_schedule: cosine
+  # Learning-rate schedule. "trapezoid" (default) is warmup -> constant-at-peak
+  # -> linear-decay (tail controlled by pretrain_trapezoid_decay_frac); on a
+  # controlled synthetic next-token task at 92m (60 steps, 3 seeds) it drove
+  # final loss ~2.5% lower than cosine for the same compute (0.762 vs 0.782
+  # mean). "cosine" is kept as an option for parity with prior runs.
+  pretrain_lr_schedule: trapezoid
   pretrain_trapezoid_decay_frac: 0.2
 
   # SFT
@@ -74,8 +74,8 @@ defaults:
   muon_verified: false
 
   # Generation
-  temperature: 0.1
-  top_k: 1
+  temperature: 0.7
+  top_k: 50
   top_p: 1.0
 
   # Paths
@@ -89,7 +89,7 @@ defaults:
   checkpoint_dir: ""
 
   # Corpus planning
-  target_train_tokens: 6000000000
+  target_train_tokens: 5000000000
   target_processed_tokens: 0
   large_corpus_dir: data/raw/large_corpus
   corpus_report_path: data/processed/corpus_report.json
@@ -131,13 +131,13 @@ presets:
     n_heads: 12
     d_ff: 3072
     activation_checkpointing: false
-    pretrain_batch_size: 64
+    pretrain_batch_size: 92
     pretrain_grad_accum_steps: 1
     pretrain_lr: 6.0e-4
     sft_batch_size: 92
     sft_grad_accum_steps: 2
     sft_lr: 4.0e-5
-    sft_epochs: 3
+    sft_epochs: 6
 
   180m:
     n_layers: 16
@@ -177,11 +177,9 @@ sft_source_limits:
   alpaca: 16000
   dolly: 10000
   no_robots: 10000
-  smoltalk: 30000
+  smoltalk: 15000
   squad: 12000
-  sciq: 8000
-  boolq: 8000
-  arc_easy: 8000
+  triviaqa: 20000
   arc_challenge: 5000
   openbookqa: 5000
 
