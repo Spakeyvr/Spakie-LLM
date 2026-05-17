@@ -148,7 +148,7 @@ presets:
     pretrain_batch_size: 96
     pretrain_grad_accum_steps: 2
     sft_batch_size: 32
-    sft_grad_accum_steps: 8
+    sft_grad_accum_steps: 4
     sft_lr: 3.0e-5
     sft_epochs: 4
 

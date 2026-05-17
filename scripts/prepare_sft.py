@@ -38,6 +38,17 @@ _TEMPLATE_TRAILER_RE = re.compile(
     re.IGNORECASE,
 )
 
+DISALLOWED_SFT_MARKERS = (
+    "<tool_call>",
+    "</tool_call>",
+    "<tools>",
+    "</tools>",
+    "Action:",
+    "Observation:",
+    "Final Answer:",
+    "You are an expert in composing functions",
+)
+
 
 def strip_question_template(content: str) -> str:
     """Strip 'Question: ... Context: ... Answer clearly.' scaffolding from a user turn.
@@ -60,6 +71,19 @@ def strip_question_template(content: str) -> str:
     if not question or not context:
         return body.strip()
     return f"{context}\n\n{question}"
+
+
+def contains_disallowed_sft_marker(messages: object) -> bool:
+    """Return True when any message content contains tool/reasoning scaffolding."""
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and any(marker in content for marker in DISALLOWED_SFT_MARKERS):
+            return True
+    return False
 
 
 def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
@@ -109,7 +133,8 @@ def signature(example: dict) -> tuple:
 
 def load_source(path: str, system_prompt: str | None, limit: int, seed: int) -> list[dict]:
     examples: list[dict] = []
-    skipped = 0
+    malformed = 0
+    filtered = 0
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -118,15 +143,20 @@ def load_source(path: str, system_prompt: str | None, limit: int, seed: int) -> 
             try:
                 raw = json.loads(line)
             except json.JSONDecodeError:
-                skipped += 1
+                malformed += 1
+                continue
+            if contains_disallowed_sft_marker(raw.get("messages")):
+                filtered += 1
                 continue
             example = normalize_example(raw, system_prompt)
             if example is None:
-                skipped += 1
+                malformed += 1
                 continue
             examples.append(example)
-    if skipped:
-        print(f"    warning: skipped {skipped} malformed lines in {os.path.basename(path)}")
+    if malformed:
+        print(f"    warning: skipped {malformed} malformed lines in {os.path.basename(path)}")
+    if filtered:
+        print(f"    filtered {filtered} tool/template artifact examples in {os.path.basename(path)}")
     if limit > 0 and len(examples) > limit:
         random.Random(seed).shuffle(examples)
         examples = examples[:limit]
