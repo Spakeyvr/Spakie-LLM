@@ -47,6 +47,7 @@ class SpakieConfig:
     vocab_size: int = _D["vocab_size"]
     n_layers: int = _D["n_layers"]
     n_heads: int = _D["n_heads"]
+    n_kv_heads: int = _D.get("n_kv_heads", 0)
     d_model: int = _D["d_model"]
     d_ff: int = _D["d_ff"]
     max_seq_len: int = _D["max_seq_len"]
@@ -163,6 +164,11 @@ class SpakieConfig:
         self.refresh_derived_fields()
 
     def refresh_derived_fields(self) -> None:
+        if self.n_kv_heads < 0:
+            raise ValueError("n_kv_heads must be >= 0")
+        effective_kv_heads = self.n_kv_heads or self.n_heads
+        if self.n_heads % effective_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads")
         self.target_processed_tokens = derive_processed_token_target(self.target_train_tokens, self.train_split_fraction)
         if self.pretrain_target_tokens <= 0:
             self.pretrain_target_tokens = self.target_train_tokens
@@ -264,10 +270,15 @@ def checkpoint_search_dirs(config: SpakieConfig) -> list[str]:
 
 
 def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig:
+    if not hasattr(checkpoint_config, "n_kv_heads"):
+        # Older checkpoints predate grouped-query attention and use the fused
+        # full-MHA qkv projection. Preserve that shape when loading them.
+        config.n_kv_heads = 0
     for field_name in (
         "vocab_size",
         "n_layers",
         "n_heads",
+        "n_kv_heads",
         "d_model",
         "d_ff",
         "max_seq_len",
@@ -277,4 +288,17 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
     ):
         if hasattr(checkpoint_config, field_name):
             setattr(config, field_name, getattr(checkpoint_config, field_name))
+    return config
+
+
+def inherit_attention_shape_from_tensors(config: SpakieConfig, tensors: dict) -> SpakieConfig:
+    """Infer MHA vs GQA from checkpoint tensor names/shapes for MLX safetensors."""
+    if any(name.endswith(".attn.qkv.weight") for name in tensors):
+        config.n_kv_heads = 0
+        return config
+    for name, tensor in tensors.items():
+        if name.endswith(".attn.kv_proj.weight"):
+            head_dim = config.d_model // config.n_heads
+            config.n_kv_heads = int(tensor.shape[0]) // (2 * head_dim)
+            return config
     return config

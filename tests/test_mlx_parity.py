@@ -38,7 +38,8 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         return SpakieConfig(
             vocab_size=128,
             n_layers=2,
-            n_heads=2,
+            n_heads=4,
+            n_kv_heads=2,
             d_model=32,
             d_ff=64,
             max_seq_len=16,
@@ -68,7 +69,16 @@ class TorchMLXForwardParityTests(unittest.TestCase):
                 overrides[f"{src_prefix}.ln1.bias"] = mx.array(state[f"{src_prefix}.ln1.bias"])
             if f"{src_prefix}.ln2.bias" in state:
                 overrides[f"{src_prefix}.ln2.bias"] = mx.array(state[f"{src_prefix}.ln2.bias"])
-            overrides[f"{src_prefix}.attn.qkv.weight"] = mx.array(state[f"{src_prefix}.attn.qkv.weight"])
+            qkv_key = f"{src_prefix}.attn.qkv.weight"
+            if qkv_key in state:
+                overrides[qkv_key] = mx.array(state[qkv_key])
+            else:
+                overrides[f"{src_prefix}.attn.q_proj.weight"] = mx.array(
+                    state[f"{src_prefix}.attn.q_proj.weight"]
+                )
+                overrides[f"{src_prefix}.attn.kv_proj.weight"] = mx.array(
+                    state[f"{src_prefix}.attn.kv_proj.weight"]
+                )
             overrides[f"{src_prefix}.attn.out_proj.weight"] = mx.array(state[f"{src_prefix}.attn.out_proj.weight"])
             overrides[f"{src_prefix}.mlp.fc1.weight"] = mx.array(state[f"{src_prefix}.mlp.fc1.weight"])
             overrides[f"{src_prefix}.mlp.fc2.weight"] = mx.array(state[f"{src_prefix}.mlp.fc2.weight"])
@@ -136,12 +146,13 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         self.assertIsNotNone(cache)
         self.assertEqual(len(cache), config.n_layers)
         cache_tensors = [logits]
+        n_kv_heads = config.n_kv_heads or config.n_heads
         for layer_cache in cache:
             self.assertIsNotNone(layer_cache)
             k, v = layer_cache
             cache_tensors.extend((k, v))
-            self.assertEqual(tuple(k.shape), (1, config.n_heads, prompt.shape[1], config.d_model // config.n_heads))
-            self.assertEqual(tuple(v.shape), (1, config.n_heads, prompt.shape[1], config.d_model // config.n_heads))
+            self.assertEqual(tuple(k.shape), (1, n_kv_heads, prompt.shape[1], config.d_model // config.n_heads))
+            self.assertEqual(tuple(v.shape), (1, n_kv_heads, prompt.shape[1], config.d_model // config.n_heads))
         mx.eval(*cache_tensors)
 
         next_token = np.array([[5]], dtype=np.int32)
@@ -159,8 +170,8 @@ class TorchMLXForwardParityTests(unittest.TestCase):
             self.assertIsNotNone(layer_cache)
             k, v = layer_cache
             next_cache_tensors.extend((k, v))
-            self.assertEqual(tuple(k.shape), (1, config.n_heads, prompt.shape[1] + 1, config.d_model // config.n_heads))
-            self.assertEqual(tuple(v.shape), (1, config.n_heads, prompt.shape[1] + 1, config.d_model // config.n_heads))
+            self.assertEqual(tuple(k.shape), (1, n_kv_heads, prompt.shape[1] + 1, config.d_model // config.n_heads))
+            self.assertEqual(tuple(v.shape), (1, n_kv_heads, prompt.shape[1] + 1, config.d_model // config.n_heads))
         mx.eval(*next_cache_tensors)
 
 

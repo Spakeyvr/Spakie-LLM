@@ -5,7 +5,14 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from configs.default import CHAT_SYSTEM_PROMPT, SUPPORTED_PRESETS, checkpoint_search_dirs, get_preset_config, inherit_model_shape
+from configs.default import (
+    CHAT_SYSTEM_PROMPT,
+    SUPPORTED_PRESETS,
+    checkpoint_search_dirs,
+    get_preset_config,
+    inherit_attention_shape_from_tensors,
+    inherit_model_shape,
+)
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 
 
@@ -219,6 +226,7 @@ def run_mlx_chat(args, config, ckpt_path):
     if not model_flat:
         print(f"Error: no 'model.*' tensors found in {ckpt_path}")
         sys.exit(1)
+    config = inherit_attention_shape_from_tensors(config, model_flat)
 
     model = SpakieGPTMLX(config)
     model.update(tree_unflatten(list(model_flat.items())))

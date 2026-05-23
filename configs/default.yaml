@@ -17,6 +17,9 @@ defaults:
   vocab_size: 16384
   n_layers: 12
   n_heads: 12
+  # Number of key/value heads for grouped-query attention. 0 means full
+  # multi-head attention with n_kv_heads == n_heads.
+  n_kv_heads: 0
   d_model: 768
   d_ff: 3072
   max_seq_len: 512
@@ -143,6 +146,7 @@ presets:
     n_layers: 16
     d_model: 896
     n_heads: 14
+    n_kv_heads: 2
     d_ff: 3584
     activation_checkpointing: false
     pretrain_batch_size: 96

@@ -19,10 +19,21 @@ class CausalSelfAttentionMLX(nn.Module):
         super().__init__()
         assert config.d_model % config.n_heads == 0
         self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads or config.n_heads
+        assert self.n_heads % self.n_kv_heads == 0
         self.head_dim = config.d_model // config.n_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
-        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
+        if self.n_kv_heads == self.n_heads:
+            self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
+            self.q_proj = None
+            self.kv_proj = None
+        else:
+            self.qkv = None
+            self.q_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
+            self.kv_proj = nn.Linear(
+                config.d_model, 2 * self.n_kv_heads * self.head_dim, bias=config.bias
+            )
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
         self.attn_dropout_p = config.dropout
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -35,12 +46,16 @@ class CausalSelfAttentionMLX(nn.Module):
         return_cache: bool = False,
     ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
         B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = mx.split(qkv, 3, axis=-1)
-
+        if self.qkv is not None:
+            qkv = self.qkv(x)
+            q, k, v = mx.split(qkv, 3, axis=-1)
+        else:
+            q = self.q_proj(x)
+            kv = self.kv_proj(x)
+            k, v = mx.split(kv, 2, axis=-1)
         q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         if cache is not None:
             k_prev, v_prev = cache
@@ -139,9 +154,22 @@ class SpakieGPTMLX(nn.Module):
             if getattr(block.ln2, "bias", None) is not None:
                 overrides[f"{prefix}.ln2.bias"] = mx.zeros_like(block.ln2.bias)
 
-            overrides[f"{prefix}.attn.qkv.weight"] = _normal(block.attn.qkv.weight.shape, 0.02)
-            if config.bias:
-                overrides[f"{prefix}.attn.qkv.bias"] = mx.zeros_like(block.attn.qkv.bias)
+            if block.attn.qkv is not None:
+                overrides[f"{prefix}.attn.qkv.weight"] = _normal(block.attn.qkv.weight.shape, 0.02)
+                if config.bias:
+                    overrides[f"{prefix}.attn.qkv.bias"] = mx.zeros_like(block.attn.qkv.bias)
+            else:
+                overrides[f"{prefix}.attn.q_proj.weight"] = _normal(
+                    block.attn.q_proj.weight.shape, 0.02
+                )
+                overrides[f"{prefix}.attn.kv_proj.weight"] = _normal(
+                    block.attn.kv_proj.weight.shape, 0.02
+                )
+                if config.bias:
+                    overrides[f"{prefix}.attn.q_proj.bias"] = mx.zeros_like(block.attn.q_proj.bias)
+                    overrides[f"{prefix}.attn.kv_proj.bias"] = mx.zeros_like(
+                        block.attn.kv_proj.bias
+                    )
             overrides[f"{prefix}.attn.out_proj.weight"] = _normal(
                 block.attn.out_proj.weight.shape, residual_std
             )

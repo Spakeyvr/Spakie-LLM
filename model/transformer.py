@@ -17,24 +17,50 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.d_model % config.n_heads == 0
         self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads or config.n_heads
+        assert self.n_heads % self.n_kv_heads == 0
         self.head_dim = config.d_model // config.n_heads
 
-        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
+        if self.n_kv_heads == self.n_heads:
+            self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
+            self.q_proj = None
+            self.kv_proj = None
+        else:
+            self.qkv = None
+            self.q_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
+            self.kv_proj = nn.Linear(
+                config.d_model, 2 * self.n_kv_heads * self.head_dim, bias=config.bias
+            )
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(C, dim=2)
+        if self.qkv is not None:
+            qkv = self.qkv(x)
+            q, k, v = qkv.split(C, dim=2)
+        else:
+            q = self.q_proj(x)
+            kv = self.kv_proj(x)
+            k, v = kv.split(self.n_kv_heads * self.head_dim, dim=2)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=self.attn_dropout.p if self.training else 0.0
-        )
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        if self.n_kv_heads == self.n_heads:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dropout_p)
+        else:
+            try:
+                y = F.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, dropout_p=dropout_p, enable_gqa=True
+                )
+            except TypeError:
+                repeat = self.n_heads // self.n_kv_heads
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dropout_p)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.out_proj(y))
 
