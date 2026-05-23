@@ -33,6 +33,11 @@ def apply_mode_defaults(args) -> None:
         args.repetition_penalty = 1.2 if args.repetition_penalty is None else args.repetition_penalty
 
 
+def default_system_for_preset(preset_name: str) -> str:
+    """Default to no system prompt for small checkpoints."""
+    return "" if preset_name in {"92m", "180m"} else CHAT_SYSTEM_PROMPT
+
+
 def list_available_models(backend: str, preset_name: str | None = None) -> list[tuple[str, str]]:
     """Return (preset, checkpoint_path) pairs for runnable models."""
     preset_names = [preset_name] if preset_name else list(SUPPORTED_PRESETS)
@@ -276,8 +281,10 @@ def main():
     parser.add_argument("--show-special-tokens", action="store_true",
                         help="Show generated special tokens in continuation mode")
     parser.add_argument("--json_mode", action="store_true", help="Enable JSON output mode")
-    parser.add_argument("--system", type=str, default=CHAT_SYSTEM_PROMPT,
-                        help="Optional system message")
+    parser.add_argument("--system", type=str, default=None,
+                        help="Optional system message (default: omitted for 92m/180m)")
+    parser.add_argument("--no-system", action="store_true",
+                        help="Do not include a system message in chat prompts")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     args = parser.parse_args()
@@ -318,6 +325,10 @@ def main():
     apply_mode_defaults(args)
 
     config = get_preset_config(selected_preset)
+    if args.no_system:
+        args.system = ""
+    elif args.system is None:
+        args.system = default_system_for_preset(config.preset_name)
     print(f"Preset: {config.preset_name}")
     print(f"Mode: {args.mode}")
 

@@ -171,6 +171,33 @@ def _default_source_checkpoint_name(backend: str) -> str:
     return "pretrain_best.safetensors" if backend == "mlx" else "pretrain_best.pt"
 
 
+def count_system_prompt_examples(examples: list[dict]) -> int:
+    count = 0
+    for example in examples:
+        messages = example.get("messages", [])
+        if messages and messages[0].get("role") == "system":
+            count += 1
+    return count
+
+
+def print_sft_format_warning(jsonl_path: str, examples: list[dict]) -> None:
+    if not examples:
+        return
+    system_count = count_system_prompt_examples(examples)
+    print(f"SFT system prompts: {system_count:,}/{len(examples):,} examples")
+    if system_count == 0:
+        print(
+            "Warning: SFT data has no system turns. Use `scripts/chat.py --no-system` "
+            "for this checkpoint, or rebuild SFT data with `scripts/prepare_sft.py` "
+            "before fine-tuning."
+        )
+    elif system_count != len(examples):
+        print(
+            f"Warning: SFT data at {jsonl_path} mixes examples with and without "
+            "system turns; this can make chat behavior less stable."
+        )
+
+
 def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_dir):
     import torch
     from model.transformer import SpakieGPT
@@ -211,6 +238,7 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
         sys.exit(1)
 
     dataset = ChatSFTDataset(jsonl_path, tokenizer, config.max_seq_len)
+    print_sft_format_warning(jsonl_path, dataset.examples)
     if args.max_examples > 0:
         max_examples = min(args.max_examples, len(dataset))
         dataset = torch.utils.data.Subset(dataset, range(max_examples))
@@ -302,6 +330,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         sys.exit(1)
 
     dataset = ChatSFTDatasetMLX(jsonl_path, tokenizer, config.max_seq_len)
+    print_sft_format_warning(jsonl_path, dataset.examples)
     if args.max_examples > 0:
         dataset = SubsetView(dataset, range(min(args.max_examples, len(dataset))))
     elif args.smoke:

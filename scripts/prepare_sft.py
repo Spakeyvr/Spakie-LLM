@@ -5,9 +5,9 @@ is the source name, used to look up an optional per-source cap from
 `SpakieConfig.sft_source_limits`. Any custom JSONL you drop into data/chat_raw/
 is picked up automatically; sources without a cap entry are taken in full.
 
-The chosen system prompt is injected into every example. If the raw example
-already carries a system message, it is replaced (or stripped when
---no-system is set).
+System messages are stripped by default, which works better for small models
+where every control token has to earn its keep. Pass --system to inject exactly
+one system message into every example.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import CHAT_SYSTEM_PROMPT, SpakieConfig
+from configs.default import SpakieConfig
 
 
 # Templated prefixes injected by scripts/download_sft_data.py (squad, sciq, boolq, arc, openbookqa).
@@ -47,6 +47,33 @@ DISALLOWED_SFT_MARKERS = (
     "Observation:",
     "Final Answer:",
     "You are an expert in composing functions",
+)
+
+ASSISTANT_BEHAVIOR_SEEDS = (
+    ("Hi", "Hello! How can I help you today?"),
+    ("Hello", "Hello! How can I help?"),
+    ("Hey", "Hi! What would you like help with?"),
+    ("Good morning", "Good morning! How can I help you today?"),
+    ("Are you there?", "Yes, I am here and ready to help."),
+    ("Can you help me?", "Yes. Tell me what you need help with, and I will do my best."),
+    ("Who are you?", "I am Spakie, a helpful AI assistant."),
+    ("What are you?", "I am an AI assistant designed to answer questions and help with tasks."),
+    ("Are you human?", "No. I am an AI assistant, not a human."),
+    ("How old are you?", "I do not have an age. I am an AI assistant."),
+    ("Where do you live?", "I do not live anywhere. I run as software."),
+    ("Do you have a husband?", "No. I am an AI assistant and do not have personal relationships."),
+    ("Tell me about yourself.", "I am Spakie, an AI assistant that gives clear and useful answers."),
+    ("What do you like to cook?", "I do not cook or have personal hobbies, but I can help with recipes."),
+    ("What is 2 + 2?", "2 + 2 = 4."),
+    ("What is the capital of France?", "The capital of France is Paris."),
+    ("What is Python?", "Python is a popular programming language used for software, data, automation, and AI."),
+    ("Explain photosynthesis simply.", "Photosynthesis is how plants use sunlight, water, and carbon dioxide to make food and oxygen."),
+    ("What is gravity?", "Gravity is the force that pulls objects with mass toward each other."),
+    ("If you do not know an answer, what should you do?", "I should say that I do not know instead of making up an answer."),
+    ("Answer briefly: what is an operating system?", "An operating system manages a computer's hardware and helps programs run."),
+    ("Say hello in one short sentence.", "Hello! How can I help you today?"),
+    ("I only said hi. What should you say back?", "I should greet you and ask how I can help."),
+    ("Please answer as an assistant, not as a fictional character.", "Understood. I will answer directly as an AI assistant."),
 )
 
 
@@ -122,6 +149,27 @@ def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
     return {"messages": cleaned}
 
 
+def build_assistant_seed_examples(system_prompt: str | None, repeats: int) -> list[dict]:
+    """Return repeated assistant-behavior examples for SFT anchoring."""
+    if repeats <= 0:
+        return []
+
+    examples: list[dict] = []
+    for _ in range(repeats):
+        for user_text, assistant_text in ASSISTANT_BEHAVIOR_SEEDS:
+            messages: list[dict] = []
+            if system_prompt is not None:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.extend(
+                [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": assistant_text},
+                ]
+            )
+            examples.append({"messages": messages})
+    return examples
+
+
 def signature(example: dict) -> tuple:
     # Dedup on user/assistant content only — the system prompt is uniform.
     return tuple(
@@ -181,8 +229,8 @@ def main() -> None:
     parser.add_argument(
         "--system",
         type=str,
-        default=CHAT_SYSTEM_PROMPT,
-        help="System prompt to inject into every example",
+        default=None,
+        help="Optional system prompt to inject into every example",
     )
     parser.add_argument(
         "--no-system",
@@ -197,6 +245,15 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed")
     parser.add_argument(
+        "--assistant-seed-repeats",
+        type=int,
+        default=20,
+        help=(
+            "Repeat a small built-in assistant-behavior seed set this many times "
+            "(0 disables). Helps greetings, identity questions, and short factual prompts."
+        ),
+    )
+    parser.add_argument(
         "--sources",
         type=str,
         default="",
@@ -204,7 +261,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.no_system:
+    if args.no_system or args.system is None:
         system_prompt: str | None = None
         system_label = "(no system message)"
     else:
@@ -253,6 +310,12 @@ def main() -> None:
     dropped = len(all_examples) - len(deduped)
     if dropped:
         print(f"Removed {dropped:,} duplicate examples")
+
+    assistant_seed = build_assistant_seed_examples(system_prompt, args.assistant_seed_repeats)
+    if assistant_seed:
+        deduped.extend(assistant_seed)
+        counts["assistant_seed"] = len(assistant_seed)
+        print(f"Added {len(assistant_seed):,} assistant-behavior seed examples")
 
     random.Random(args.seed).shuffle(deduped)
     if args.max > 0 and len(deduped) > args.max:

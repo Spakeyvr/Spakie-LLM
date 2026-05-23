@@ -52,8 +52,11 @@ class ScalingConfigTests(unittest.TestCase):
             sum(int(entry["target_tokens"]) for entry in source_plan.values()),
             config.target_processed_tokens,
         )
-        self.assertEqual(config.target_train_tokens, 4_000_000_000)
-        self.assertEqual(config.pretrain_target_tokens, 4_000_000_000)
+        self.assertEqual(
+            config.target_processed_tokens,
+            math.ceil(config.target_train_tokens / config.train_split_fraction),
+        )
+        self.assertEqual(config.pretrain_target_tokens, config.target_train_tokens)
 
     def test_parse_sources_all_and_aliases(self):
         config = SpakieConfig()
@@ -302,12 +305,28 @@ class ScalingConfigTests(unittest.TestCase):
 
     def test_pretrain_budget_derives_steps_for_presets(self):
         config_92m = get_preset_config("92m")
-        self.assertEqual(config_92m.pretrain_tokens_per_step(), 32_768)   # 64 * 1 * 512
-        self.assertEqual(config_92m.pretrain_max_steps, math.ceil(4_000_000_000 / 32_768))
+        tokens_per_step_92m = (
+            config_92m.pretrain_batch_size
+            * config_92m.pretrain_grad_accum_steps
+            * config_92m.max_seq_len
+        )
+        self.assertEqual(config_92m.pretrain_tokens_per_step(), tokens_per_step_92m)
+        self.assertEqual(
+            config_92m.pretrain_max_steps,
+            math.ceil(config_92m.pretrain_target_tokens / tokens_per_step_92m),
+        )
 
         config_180m = get_preset_config("180m")
-        self.assertEqual(config_180m.pretrain_tokens_per_step(), 98_304)  # 96 * 2 * 512
-        self.assertEqual(config_180m.pretrain_max_steps, math.ceil(4_000_000_000 / 98_304))
+        tokens_per_step_180m = (
+            config_180m.pretrain_batch_size
+            * config_180m.pretrain_grad_accum_steps
+            * config_180m.max_seq_len
+        )
+        self.assertEqual(config_180m.pretrain_tokens_per_step(), tokens_per_step_180m)
+        self.assertEqual(
+            config_180m.pretrain_max_steps,
+            math.ceil(config_180m.pretrain_target_tokens / tokens_per_step_180m),
+        )
         self.assertFalse(config_180m.should_use_pretrain_early_stopping())
 
 

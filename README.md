@@ -148,15 +148,20 @@ python3 scripts/run_pipeline.py --preset 300m --backend mlx --skip-sft
 Fine-tuning expects chat-style JSONL records like:
 
 ```json
-{"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+{"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
+
+System messages are optional. The default SFT merge omits them, which is usually
+better for the smaller presets; pass `--system "..."` only when you intend to
+train and infer with that extra control turn.
 
 SFT source data is downloaded to `data/chat_raw/` and merged into `data/chat/train.jsonl`:
 
 ```bash
 python3 scripts/download_sft_data.py
 python3 scripts/prepare_sft.py
-python3 scripts/prepare_sft.py --no-system
+python3 scripts/prepare_sft.py --system "Answer clearly and factually."
+python3 scripts/prepare_sft.py --assistant-seed-repeats 0
 python3 scripts/finetune.py --backend mlx --precision auto
 python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
@@ -190,6 +195,11 @@ Useful SFT options:
 --no-model-prompt
 ```
 
+`prepare_sft.py` also adds a small repeated assistant-behavior seed set by
+default. This anchors greetings, identity questions, and simple factual answers
+so a lightly fine-tuned model is less likely to continue pretraining-style web
+text. Set `--assistant-seed-repeats 0` to disable it.
+
 ## Optimizer
 
 The default optimizer is Muon, with AdamW fallback only when explicitly allowed:
@@ -211,6 +221,7 @@ Useful commands:
 ```bash
 python3 scripts/chat.py --list-models --device auto --precision auto
 python3 scripts/chat.py --model 1 --backend mlx --no-model-prompt
+python3 scripts/chat.py --model 1 --backend mlx --no-system
 python3 scripts/chat.py --checkpoint checkpoints/300m/best.pt --backend mlx
 python3 scripts/chat.py --json_mode --system "Answer as JSON."
 python3 scripts/finetune.py --list-models --backend mlx
@@ -295,3 +306,6 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 <|user|>What is Python?<eos>
 <|assistant|>Python is a programming language.<eos>
 ```
+
+The system turn is optional. For 92m and 180m checkpoints, `scripts/chat.py`
+omits it by default unless `--system` is provided.

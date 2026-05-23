@@ -49,7 +49,8 @@ def muon_newton_schulz_mlx(
     x = x / (mx.sqrt((x * x).sum()) + eps)
     for _ in range(ns_steps):
         xx_t = x @ x.T
-        x = a * x + (b * xx_t + c * (xx_t @ xx_t)) @ x
+        poly = mx.addmm(b * xx_t, xx_t, xx_t, alpha=c, beta=1.0)
+        x = mx.addmm(a * x, poly, x, alpha=1.0, beta=1.0)
     if transposed:
         x = x.T
     return x.astype(update.dtype)

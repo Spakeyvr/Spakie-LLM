@@ -88,6 +88,24 @@ class PrepareSFTTests(unittest.TestCase):
         self.assertIn("filtered 3 tool/template artifact examples", log)
         self.assertIn("skipped 1 malformed lines", log)
 
+    def test_build_assistant_seed_examples_repeats_and_injects_system(self):
+        examples = prepare_sft.build_assistant_seed_examples("System prompt.", repeats=2)
+
+        self.assertEqual(len(examples), len(prepare_sft.ASSISTANT_BEHAVIOR_SEEDS) * 2)
+        self.assertEqual(examples[0]["messages"][0], {"role": "system", "content": "System prompt."})
+        self.assertEqual(examples[0]["messages"][1], {"role": "user", "content": "Hi"})
+        self.assertEqual(
+            examples[0]["messages"][2],
+            {"role": "assistant", "content": "Hello! How can I help you today?"},
+        )
+
+    def test_build_assistant_seed_examples_can_omit_system(self):
+        examples = prepare_sft.build_assistant_seed_examples(None, repeats=1)
+
+        self.assertEqual(examples[0]["messages"][0], {"role": "user", "content": "Hi"})
+        self.assertNotIn("system", {msg["role"] for msg in examples[0]["messages"]})
+        self.assertEqual(prepare_sft.build_assistant_seed_examples("System prompt.", repeats=0), [])
+
 
 if __name__ == "__main__":
     unittest.main()

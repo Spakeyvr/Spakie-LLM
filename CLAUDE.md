@@ -119,6 +119,9 @@ Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `
 <|assistant|>Python is a programming language.<eos>
 ```
 
+The system turn is optional. Prefer no-system SFT and no-system chat for the
+smaller presets unless a run was explicitly trained with system turns.
+
 SFT data must be chat-style JSONL with a top-level `messages` array of `{role, content}` objects.
 
 ## Mac / MPS notes
