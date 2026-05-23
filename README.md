@@ -257,11 +257,11 @@ Notable tests:
 
 The repo currently supports these presets:
 
-| Preset | Layers | `d_model` | Heads | `d_ff` | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| `92m` | 12 | 768 | 12 | 3072 | 64 | 1 | 16 | 2 | Smallest preset, good for smoke tests and quicker iteration |
-| `180m` | 16 | 896 | 14 | 3584 | 96 | 2 | 32 | 8 | Mid-size preset |
-| `300m` | 24 | 1024 | 16 | 4096 | 64 | 2 | 16 | 2 | Config and pipeline default preset |
+| Preset | Layers | `d_model` | Q heads | KV heads | MLP | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
+| `92m` | 12 | 768 | 12 | 12 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
+| `180m` | 16 | 896 | 14 | 2 | SwiGLU hidden 2048 | 96 | 2 | 32 | 4 | Mid-size MLX-optimized preset |
+| `300m` | 24 | 1024 | 16 | 16 | GELU `d_ff=4096` | 64 | 2 | 16 | 2 | Config and pipeline default preset |
 
 Shared model defaults:
 
@@ -271,8 +271,8 @@ Shared model defaults:
 - `bias = false`
 - learned positional embeddings
 - weight-tied LM head
-- GELU activations
-- scaled dot-product attention
+- GELU or SwiGLU MLPs, depending on preset
+- scaled dot-product attention, with grouped-query attention where configured
 - activation checkpointing disabled by default for all current presets
 
 ## Architecture Notes

@@ -38,6 +38,8 @@ class MuonCoreTests(unittest.TestCase):
         self.assertFalse(is_muon_parameter_name("blocks.0.ln1.weight", 1))
         self.assertTrue(is_muon_parameter_name("blocks.0.attn.qkv.weight", 2))
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.fc1.weight", 2))
+        self.assertTrue(is_muon_parameter_name("blocks.0.mlp.gate_up.weight", 2))
+        self.assertTrue(is_muon_parameter_name("blocks.0.mlp.down.weight", 2))
 
 
 class TorchMuonOptimizerTests(unittest.TestCase):

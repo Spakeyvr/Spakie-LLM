@@ -50,6 +50,8 @@ class SpakieConfig:
     n_kv_heads: int = _D.get("n_kv_heads", 0)
     d_model: int = _D["d_model"]
     d_ff: int = _D["d_ff"]
+    mlp_type: str = _D.get("mlp_type", "gelu")
+    swiglu_hidden: int = _D.get("swiglu_hidden", 0)
     max_seq_len: int = _D["max_seq_len"]
     dropout: float = _D["dropout"]
     bias: bool = _D["bias"]
@@ -169,6 +171,11 @@ class SpakieConfig:
         effective_kv_heads = self.n_kv_heads or self.n_heads
         if self.n_heads % effective_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
+        self.mlp_type = (self.mlp_type or "gelu").lower()
+        if self.mlp_type not in {"gelu", "swiglu"}:
+            raise ValueError("mlp_type must be 'gelu' or 'swiglu'")
+        if self.swiglu_hidden < 0:
+            raise ValueError("swiglu_hidden must be >= 0")
         self.target_processed_tokens = derive_processed_token_target(self.target_train_tokens, self.train_split_fraction)
         if self.pretrain_target_tokens <= 0:
             self.pretrain_target_tokens = self.target_train_tokens
@@ -274,6 +281,9 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
         # Older checkpoints predate grouped-query attention and use the fused
         # full-MHA qkv projection. Preserve that shape when loading them.
         config.n_kv_heads = 0
+    if not hasattr(checkpoint_config, "mlp_type"):
+        config.mlp_type = "gelu"
+        config.swiglu_hidden = 0
     for field_name in (
         "vocab_size",
         "n_layers",
@@ -281,6 +291,8 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
         "n_kv_heads",
         "d_model",
         "d_ff",
+        "mlp_type",
+        "swiglu_hidden",
         "max_seq_len",
         "dropout",
         "bias",
@@ -300,5 +312,18 @@ def inherit_attention_shape_from_tensors(config: SpakieConfig, tensors: dict) ->
         if name.endswith(".attn.kv_proj.weight"):
             head_dim = config.d_model // config.n_heads
             config.n_kv_heads = int(tensor.shape[0]) // (2 * head_dim)
+            return config
+    return config
+
+
+def inherit_mlp_shape_from_tensors(config: SpakieConfig, tensors: dict) -> SpakieConfig:
+    """Infer GELU vs SwiGLU MLP shape from checkpoint tensor names for MLX safetensors."""
+    if any(name.endswith(".mlp.fc1.weight") for name in tensors):
+        config.mlp_type = "gelu"
+        return config
+    for name, tensor in tensors.items():
+        if name.endswith(".mlp.gate_up.weight"):
+            config.mlp_type = "swiglu"
+            config.swiglu_hidden = int(tensor.shape[0]) // 2
             return config
     return config

@@ -22,6 +22,9 @@ defaults:
   n_kv_heads: 0
   d_model: 768
   d_ff: 3072
+  mlp_type: gelu
+  # Hidden size for SwiGLU MLPs. 0 uses d_ff. Only used when mlp_type=swiglu.
+  swiglu_hidden: 0
   max_seq_len: 512
   dropout: 0.1
   bias: false
@@ -148,6 +151,8 @@ presets:
     n_heads: 14
     n_kv_heads: 2
     d_ff: 3584
+    mlp_type: swiglu
+    swiglu_hidden: 2048
     activation_checkpointing: false
     pretrain_batch_size: 96
     pretrain_grad_accum_steps: 2

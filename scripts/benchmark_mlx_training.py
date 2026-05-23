@@ -322,6 +322,7 @@ def main() -> None:
     print(f"Precision: {runtime.precision}")
     print(f"Data: {data_source}")
     print(f"Attention KV heads: {config.n_kv_heads or config.n_heads}/{config.n_heads}")
+    print(f"MLP: {config.mlp_type}")
     print(f"Batch size: {batch_size}")
     print(f"Grad accum: {grad_accum}")
     print(f"Optimizer: {optimizer.optimizer_kind}")

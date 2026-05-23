@@ -42,6 +42,8 @@ class TorchMLXForwardParityTests(unittest.TestCase):
             n_kv_heads=2,
             d_model=32,
             d_ff=64,
+            mlp_type="swiglu",
+            swiglu_hidden=32,
             max_seq_len=16,
             dropout=0.0,
             bias=False,
@@ -80,8 +82,19 @@ class TorchMLXForwardParityTests(unittest.TestCase):
                     state[f"{src_prefix}.attn.kv_proj.weight"]
                 )
             overrides[f"{src_prefix}.attn.out_proj.weight"] = mx.array(state[f"{src_prefix}.attn.out_proj.weight"])
-            overrides[f"{src_prefix}.mlp.fc1.weight"] = mx.array(state[f"{src_prefix}.mlp.fc1.weight"])
-            overrides[f"{src_prefix}.mlp.fc2.weight"] = mx.array(state[f"{src_prefix}.mlp.fc2.weight"])
+            fc1_key = f"{src_prefix}.mlp.fc1.weight"
+            if fc1_key in state:
+                overrides[fc1_key] = mx.array(state[fc1_key])
+                overrides[f"{src_prefix}.mlp.fc2.weight"] = mx.array(
+                    state[f"{src_prefix}.mlp.fc2.weight"]
+                )
+            else:
+                overrides[f"{src_prefix}.mlp.gate_up.weight"] = mx.array(
+                    state[f"{src_prefix}.mlp.gate_up.weight"]
+                )
+                overrides[f"{src_prefix}.mlp.down.weight"] = mx.array(
+                    state[f"{src_prefix}.mlp.down.weight"]
+                )
 
         mlx_model.update(tree_unflatten(list(overrides.items())))
 

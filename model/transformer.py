@@ -68,11 +68,24 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        self.fc1 = nn.Linear(config.d_model, config.d_ff, bias=config.bias)
-        self.fc2 = nn.Linear(config.d_ff, config.d_model, bias=config.bias)
+        self.mlp_type = config.mlp_type
+        if self.mlp_type == "swiglu":
+            hidden = config.swiglu_hidden or config.d_ff
+            self.gate_up = nn.Linear(config.d_model, 2 * hidden, bias=config.bias)
+            self.down = nn.Linear(hidden, config.d_model, bias=config.bias)
+            self.fc1 = None
+            self.fc2 = None
+        else:
+            self.fc1 = nn.Linear(config.d_model, config.d_ff, bias=config.bias)
+            self.fc2 = nn.Linear(config.d_ff, config.d_model, bias=config.bias)
+            self.gate_up = None
+            self.down = None
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mlp_type == "swiglu":
+            gate, up = self.gate_up(x).chunk(2, dim=-1)
+            return self.dropout(self.down(F.silu(gate) * up))
         return self.dropout(self.fc2(F.gelu(self.fc1(x))))
 
 
@@ -108,7 +121,10 @@ class SpakieGPT(nn.Module):
         # Scale residual projections
         for block in self.blocks:
             nn.init.normal_(block.attn.out_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
-            nn.init.normal_(block.mlp.fc2.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
+            if block.mlp.mlp_type == "swiglu":
+                nn.init.normal_(block.mlp.down.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
+            else:
+                nn.init.normal_(block.mlp.fc2.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):

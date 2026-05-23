@@ -10,6 +10,7 @@ from configs.default import (
     checkpoint_search_dirs,
     get_preset_config,
     inherit_attention_shape_from_tensors,
+    inherit_mlp_shape_from_tensors,
     inherit_model_shape,
 )
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
@@ -327,6 +328,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         print(f"Error: no 'model.*' tensors found in {ckpt_path}")
         sys.exit(1)
     config = inherit_attention_shape_from_tensors(config, model_flat)
+    config = inherit_mlp_shape_from_tensors(config, model_flat)
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPTMLX(config)
     model.update(tree_unflatten(list(model_flat.items())))

@@ -5,7 +5,11 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from configs.default import get_preset_config, inherit_attention_shape_from_tensors
+from configs.default import (
+    get_preset_config,
+    inherit_attention_shape_from_tensors,
+    inherit_mlp_shape_from_tensors,
+)
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 from training.muon_core import (
     MUON_ADJUST_LR_CHOICES,
@@ -137,6 +141,7 @@ def run_torch_pretrain(args, config):
     print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
     print(f"Attention KV heads: {config.n_kv_heads or config.n_heads}/{config.n_heads}")
+    print(f"MLP: {config.mlp_type}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
@@ -203,7 +208,9 @@ def run_mlx_pretrain(args, config):
             sys.exit(1)
         resume_state = load_training_checkpoint_mlx(resume_path)
         from mlx.utils import tree_flatten
-        config = inherit_attention_shape_from_tensors(config, dict(tree_flatten(resume_state["model"])))
+        model_tensors = dict(tree_flatten(resume_state["model"]))
+        config = inherit_attention_shape_from_tensors(config, model_tensors)
+        config = inherit_mlp_shape_from_tensors(config, model_tensors)
         if args.reset_best_loss:
             resume_state.setdefault("meta", {})["best_val_loss"] = float("inf")
         # Config fields aren't serialized in the safetensors; preset hyperparameters
@@ -245,6 +252,7 @@ def run_mlx_pretrain(args, config):
     print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
     print(f"Attention KV heads: {config.n_kv_heads or config.n_heads}/{config.n_heads}")
+    print(f"MLP: {config.mlp_type}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")

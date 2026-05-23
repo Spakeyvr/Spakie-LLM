@@ -78,11 +78,27 @@ class CausalSelfAttentionMLX(nn.Module):
 class MLPMLX(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        self.fc1 = nn.Linear(config.d_model, config.d_ff, bias=config.bias)
-        self.fc2 = nn.Linear(config.d_ff, config.d_model, bias=config.bias)
+        self.mlp_type = config.mlp_type
+        if self.mlp_type == "swiglu":
+            hidden = config.swiglu_hidden or config.d_ff
+            self.swiglu_hidden = hidden
+            self.gate_up = nn.Linear(config.d_model, 2 * hidden, bias=config.bias)
+            self.down = nn.Linear(hidden, config.d_model, bias=config.bias)
+            self.fc1 = None
+            self.fc2 = None
+        else:
+            self.swiglu_hidden = 0
+            self.fc1 = nn.Linear(config.d_model, config.d_ff, bias=config.bias)
+            self.fc2 = nn.Linear(config.d_ff, config.d_model, bias=config.bias)
+            self.gate_up = None
+            self.down = None
         self.dropout = nn.Dropout(config.dropout)
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.mlp_type == "swiglu":
+            gate_up = self.gate_up(x)
+            gate, up = mx.split(gate_up, 2, axis=-1)
+            return self.dropout(self.down(nn.silu(gate) * up))
         return self.dropout(self.fc2(nn.gelu(self.fc1(x))))
 
 
@@ -176,12 +192,28 @@ class SpakieGPTMLX(nn.Module):
             if config.bias:
                 overrides[f"{prefix}.attn.out_proj.bias"] = mx.zeros_like(block.attn.out_proj.bias)
 
-            overrides[f"{prefix}.mlp.fc1.weight"] = _normal(block.mlp.fc1.weight.shape, 0.02)
-            if config.bias:
-                overrides[f"{prefix}.mlp.fc1.bias"] = mx.zeros_like(block.mlp.fc1.bias)
-            overrides[f"{prefix}.mlp.fc2.weight"] = _normal(block.mlp.fc2.weight.shape, residual_std)
-            if config.bias:
-                overrides[f"{prefix}.mlp.fc2.bias"] = mx.zeros_like(block.mlp.fc2.bias)
+            if block.mlp.mlp_type == "swiglu":
+                overrides[f"{prefix}.mlp.gate_up.weight"] = _normal(
+                    block.mlp.gate_up.weight.shape, 0.02
+                )
+                if config.bias:
+                    overrides[f"{prefix}.mlp.gate_up.bias"] = mx.zeros_like(
+                        block.mlp.gate_up.bias
+                    )
+                overrides[f"{prefix}.mlp.down.weight"] = _normal(
+                    block.mlp.down.weight.shape, residual_std
+                )
+                if config.bias:
+                    overrides[f"{prefix}.mlp.down.bias"] = mx.zeros_like(block.mlp.down.bias)
+            else:
+                overrides[f"{prefix}.mlp.fc1.weight"] = _normal(block.mlp.fc1.weight.shape, 0.02)
+                if config.bias:
+                    overrides[f"{prefix}.mlp.fc1.bias"] = mx.zeros_like(block.mlp.fc1.bias)
+                overrides[f"{prefix}.mlp.fc2.weight"] = _normal(
+                    block.mlp.fc2.weight.shape, residual_std
+                )
+                if config.bias:
+                    overrides[f"{prefix}.mlp.fc2.bias"] = mx.zeros_like(block.mlp.fc2.bias)
 
         from mlx.utils import tree_unflatten
 
