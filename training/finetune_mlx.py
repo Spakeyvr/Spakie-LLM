@@ -34,6 +34,33 @@ def _save_sft_checkpoint(base_path: str, model: SpakieGPTMLX, meta: dict) -> Non
     save_meta_json(base_path + ".meta.json", meta)
 
 
+def _evaluate_sft_loss(model: SpakieGPTMLX, val_dataset, batch_size: int) -> float:
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+
+    try:
+        for start in range(0, len(val_dataset), batch_size):
+            stop = min(start + batch_size, len(val_dataset))
+            x_np, y_np = stack_batch(val_dataset, range(start, stop))
+            valid_tokens = int((y_np != -100).sum())
+            if valid_tokens == 0:
+                continue
+
+            x = mx.array(x_np)
+            y = mx.array(y_np)
+            _, loss, _ = model(x, y, return_cache=False)
+            mx.eval(loss)
+            total_loss += float(loss.item()) * valid_tokens
+            total_tokens += valid_tokens
+    finally:
+        if was_training:
+            model.train()
+
+    return total_loss / max(total_tokens, 1)
+
+
 def finetune_mlx(
     model: SpakieGPTMLX,
     train_dataset,
@@ -62,9 +89,6 @@ def finetune_mlx(
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     train_sampler = ResumableBatchSamplerMLX(
         len(train_dataset), config.sft_batch_size, drop_last=True, seed=0
-    )
-    val_sampler = ResumableBatchSamplerMLX(
-        len(val_dataset), config.sft_batch_size, drop_last=False, seed=1
     )
     steps_per_epoch = len(train_dataset) // config.sft_batch_size
     total_steps = max(1, (steps_per_epoch * config.sft_epochs) // config.sft_grad_accum_steps)
@@ -169,44 +193,10 @@ def finetune_mlx(
             # Validation
             if profiler.enabled:
                 eval_start = now()
-                model.eval()
-                val_loss = 0.0
-                val_count = 0
-                val_iter = iter(val_sampler)
-                for _ in range(max(1, len(val_dataset) // config.sft_batch_size)):
-                    try:
-                        batch_indices = next(val_iter)
-                    except StopIteration:
-                        break
-                    x_np, y_np = stack_batch(val_dataset, batch_indices)
-                    x = mx.array(x_np)
-                    y = mx.array(y_np)
-                    _, loss, _ = model(x, y, return_cache=False)
-                    mx.eval(loss)
-                    val_loss += float(loss.item())
-                    val_count += 1
-                val_loss = val_loss / max(val_count, 1)
-                model.train()
+                val_loss = _evaluate_sft_loss(model, val_dataset, config.sft_batch_size)
                 profiler.add("eval", now() - eval_start)
             else:
-                model.eval()
-                val_loss = 0.0
-                val_count = 0
-                val_iter = iter(val_sampler)
-                for _ in range(max(1, len(val_dataset) // config.sft_batch_size)):
-                    try:
-                        batch_indices = next(val_iter)
-                    except StopIteration:
-                        break
-                    x_np, y_np = stack_batch(val_dataset, batch_indices)
-                    x = mx.array(x_np)
-                    y = mx.array(y_np)
-                    _, loss, _ = model(x, y, return_cache=False)
-                    mx.eval(loss)
-                    val_loss += float(loss.item())
-                    val_count += 1
-                val_loss = val_loss / max(val_count, 1)
-                model.train()
+                val_loss = _evaluate_sft_loss(model, val_dataset, config.sft_batch_size)
 
             print(
                 f"Epoch {epoch + 1} | train_loss {epoch_loss / max(n_micro, 1):.4f} | "
