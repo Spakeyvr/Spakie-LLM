@@ -194,9 +194,9 @@ def print_sft_format_warning(jsonl_path: str, examples: list[dict]) -> None:
     print(f"SFT system prompts: {system_count:,}/{len(examples):,} examples")
     if system_count == 0:
         print(
-            "Warning: SFT data has no system turns. Use `scripts/chat.py --no-system` "
-            "for this checkpoint, or rebuild SFT data with `scripts/prepare_sft.py` "
-            "before fine-tuning."
+            "Warning: SFT data has no system turns. Use `scripts/chat.py` without "
+            "`--system` for this checkpoint, or rebuild SFT data with "
+            "`scripts/prepare_sft.py --system ...` before fine-tuning."
         )
     elif system_count != len(examples):
         print(

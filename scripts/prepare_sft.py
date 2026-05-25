@@ -233,11 +233,6 @@ def main() -> None:
         help="Optional system prompt to inject into every example",
     )
     parser.add_argument(
-        "--no-system",
-        action="store_true",
-        help="Do not include any system message (overrides --system)",
-    )
-    parser.add_argument(
         "--max",
         type=int,
         default=0,
@@ -261,7 +256,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.no_system or args.system is None:
+    if args.system is None:
         system_prompt: str | None = None
         system_label = "(no system message)"
     else:

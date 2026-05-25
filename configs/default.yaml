@@ -183,12 +183,11 @@ source_min_doc_chars:
   dictionary: 80
 
 sft_source_limits:
-  alpaca: 16000
-  dolly: 10000
+  alpaca: 4000
   no_robots: 10000
-  smoltalk: 15000
-  squad: 12000
-  triviaqa: 20000
+  smoltalk: 25000
+  squad: 3000
+  triviaqa: 4000
   arc_challenge: 5000
   openbookqa: 5000
 

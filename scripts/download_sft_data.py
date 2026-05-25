@@ -90,24 +90,6 @@ def download_alpaca(limit: int, seed: int) -> list[dict]:
     return examples
 
 
-def load_dolly(limit: int, seed: int) -> list[dict]:
-    print("Loading Dolly...")
-    dataset = load_dataset("databricks/databricks-dolly-15k", split="train")
-    rows = take_rows(dataset, limit, seed)
-    examples = []
-    for row in rows:
-        instruction = trim(row.get("instruction", ""))
-        context = trim(row.get("context", ""))
-        response = trim(row.get("response", ""))
-        if not instruction or not response:
-            continue
-        user_text = f"{instruction}\n\nContext: {context}" if context else instruction
-        example = make_example(user_text, response)
-        if example is not None:
-            examples.append(example)
-    return examples
-
-
 def load_no_robots(limit: int, seed: int) -> list[dict]:
     print("Loading No Robots...")
     dataset = load_dataset("HuggingFaceH4/no_robots", split="train")
@@ -286,7 +268,7 @@ def main() -> None:
     parser.add_argument(
         "--sources",
         type=str,
-        default="alpaca,dolly,no_robots,smoltalk,squad,triviaqa,arc_challenge,openbookqa",
+        default="alpaca,no_robots,smoltalk,squad,triviaqa,arc_challenge,openbookqa",
         help="Comma-separated SFT sources to download",
     )
     parser.add_argument(
@@ -301,7 +283,6 @@ def main() -> None:
 
     source_builders = {
         "alpaca": lambda limit: download_alpaca(limit, args.seed),
-        "dolly": lambda limit: load_dolly(limit, args.seed),
         "no_robots": lambda limit: load_no_robots(limit, args.seed),
         "smoltalk": lambda limit: load_smoltalk(limit, args.seed),
         "squad": lambda limit: load_squad(limit, args.seed),

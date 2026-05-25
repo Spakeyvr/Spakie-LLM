@@ -166,12 +166,12 @@ python3 scripts/finetune.py --backend mlx --precision auto
 python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
-The default SFT download includes Alpaca Clean, Dolly, HuggingFaceH4/no_robots,
+The default SFT download includes Alpaca Clean, HuggingFaceH4/no_robots,
 HuggingFaceTB/smoltalk, SQuAD, SciQ, BoolQ, ARC, and OpenBookQA. To download
 only selected sources:
 
 ```bash
-python3 scripts/download_sft_data.py --sources smoltalk,no_robots,dolly
+python3 scripts/download_sft_data.py --sources smoltalk,no_robots,alpaca
 ```
 
 For a small targeted SFT/eval set instead of downloaded SFT sources:
@@ -221,7 +221,6 @@ Useful commands:
 ```bash
 python3 scripts/chat.py --list-models --device auto --precision auto
 python3 scripts/chat.py --model 1 --backend mlx --no-model-prompt
-python3 scripts/chat.py --model 1 --backend mlx --no-system
 python3 scripts/chat.py --checkpoint checkpoints/300m/best.pt --backend mlx
 python3 scripts/chat.py --json_mode --system "Answer as JSON."
 python3 scripts/finetune.py --list-models --backend mlx
@@ -307,5 +306,5 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 <|assistant|>Python is a programming language.<eos>
 ```
 
-The system turn is optional. For 92m and 180m checkpoints, `scripts/chat.py`
-omits it by default unless `--system` is provided.
+The system turn is optional. `scripts/chat.py` omits it by default unless
+`--system` is provided.

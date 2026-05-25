@@ -6,14 +6,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 
-from configs.default import CHAT_SYSTEM_PROMPT, SpakieConfig
+from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings
 from tokenizer.train_tokenizer import SpakieTokenizer
 from inference.generate import generate, generate_json
-
-
-DEFAULT_SYSTEM = CHAT_SYSTEM_PROMPT
 
 
 def build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg: str) -> list[int]:
@@ -22,7 +19,7 @@ def build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg
 
 
 def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig,
-              runtime: RuntimeSettings, system_msg: str = DEFAULT_SYSTEM,
+              runtime: RuntimeSettings, system_msg: str = "",
               temperature: float = 0.1, top_k: int = 1, top_p: float = 1.0,
               json_mode: bool = False, max_new_tokens: int = 256,
               repetition_penalty: float = 1.2):
