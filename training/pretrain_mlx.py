@@ -137,7 +137,6 @@ def _build_microbatch_step(
     *,
     compile_step: bool,
     ignore_index: int | None = -100,
-    capture_random_state: bool = True,
 ):
     """Return a callable `step(x, y) -> (loss, grads)`.
 
@@ -154,7 +153,7 @@ def _build_microbatch_step(
             return value_and_grad(model, x, y)
         return step
 
-    state = [model.state, mx.random.state] if capture_random_state else [model.state]
+    state = [model.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
     def step(x, y):
@@ -517,11 +516,7 @@ def pretrain_mlx(
     # Pretraining never emits ignore_index tokens; skip the mask path to avoid
     # two extra (B*T) tensors per microbatch and a softer backward graph.
     microbatch_step = _build_microbatch_step(
-        model,
-        accum_scale,
-        compile_step=use_compile,
-        ignore_index=None,
-        capture_random_state=config.dropout > 0.0,
+        model, accum_scale, compile_step=use_compile, ignore_index=None
     )
 
     ckpt_writer = AsyncCheckpointWriter()

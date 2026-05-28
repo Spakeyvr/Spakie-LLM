@@ -90,91 +90,6 @@ class ChatSFTDatasetMLX:
         return np.asarray(x, dtype=np.int32), np.asarray(y, dtype=np.int32)
 
 
-class PackedChatSFTDatasetMLX:
-    """Pack chat examples into dense SFT sequences while preserving loss masks."""
-
-    is_packed = True
-
-    def __init__(self, jsonl_path: str, tokenizer: SpakieTokenizer, max_seq_len: int):
-        self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-        self.examples: list[dict] = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    self.examples.append(json.loads(line))
-        self._xs: list[np.ndarray] = []
-        self._ys: list[np.ndarray] = []
-        self._pack_examples()
-
-    def _serialize_example(self, example: dict) -> tuple[list[int], list[int]]:
-        input_ids: list[int] = []
-        labels: list[int] = []
-        for msg in example["messages"]:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                role_token = self.tokenizer.system_id
-            elif role == "user":
-                role_token = self.tokenizer.user_id
-            elif role == "assistant":
-                role_token = self.tokenizer.assistant_id
-            else:
-                continue
-
-            content_ids = self.tokenizer.encode(content)
-            turn_ids = [role_token] + content_ids + [self.tokenizer.eos_id]
-            if role == "assistant":
-                turn_labels = [-100] + content_ids + [self.tokenizer.eos_id]
-            else:
-                turn_labels = [-100] * len(turn_ids)
-
-            input_ids.extend(turn_ids)
-            labels.extend(turn_labels)
-        return input_ids, labels
-
-    def _append_pack(self, tokens: list[int], labels: list[int]) -> None:
-        if len(tokens) < 2:
-            return
-        tokens = tokens[: self.max_seq_len + 1]
-        labels = labels[: self.max_seq_len + 1]
-        x = tokens[:-1]
-        y = labels[1:]
-        pad_len = self.max_seq_len - len(x)
-        x = x + [self.tokenizer.pad_id] * pad_len
-        y = y + [-100] * pad_len
-        self._xs.append(np.asarray(x, dtype=np.int32))
-        self._ys.append(np.asarray(y, dtype=np.int32))
-
-    def _pack_examples(self) -> None:
-        pack_tokens: list[int] = []
-        pack_labels: list[int] = []
-        limit = self.max_seq_len + 1
-        for example in self.examples:
-            tokens, labels = self._serialize_example(example)
-            while tokens:
-                remaining = limit - len(pack_tokens)
-                if remaining <= 0:
-                    self._append_pack(pack_tokens, pack_labels)
-                    pack_tokens = []
-                    pack_labels = []
-                    remaining = limit
-                take = min(remaining, len(tokens))
-                pack_tokens.extend(tokens[:take])
-                pack_labels.extend(labels[:take])
-                tokens = tokens[take:]
-                labels = labels[take:]
-        if pack_tokens:
-            self._append_pack(pack_tokens, pack_labels)
-
-    def __len__(self) -> int:
-        return len(self._xs)
-
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
-        return self._xs[idx], self._ys[idx]
-
-
 def train_val_split_mlx(dataset, val_fraction: float = 0.05, seed: int = 42):
     """Deterministic grouped split. Returns (train_indices, val_indices).
 
@@ -202,8 +117,6 @@ def train_val_split_mlx(dataset, val_fraction: float = 0.05, seed: int = 42):
 
 
 def _raw_example_at(dataset, idx: int):
-    if getattr(dataset, "is_packed", False):
-        return None
     if hasattr(dataset, "examples"):
         return dataset.examples[idx]
     if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):

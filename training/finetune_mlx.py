@@ -98,12 +98,7 @@ def finetune_mlx(
     global_step = 0
     interrupted = False
     accum_scale = 1.0 / config.sft_grad_accum_steps
-    microbatch_step = _build_microbatch_step(
-        model,
-        accum_scale,
-        compile_step=use_compile,
-        capture_random_state=config.dropout > 0.0,
-    )
+    microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
     profiler = MLXProfile(enabled=profile)
 
     try:

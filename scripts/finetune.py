@@ -292,12 +292,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     from model.transformer_mlx import SpakieGPTMLX
     from runtime.mlx_backend import configure_metal_limits, load_safetensors, resolve_mlx_runtime
     from tokenizer.train_tokenizer import SpakieTokenizer
-    from training.dataset_mlx import (
-        ChatSFTDatasetMLX,
-        PackedChatSFTDatasetMLX,
-        SubsetView,
-        train_val_split_mlx,
-    )
+    from training.dataset_mlx import ChatSFTDatasetMLX, SubsetView, train_val_split_mlx
     from training.finetune_mlx import finetune_mlx
 
     runtime = resolve_mlx_runtime(args.precision)
@@ -343,16 +338,13 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         print(f"Error: SFT data not found at {jsonl_path}")
         sys.exit(1)
 
-    dataset_cls = PackedChatSFTDatasetMLX if args.pack_sft else ChatSFTDatasetMLX
-    dataset = dataset_cls(jsonl_path, tokenizer, config.max_seq_len)
+    dataset = ChatSFTDatasetMLX(jsonl_path, tokenizer, config.max_seq_len)
     print_sft_format_warning(jsonl_path, dataset.examples)
     if args.max_examples > 0:
         dataset = SubsetView(dataset, range(min(args.max_examples, len(dataset))))
     elif args.smoke:
         dataset = SubsetView(dataset, range(min(512, len(dataset))))
     print(f"SFT examples: {len(dataset)}")
-    if args.pack_sft:
-        print("SFT packing: enabled")
 
     train_idx, val_idx = train_val_split_mlx(dataset)
     train_ds = SubsetView(dataset, train_idx)
@@ -462,12 +454,6 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Stage the next batch on a worker thread (mlx backend)",
-    )
-    parser.add_argument(
-        "--pack-sft",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Pack MLX SFT examples into dense max-length sequences",
     )
     parser.add_argument(
         "--mlx-memory-gb",
