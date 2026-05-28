@@ -136,12 +136,13 @@ presets:
     d_model: 768
     n_heads: 12
     d_ff: 3072
+    dropout: 0.0
     activation_checkpointing: false
-    pretrain_batch_size: 92
+    pretrain_batch_size: 64
     pretrain_grad_accum_steps: 1
     pretrain_lr: 6.0e-4
-    sft_batch_size: 92
-    sft_grad_accum_steps: 2
+    sft_batch_size: 64
+    sft_grad_accum_steps: 1
     sft_lr: 4.0e-5
     sft_epochs: 6
 
@@ -153,11 +154,12 @@ presets:
     d_ff: 3584
     mlp_type: swiglu
     swiglu_hidden: 2048
+    dropout: 0.0
     activation_checkpointing: false
-    pretrain_batch_size: 96
-    pretrain_grad_accum_steps: 2
+    pretrain_batch_size: 128
+    pretrain_grad_accum_steps: 1
     sft_batch_size: 32
-    sft_grad_accum_steps: 4
+    sft_grad_accum_steps: 1
     sft_lr: 3.0e-5
     sft_epochs: 4
 
