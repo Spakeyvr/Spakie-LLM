@@ -166,12 +166,13 @@ presets:
     d_model: 1024
     n_heads: 16
     d_ff: 4096
+    dropout: 0.0
     activation_checkpointing: false
-    pretrain_batch_size: 64
-    pretrain_grad_accum_steps: 2
+    pretrain_batch_size: 96
+    pretrain_grad_accum_steps: 1
     pretrain_lr: 6.0e-4
-    sft_batch_size: 16
-    sft_grad_accum_steps: 2
+    sft_batch_size: 20
+    sft_grad_accum_steps: 1
 
 source_min_doc_chars:
   wikipedia_snapshot: 200
