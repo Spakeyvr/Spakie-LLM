@@ -173,6 +173,14 @@ def main():
              ns_steps=5, perhead=False, warmup=20, schedule="cosine"),
         dict(label="cosine_ns3", lr=6e-4, wd=0.1, optimizer_kind="muon",
              ns_steps=3, perhead=False, warmup=20, schedule="cosine"),
+        dict(label="cosine_ns2", lr=6e-4, wd=0.1, optimizer_kind="muon",
+             ns_steps=2, perhead=False, warmup=20, schedule="cosine"),
+        dict(label="cosine_ns2_higher_lr", lr=1.2e-3, wd=0.1, optimizer_kind="muon",
+             ns_steps=2, perhead=False, warmup=20, schedule="cosine"),
+        dict(label="cosine_ns1", lr=6e-4, wd=0.1, optimizer_kind="muon",
+             ns_steps=1, perhead=False, warmup=20, schedule="cosine"),
+        dict(label="cosine_ns1_higher_lr", lr=1.2e-3, wd=0.1, optimizer_kind="muon",
+             ns_steps=1, perhead=False, warmup=20, schedule="cosine"),
     ]
 
     print(f"Preset {args.preset} | batch {args.batch_size} | seq {config.max_seq_len} | "

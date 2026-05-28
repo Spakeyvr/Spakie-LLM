@@ -51,6 +51,10 @@ class SpakieConfig:
     d_model: int = _D["d_model"]
     d_ff: int = _D["d_ff"]
     mlp_type: str = _D.get("mlp_type", "gelu")
+    gelu_variant: str = _D.get("gelu_variant", "exact")
+    norm_type: str = _D.get("norm_type", "layernorm")
+    loss_layout: str = _D.get("loss_layout", "flat")
+    residual_type: str = _D.get("residual_type", "serial")
     swiglu_hidden: int = _D.get("swiglu_hidden", 0)
     max_seq_len: int = _D["max_seq_len"]
     dropout: float = _D["dropout"]
@@ -174,6 +178,18 @@ class SpakieConfig:
         self.mlp_type = (self.mlp_type or "gelu").lower()
         if self.mlp_type not in {"gelu", "swiglu"}:
             raise ValueError("mlp_type must be 'gelu' or 'swiglu'")
+        self.gelu_variant = (self.gelu_variant or "exact").lower()
+        if self.gelu_variant not in {"exact", "fast"}:
+            raise ValueError("gelu_variant must be 'exact' or 'fast'")
+        self.norm_type = (self.norm_type or "layernorm").lower()
+        if self.norm_type not in {"layernorm", "rmsnorm"}:
+            raise ValueError("norm_type must be 'layernorm' or 'rmsnorm'")
+        self.loss_layout = (self.loss_layout or "flat").lower()
+        if self.loss_layout not in {"flat", "3d", "custom"}:
+            raise ValueError("loss_layout must be 'flat', '3d', or 'custom'")
+        self.residual_type = (self.residual_type or "serial").lower()
+        if self.residual_type not in {"serial", "parallel"}:
+            raise ValueError("residual_type must be 'serial' or 'parallel'")
         if self.swiglu_hidden < 0:
             raise ValueError("swiglu_hidden must be >= 0")
         self.target_processed_tokens = derive_processed_token_target(self.target_train_tokens, self.train_split_fraction)
@@ -292,6 +308,10 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
         "d_model",
         "d_ff",
         "mlp_type",
+        "gelu_variant",
+        "norm_type",
+        "loss_layout",
+        "residual_type",
         "swiglu_hidden",
         "max_seq_len",
         "dropout",

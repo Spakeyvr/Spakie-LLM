@@ -69,6 +69,7 @@ class MLP(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
         self.mlp_type = config.mlp_type
+        self.gelu_variant = config.gelu_variant
         if self.mlp_type == "swiglu":
             hidden = config.swiglu_hidden or config.d_ff
             self.gate_up = nn.Linear(config.d_model, 2 * hidden, bias=config.bias)
@@ -86,19 +87,37 @@ class MLP(nn.Module):
         if self.mlp_type == "swiglu":
             gate, up = self.gate_up(x).chunk(2, dim=-1)
             return self.dropout(self.down(F.silu(gate) * up))
-        return self.dropout(self.fc2(F.gelu(self.fc1(x))))
+        h = self.fc1(x)
+        if self.gelu_variant == "fast":
+            h = h * torch.sigmoid(1.702 * h)
+        else:
+            h = F.gelu(h)
+        return self.dropout(self.fc2(h))
 
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln1 = (
+            nn.RMSNorm(config.d_model, eps=1e-5)
+            if config.norm_type == "rmsnorm"
+            else nn.LayerNorm(config.d_model, bias=config.bias)
+        )
         self.attn = CausalSelfAttention(config)
-        self.ln2 = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln2 = (
+            nn.RMSNorm(config.d_model, eps=1e-5)
+            if config.norm_type == "rmsnorm"
+            else nn.LayerNorm(config.d_model, bias=config.bias)
+        )
         self.mlp = MLP(config)
+        self.residual_type = config.residual_type
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
+        h = self.ln1(x)
+        attn_out = self.attn(h)
+        if self.residual_type == "parallel":
+            return x + attn_out + self.mlp(h)
+        x = x + attn_out
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -111,7 +130,11 @@ class SpakieGPT(nn.Module):
         self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
-        self.ln_f = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_f = (
+            nn.RMSNorm(config.d_model, eps=1e-5)
+            if config.norm_type == "rmsnorm"
+            else nn.LayerNorm(config.d_model, bias=config.bias)
+        )
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Weight tying
@@ -133,9 +156,9 @@ class SpakieGPT(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
             nn.init.ones_(module.weight)
-            if module.bias is not None:
+            if getattr(module, "bias", None) is not None:
                 nn.init.zeros_(module.bias)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):

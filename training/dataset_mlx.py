@@ -229,6 +229,62 @@ class ResumableBatchSamplerMLX:
         )
 
 
+def sequence_length_at(dataset, idx: int, *, pad_id: int = 0, ignore_index: int = -100) -> int:
+    x, y = dataset[idx]
+    keep = (x != pad_id) | (y != ignore_index)
+    if not keep.any():
+        return 1
+    return int(np.nonzero(keep)[0].max()) + 1
+
+
+def sequence_lengths(dataset, *, pad_id: int = 0, ignore_index: int = -100) -> np.ndarray:
+    return np.asarray(
+        [
+            sequence_length_at(dataset, i, pad_id=pad_id, ignore_index=ignore_index)
+            for i in range(len(dataset))
+        ],
+        dtype=np.int32,
+    )
+
+
+class LengthBucketBatchSamplerMLX:
+    """Infinite sortish sampler that batches examples with similar lengths."""
+
+    def __init__(
+        self,
+        lengths: np.ndarray,
+        batch_size: int,
+        *,
+        bucket_size: int = 2048,
+        drop_last: bool = True,
+        seed: int = 0,
+    ):
+        self.lengths = np.asarray(lengths, dtype=np.int32)
+        self.batch_size = batch_size
+        self.bucket_size = max(batch_size, bucket_size)
+        self.drop_last = drop_last
+        self.rng = np.random.default_rng(seed)
+
+    def __iter__(self):
+        n = len(self.lengths)
+        while True:
+            order = self.rng.permutation(n)
+            buckets = [
+                order[start : start + self.bucket_size]
+                for start in range(0, n, self.bucket_size)
+            ]
+            self.rng.shuffle(buckets)
+            for bucket in buckets:
+                sorted_bucket = bucket[np.argsort(self.lengths[bucket])]
+                if self.rng.random() < 0.5:
+                    sorted_bucket = sorted_bucket[::-1]
+                for start in range(0, len(sorted_bucket), self.batch_size):
+                    batch = sorted_bucket[start : start + self.batch_size]
+                    if len(batch) < self.batch_size and self.drop_last:
+                        continue
+                    yield batch
+
+
 def stack_batch(dataset, indices: list[int] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     xs = []
     ys = []
@@ -237,6 +293,32 @@ def stack_batch(dataset, indices: list[int] | np.ndarray) -> tuple[np.ndarray, n
         xs.append(x)
         ys.append(y)
     return np.stack(xs), np.stack(ys)
+
+
+def trim_right_padding_bucket(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    pad_id: int = 0,
+    ignore_index: int = -100,
+    bucket_multiple: int = 128,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Trim SFT batches to a right-padding bucket while preserving all tokens."""
+    if x.ndim != 2 or y.ndim != 2 or x.shape != y.shape:
+        return x, y
+    keep = (x != pad_id) | (y != ignore_index)
+    if not keep.any():
+        target_len = 1
+    else:
+        target_len = int(np.nonzero(keep)[1].max()) + 1
+    if bucket_multiple > 1:
+        target_len = (
+            (target_len + bucket_multiple - 1) // bucket_multiple
+        ) * bucket_multiple
+    target_len = max(1, min(target_len, x.shape[1]))
+    if target_len == x.shape[1]:
+        return x, y
+    return np.ascontiguousarray(x[:, :target_len]), np.ascontiguousarray(y[:, :target_len])
 
 
 def iterate_batches(dataset, sampler: ResumableBatchSamplerMLX):

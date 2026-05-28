@@ -23,17 +23,20 @@ defaults:
   d_model: 768
   d_ff: 3072
   mlp_type: gelu
+  gelu_variant: fast
+  norm_type: rmsnorm
+  loss_layout: custom
+  residual_type: serial
   # Hidden size for SwiGLU MLPs. 0 uses d_ff. Only used when mlp_type=swiglu.
   swiglu_hidden: 0
   max_seq_len: 512
-  dropout: 0.1
+  dropout: 0.0
   bias: false
   activation_checkpointing: false
   # Chunk size for the lm_head matmul + cross-entropy in the MLX training
-  # path. 0 (default) skips chunking and computes flat 2-D logits + CE in one
-  # go — measured fastest across 92m / 180m / 300m on Apple Silicon at
-  # vocab_size=16384. Larger chunks may help on hardware with tight memory
-  # budgets; benchmark before changing.
+  # path. 0 (default) skips chunking. The MLX default uses a custom VJP for
+  # tied lm-head cross-entropy; larger chunks may help on hardware with tight
+  # memory budgets; benchmark before changing.
   loss_chunk_size: 0
 
   # Pretraining
@@ -72,7 +75,7 @@ defaults:
   allow_adamw_fallback: false
   muon_momentum: 0.95
   muon_nesterov: true
-  muon_ns_steps: 5
+  muon_ns_steps: 2
   muon_ns_coefficients: [3.4445, -4.7750, 2.0315]
   muon_eps: 1.0e-7
   muon_adjust_lr_fn: match_rms_adamw
@@ -162,16 +165,19 @@ presets:
     sft_epochs: 4
 
   300m:
-    n_layers: 24
-    d_model: 1024
-    n_heads: 16
-    d_ff: 4096
+    n_layers: 10
+    d_model: 1280
+    n_heads: 20
+    n_kv_heads: 0
+    d_ff: 9088
     activation_checkpointing: false
     pretrain_batch_size: 64
     pretrain_grad_accum_steps: 2
     pretrain_lr: 6.0e-4
+    pretrain_grad_clip: 0.0
     sft_batch_size: 16
     sft_grad_accum_steps: 2
+    sft_grad_clip: 0.0
 
 source_min_doc_chars:
   wikipedia_snapshot: 200

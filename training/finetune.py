@@ -76,7 +76,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     n_batches += 1
 
                     if (batch_idx + 1) % config.sft_grad_accum_steps == 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.sft_grad_clip)
+                        if config.sft_grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), config.sft_grad_clip)
 
                         # Cosine LR
                         progress = global_step / max(total_steps, 1)

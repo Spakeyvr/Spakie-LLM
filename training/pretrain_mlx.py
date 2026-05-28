@@ -137,6 +137,7 @@ def _build_microbatch_step(
     *,
     compile_step: bool,
     ignore_index: int | None = -100,
+    shapeless: bool = False,
 ):
     """Return a callable `step(x, y) -> (loss, grads)`.
 
@@ -153,9 +154,11 @@ def _build_microbatch_step(
             return value_and_grad(model, x, y)
         return step
 
-    state = [model.state, mx.random.state]
+    state = [model.state]
+    if getattr(model.config, "dropout", 0.0) > 0.0:
+        state.append(mx.random.state)
 
-    @partial(mx.compile, inputs=state, outputs=state)
+    @partial(mx.compile, inputs=state, outputs=state, shapeless=shapeless)
     def step(x, y):
         return value_and_grad(model, x, y)
 
@@ -591,18 +594,24 @@ def pretrain_mlx(
                 accum_grads = _accum_grads(accum_grads, grads)
                 accum_loss = accum_loss + loss.astype(mx.float32)
                 # Materialize after each microbatch so MLX frees the per-microbatch
-                # activation/intermediate graph. Deferring the eval until after the
-                # optimizer step holds every microbatch's full fwd+bwd graph in
-                # memory simultaneously — fine for grad_accum=1 (92m), catastrophic
-                # for grad_accum>=2 (180m+).
-                mx.eval(accum_grads, accum_loss)
+                # activation/intermediate graph. async_eval lets Python queue the
+                # next batch while Metal drains the current graph.
+                mx.async_eval(accum_grads, accum_loss)
                 tokens_processed += x.size
 
             if profiler.enabled:
                 opt_start = now()
-                clipped_grads, _ = clip_grads(accum_grads, config.pretrain_grad_clip)
+                clipped_grads, _ = (
+                    (accum_grads, None)
+                    if config.pretrain_grad_clip <= 0
+                    else clip_grads(accum_grads, config.pretrain_grad_clip)
+                )
             else:
-                clipped_grads, _ = clip_grads(accum_grads, config.pretrain_grad_clip)
+                clipped_grads, _ = (
+                    (accum_grads, None)
+                    if config.pretrain_grad_clip <= 0
+                    else clip_grads(accum_grads, config.pretrain_grad_clip)
+                )
 
             lr = get_lr(global_step, config)
             optimizer.set_lr(lr)

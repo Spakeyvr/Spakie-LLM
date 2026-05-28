@@ -14,6 +14,38 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 
 
+def _gelu_exact(x: mx.array) -> mx.array:
+    return x * (1 + mx.erf(x / math.sqrt(2))) / 2
+
+
+def _gelu_fast(x: mx.array) -> mx.array:
+    return x * mx.sigmoid(1.702 * x)
+
+
+@mx.custom_function
+def _linear_cross_entropy_mean(flat_x: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
+    logits = flat_x @ weight.T
+    if logits.dtype == mx.float16:
+        logits = logits.astype(mx.float32)
+    return nn.losses.cross_entropy(logits, targets, reduction="mean")
+
+
+@_linear_cross_entropy_mean.vjp
+def _linear_cross_entropy_mean_vjp(primals, cotangent, output):
+    flat_x, weight, targets = primals
+    logits = flat_x @ weight.T
+    if logits.dtype == mx.float16:
+        logits = logits.astype(mx.float32)
+    probs = mx.softmax(logits, axis=-1)
+    target_idx = targets[:, None]
+    target_updates = mx.take_along_axis(probs, target_idx, axis=1) - 1
+    grad_logits = mx.put_along_axis(probs, target_idx, target_updates, axis=1) / flat_x.shape[0]
+    grad_logits = grad_logits * cotangent
+    grad_x = grad_logits @ weight
+    grad_weight = grad_logits.T @ flat_x
+    return grad_x, grad_weight, mx.zeros_like(targets)
+
+
 class CausalSelfAttentionMLX(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
@@ -79,6 +111,7 @@ class MLPMLX(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
         self.mlp_type = config.mlp_type
+        self.gelu_variant = config.gelu_variant
         if self.mlp_type == "swiglu":
             hidden = config.swiglu_hidden or config.d_ff
             self.swiglu_hidden = hidden
@@ -99,16 +132,20 @@ class MLPMLX(nn.Module):
             gate_up = self.gate_up(x)
             gate, up = mx.split(gate_up, 2, axis=-1)
             return self.dropout(self.down(nn.silu(gate) * up))
-        return self.dropout(self.fc2(nn.gelu(self.fc1(x))))
+        h = self.fc1(x)
+        h = _gelu_fast(h) if self.gelu_variant == "fast" else _gelu_exact(h)
+        return self.dropout(self.fc2(h))
 
 
 class TransformerBlockMLX(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.d_model, bias=config.bias)
+        norm = nn.RMSNorm if config.norm_type == "rmsnorm" else nn.LayerNorm
+        self.ln1 = norm(config.d_model) if config.norm_type == "rmsnorm" else norm(config.d_model, bias=config.bias)
         self.attn = CausalSelfAttentionMLX(config)
-        self.ln2 = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln2 = norm(config.d_model) if config.norm_type == "rmsnorm" else norm(config.d_model, bias=config.bias)
         self.mlp = MLPMLX(config)
+        self.residual_type = config.residual_type
 
     def __call__(
         self,
@@ -117,7 +154,11 @@ class TransformerBlockMLX(nn.Module):
         *,
         return_cache: bool = False,
     ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
-        attn_out, new_cache = self.attn(self.ln1(x), cache=cache, return_cache=return_cache)
+        h = self.ln1(x)
+        attn_out, new_cache = self.attn(h, cache=cache, return_cache=return_cache)
+        if self.residual_type == "parallel" and cache is None and not return_cache:
+            x = x + attn_out + self.mlp(h)
+            return x, new_cache
         x = x + attn_out
         x = x + self.mlp(self.ln2(x))
         return x, new_cache
@@ -139,7 +180,11 @@ class SpakieGPTMLX(nn.Module):
             if config.activation_checkpointing
             else None
         )
-        self.ln_f = nn.LayerNorm(config.d_model, bias=config.bias)
+        self.ln_f = (
+            nn.RMSNorm(config.d_model)
+            if config.norm_type == "rmsnorm"
+            else nn.LayerNorm(config.d_model, bias=config.bias)
+        )
 
         # lm_head shares weights with tok_emb — we don't allocate a separate matrix;
         # forward uses tok_emb.weight directly as the projection.
@@ -276,10 +321,22 @@ class SpakieGPTMLX(nn.Module):
         N = flat_x.shape[0]
         chunk = self.config.loss_chunk_size or N
         if chunk <= 0 or chunk >= N:
-            flat_logits = flat_x @ W.T
-            loss = _ce_with_optional_mask(
-                flat_logits, flat_targets, ignore_index, flat_logits.dtype
-            )
+            if self.config.loss_layout == "custom" and ignore_index is None:
+                return None, _linear_cross_entropy_mean(flat_x, W, flat_targets), new_caches
+            if self.config.loss_layout == "flat":
+                flat_logits = flat_x @ W.T
+                loss = _ce_with_optional_mask(
+                    flat_logits, flat_targets, ignore_index, flat_logits.dtype
+                )
+                return None, loss, new_caches
+            logits = x @ W.T
+            if ignore_index is None:
+                loss = nn.losses.cross_entropy(logits, targets, axis=-1, reduction="mean")
+            else:
+                flat_logits = logits.reshape(-1, logits.shape[-1])
+                loss = _ce_with_optional_mask(
+                    flat_logits, flat_targets, ignore_index, flat_logits.dtype
+                )
             return None, loss, new_caches
 
         loss_sum = mx.zeros((), dtype=mx.float32)

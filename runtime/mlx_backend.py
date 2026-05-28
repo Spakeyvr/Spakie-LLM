@@ -57,11 +57,13 @@ def configure_metal_limits(
         return applied
     if max_gb is not None and max_gb > 0:
         limit = int(max_gb * (1024 ** 3))
-        mx.metal.set_memory_limit(limit)
+        setter = getattr(mx, "set_memory_limit", mx.metal.set_memory_limit)
+        setter(limit)
         applied["memory_limit"] = limit
     if wired_gb is not None and wired_gb > 0:
         limit = int(wired_gb * (1024 ** 3))
-        mx.metal.set_wired_limit(limit)
+        setter = getattr(mx, "set_wired_limit", mx.metal.set_wired_limit)
+        setter(limit)
         applied["wired_limit"] = limit
     return applied
 

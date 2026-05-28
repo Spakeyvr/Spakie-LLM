@@ -20,7 +20,12 @@ from runtime.mlx_backend import (
     clip_grads,
     save_meta_json,
 )
-from training.dataset_mlx import ResumableBatchSamplerMLX, stack_batch
+from training.dataset_mlx import (
+    LengthBucketBatchSamplerMLX,
+    sequence_lengths,
+    stack_batch,
+    trim_right_padding_bucket,
+)
 from training.mlx_profile import MLXProfile, now
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.pretrain_mlx import _accum_grads, _arrays_to_mx, _build_microbatch_step
@@ -47,6 +52,7 @@ def _evaluate_sft_loss(model: SpakieGPTMLX, val_dataset, batch_size: int) -> flo
             valid_tokens = int((y_np != -100).sum())
             if valid_tokens == 0:
                 continue
+            x_np, y_np = trim_right_padding_bucket(x_np, y_np)
 
             x = mx.array(x_np)
             y = mx.array(y_np)
@@ -87,8 +93,8 @@ def finetune_mlx(
     )
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
-    train_sampler = ResumableBatchSamplerMLX(
-        len(train_dataset), config.sft_batch_size, drop_last=True, seed=0
+    train_sampler = LengthBucketBatchSamplerMLX(
+        sequence_lengths(train_dataset), config.sft_batch_size, drop_last=True, seed=0
     )
     steps_per_epoch = len(train_dataset) // config.sft_batch_size
     total_steps = max(1, (steps_per_epoch * config.sft_epochs) // config.sft_grad_accum_steps)
@@ -138,6 +144,7 @@ def finetune_mlx(
                         profiler.add("batch_fetch", now() - batch_start)
                     else:
                         x_np, y_np = next_batch()
+                    x_np, y_np = trim_right_padding_bucket(x_np, y_np)
                     x, y = _arrays_to_mx(x_np, y_np, profiler)
 
                     # Loss-fn has accum_scale baked in.
@@ -154,15 +161,24 @@ def finetune_mlx(
                     # every accum_steps microbatches). Avoids forcing a CPU↔GPU
                     # sync between microbatches.
                     accum_loss_lazy = accum_loss_lazy + loss.astype(mx.float32)
+                    mx.async_eval(accum_grads, accum_loss_lazy)
                     n_micro += 1
                     micro_in_step += 1
 
                     if micro_in_step == config.sft_grad_accum_steps:
                         if profiler.enabled:
                             opt_start = now()
-                            clipped, _ = clip_grads(accum_grads, config.sft_grad_clip)
+                            clipped, _ = (
+                                (accum_grads, None)
+                                if config.sft_grad_clip <= 0
+                                else clip_grads(accum_grads, config.sft_grad_clip)
+                            )
                         else:
-                            clipped, _ = clip_grads(accum_grads, config.sft_grad_clip)
+                            clipped, _ = (
+                                (accum_grads, None)
+                                if config.sft_grad_clip <= 0
+                                else clip_grads(accum_grads, config.sft_grad_clip)
+                            )
 
                         progress = global_step / max(total_steps, 1)
                         lr = config.sft_lr * 0.1 + 0.5 * config.sft_lr * 0.9 * (

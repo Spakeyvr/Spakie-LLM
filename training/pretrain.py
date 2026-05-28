@@ -268,7 +268,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
 
             accum_loss = accum_loss_tensor.item()  # single GPU→CPU sync per optimizer step
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.pretrain_grad_clip)
+            if config.pretrain_grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.pretrain_grad_clip)
 
             # Update LR
             lr = get_lr(global_step, config)
