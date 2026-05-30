@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from configs.default import SpakieConfig
+from inference.continuation import decode_prefilled_continuation
 from inference.generate_mlx import generate, generate_json
 from model.transformer_mlx import SpakieGPTMLX
 from tokenizer.train_tokenizer import SpakieTokenizer
@@ -119,5 +120,10 @@ def continuation_loop(
             stop_on_special_tokens=False,
             ban_special_tokens=False,
         )
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=not show_special_tokens)
-        print(f"{response_text}\n")
+        completion_text = decode_prefilled_continuation(
+            tokenizer,
+            prompt_ids,
+            response_ids,
+            show_special_tokens=show_special_tokens,
+        )
+        print(f"{completion_text}\n")

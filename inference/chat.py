@@ -10,6 +10,7 @@ from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings
 from tokenizer.train_tokenizer import SpakieTokenizer
+from inference.continuation import decode_prefilled_continuation
 from inference.generate import generate, generate_json
 
 
@@ -110,5 +111,10 @@ def continuation_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: Spak
             stop_on_special_tokens=False,
             ban_special_tokens=False,
         )
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=not show_special_tokens)
-        print(f"{response_text}\n")
+        completion_text = decode_prefilled_continuation(
+            tokenizer,
+            prompt_ids,
+            response_ids,
+            show_special_tokens=show_special_tokens,
+        )
+        print(f"{completion_text}\n")
