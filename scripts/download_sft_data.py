@@ -299,6 +299,9 @@ def main() -> None:
     for source_name in requested_sources:
         builder = source_builders[source_name]
         limit = config.sft_source_limits.get(source_name, 0)
+        if limit <= 0:
+            print(f"  {source_name}: disabled (limit {limit})")
+            continue
         try:
             examples = builder(limit)
         except Exception as exc:

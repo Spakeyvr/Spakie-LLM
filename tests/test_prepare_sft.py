@@ -106,6 +106,32 @@ class PrepareSFTTests(unittest.TestCase):
         self.assertNotIn("system", {msg["role"] for msg in examples[0]["messages"]})
         self.assertEqual(prepare_sft.build_assistant_seed_examples("System prompt.", repeats=0), [])
 
+    def test_build_pair_seed_examples_repeats_and_injects_system(self):
+        examples = prepare_sft.build_pair_seed_examples(
+            (("What's Python", "Python is a programming language."),),
+            "System prompt.",
+            repeats=2,
+        )
+
+        self.assertEqual(len(examples), 2)
+        self.assertEqual(examples[0]["messages"][0], {"role": "system", "content": "System prompt."})
+        self.assertEqual(examples[0]["messages"][1], {"role": "user", "content": "What's Python"})
+        self.assertEqual(
+            examples[0]["messages"][2],
+            {"role": "assistant", "content": "Python is a programming language."},
+        )
+
+    def test_build_pair_seed_examples_can_omit_system(self):
+        examples = prepare_sft.build_pair_seed_examples(
+            (("Explain sleep", "Sleep helps the body rest."),),
+            None,
+            repeats=1,
+        )
+
+        self.assertEqual(examples[0]["messages"][0], {"role": "user", "content": "Explain sleep"})
+        self.assertNotIn("system", {msg["role"] for msg in examples[0]["messages"]})
+        self.assertEqual(prepare_sft.build_pair_seed_examples(prepare_sft.ANTI_ECHO_SEEDS, None, repeats=0), [])
+
 
 if __name__ == "__main__":
     unittest.main()

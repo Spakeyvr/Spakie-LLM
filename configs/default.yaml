@@ -192,10 +192,10 @@ sft_source_limits:
   alpaca: 4000
   no_robots: 10000
   smoltalk: 25000
-  squad: 3000
-  triviaqa: 4000
-  arc_challenge: 5000
-  openbookqa: 5000
+  squad: 0
+  triviaqa: 0
+  arc_challenge: 0
+  openbookqa: 0
 
 corpus_source_plan:
   fineweb-edu:

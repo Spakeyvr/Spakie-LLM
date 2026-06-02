@@ -76,6 +76,21 @@ ASSISTANT_BEHAVIOR_SEEDS = (
     ("Please answer as an assistant, not as a fictional character.", "Understood. I will answer directly as an AI assistant."),
 )
 
+ANTI_ECHO_SEEDS = (
+    ("What's Python", "Python is a popular programming language used for software, data, automation, and AI."),
+    ("What's Python?", "Python is a popular programming language used for software, data, automation, and AI."),
+    ("What is Python?", "Python is a popular programming language used for software, data, automation, and AI."),
+    ("Tell me about Python", "Python is a programming language used for scripting, web development, data analysis, automation, and AI."),
+    ("What's gravity", "Gravity is the force that pulls objects with mass toward each other."),
+    ("What's gravity?", "Gravity is the force that pulls objects with mass toward each other."),
+    ("What is gravity?", "Gravity is the force that pulls objects with mass toward each other."),
+    ("What are atoms?", "Atoms are tiny building blocks of matter."),
+    ("Explain sleep", "Sleep helps the body rest and repair itself. It also supports memory, focus, mood, and energy."),
+    ("How do I study?", "Start by reviewing the main ideas, then practice with questions. Short, focused study sessions usually work better than cramming."),
+    ("Hi", "Hello! How can I help?"),
+    ("Hello", "Hello! How can I help?"),
+)
+
 
 def strip_question_template(content: str) -> str:
     """Strip 'Question: ... Context: ... Answer clearly.' scaffolding from a user turn.
@@ -170,6 +185,31 @@ def build_assistant_seed_examples(system_prompt: str | None, repeats: int) -> li
     return examples
 
 
+def build_pair_seed_examples(
+    pairs: tuple[tuple[str, str], ...],
+    system_prompt: str | None,
+    repeats: int,
+) -> list[dict]:
+    """Return repeated single-turn user/assistant seed examples."""
+    if repeats <= 0:
+        return []
+
+    examples: list[dict] = []
+    for _ in range(repeats):
+        for user_text, assistant_text in pairs:
+            messages: list[dict] = []
+            if system_prompt is not None:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.extend(
+                [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": assistant_text},
+                ]
+            )
+            examples.append({"messages": messages})
+    return examples
+
+
 def signature(example: dict) -> tuple:
     # Dedup on user/assistant content only — the system prompt is uniform.
     return tuple(
@@ -249,6 +289,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--anti-echo-seed-repeats",
+        type=int,
+        default=80,
+        help=(
+            "Repeat direct-answer anti-echo seed examples this many times "
+            "(0 disables). Helps small models answer instead of continuing/repeating prompts."
+        ),
+    )
+    parser.add_argument(
         "--sources",
         type=str,
         default="",
@@ -311,6 +360,16 @@ def main() -> None:
         deduped.extend(assistant_seed)
         counts["assistant_seed"] = len(assistant_seed)
         print(f"Added {len(assistant_seed):,} assistant-behavior seed examples")
+
+    anti_echo_seed = build_pair_seed_examples(
+        ANTI_ECHO_SEEDS,
+        system_prompt,
+        args.anti_echo_seed_repeats,
+    )
+    if anti_echo_seed:
+        deduped.extend(anti_echo_seed)
+        counts["anti_echo_seed"] = len(anti_echo_seed)
+        print(f"Added {len(anti_echo_seed):,} anti-echo seed examples")
 
     random.Random(args.seed).shuffle(deduped)
     if args.max > 0 and len(deduped) > args.max:
