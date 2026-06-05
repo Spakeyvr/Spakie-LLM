@@ -7,6 +7,9 @@ data/
 # Checkpoints
 checkpoints/
 
+# Benchmark outputs
+bench_results/
+
 # Tokenizer model (generated)
 tokenizer/spakie.model
 tokenizer/spakie.vocab

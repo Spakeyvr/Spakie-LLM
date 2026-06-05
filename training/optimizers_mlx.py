@@ -56,6 +56,31 @@ def muon_newton_schulz_mlx(
     return x.astype(update.dtype)
 
 
+def _muon_newton_schulz_stacked_mlx(
+    update: mx.array,
+    *,
+    ns_steps: int,
+    ns_coefficients: tuple[float, float, float],
+    eps: float,
+) -> mx.array:
+    if len(update.shape) != 3:
+        raise ValueError("stacked Muon Newton-Schulz expects a 3D array")
+    a, b, c = ns_coefficients
+    x = update.astype(mx.float32)
+    transposed = x.shape[1] > x.shape[2]
+    if transposed:
+        x = x.transpose(0, 2, 1)
+    norm = mx.sqrt((x * x).sum(axis=(1, 2), keepdims=True)) + eps
+    x = x / norm
+    for _ in range(ns_steps):
+        xx_t = x @ x.transpose(0, 2, 1)
+        poly = mx.addmm(b * xx_t, xx_t, xx_t, alpha=c, beta=1.0)
+        x = mx.addmm(a * x, poly, x, alpha=1.0, beta=1.0)
+    if transposed:
+        x = x.transpose(0, 2, 1)
+    return x.astype(update.dtype)
+
+
 class DualAdamW:
     """Two AdamW optimizers: one with weight decay on >=2D params, one without."""
 
@@ -107,14 +132,51 @@ class MuonAdamWMLX:
         weight_decay: float,
         betas: tuple[float, float],
         settings: MuonSettings,
+        grouped_muon: bool = False,
+        compile_muon_ns: bool = False,
+        muon_route: str = "all",
     ) -> None:
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.settings = settings
+        self.grouped_muon = grouped_muon
+        self.compile_muon_ns = compile_muon_ns
+        self._compiled_muon_ns = None
+        self._compiled_stacked_muon_ns: dict[tuple[tuple[int, ...], str], object] = {}
+        if self.compile_muon_ns:
+            ns_steps = self.settings.ns_steps
+            ns_coefficients = self.settings.ns_coefficients
+            eps = self.settings.eps
+
+            @mx.compile
+            def _compiled_muon_ns(update: mx.array) -> mx.array:
+                return muon_newton_schulz_mlx(
+                    update,
+                    ns_steps=ns_steps,
+                    ns_coefficients=ns_coefficients,
+                    eps=eps,
+                )
+
+            self._compiled_muon_ns = _compiled_muon_ns
         self.muon_state: dict[str, mx.array] = {}
         param_flat = _flatten_arrays(model.parameters())
+        muon_route = (muon_route or "all").lower()
+
+        def _route_allows(name: str) -> bool:
+            if muon_route == "all":
+                return True
+            if muon_route == "mlp":
+                return ".mlp." in name
+            if muon_route == "attn":
+                return ".attn." in name
+            if muon_route == "none":
+                return False
+            return True
+
         self.muon_names = [
-            name for name, param in param_flat.items() if is_muon_parameter_name(name, len(param.shape))
+            name
+            for name, param in param_flat.items()
+            if is_muon_parameter_name(name, len(param.shape)) and _route_allows(name)
         ]
         self.aux_decay_names = [
             name for name, param in param_flat.items() if name not in self.muon_names and len(param.shape) >= 2
@@ -144,6 +206,10 @@ class MuonAdamWMLX:
             nodecay_grads = _subset_tree_by_names(grads, set(self.aux_nodecay_names))
             self.aux_nodecay.update(model, nodecay_grads)
 
+        if self.grouped_muon:
+            self._update_muon_grouped(model, grad_flat, param_flat)
+            return
+
         updates: dict[str, mx.array] = {}
         for name in self.muon_names:
             grad = grad_flat.get(name)
@@ -164,29 +230,111 @@ class MuonAdamWMLX:
         if updates:
             model.update(tree_unflatten(list(updates.items())))
 
+    def _update_muon_grouped(self, model, grad_flat: dict[str, mx.array], param_flat: dict[str, mx.array]) -> None:
+        bases: dict[str, mx.array] = {}
+        grouped: dict[tuple[tuple[int, int], str, float], list[tuple[str, int | None, mx.array, object]]] = {}
+        for name in self.muon_names:
+            grad = grad_flat.get(name)
+            param = param_flat.get(name)
+            if grad is None or param is None:
+                continue
+            momentum = self.muon_state.get(name)
+            if momentum is None:
+                momentum = mx.zeros_like(param)
+            momentum = momentum * self.settings.momentum + grad
+            self.muon_state[name] = momentum
+            update = grad + momentum * self.settings.momentum if self.settings.nesterov else momentum
+            next_param = param
+            if self.weight_decay:
+                next_param = next_param * (1.0 - self.learning_rate * self.weight_decay)
+            bases[name] = next_param
+
+            if self.settings.qkv_split and is_qkv_parameter_name(name) and update.shape[0] % 3 == 0:
+                for chunk_idx, chunk in enumerate(mx.split(update, 3, axis=0)):
+                    lr = adjusted_muon_lr(
+                        self.learning_rate, tuple(chunk.shape), self.settings.adjust_lr_fn
+                    )
+                    key = (tuple(chunk.shape), str(param.dtype), float(lr))
+                    grouped.setdefault(key, []).append((name, chunk_idx, chunk, param.dtype))
+            else:
+                lr = adjusted_muon_lr(
+                    self.learning_rate, tuple(update.shape), self.settings.adjust_lr_fn
+                )
+                key = (tuple(update.shape), str(param.dtype), float(lr))
+                grouped.setdefault(key, []).append((name, None, update, param.dtype))
+
+        updates: dict[str, mx.array] = {}
+        qkv_updates: dict[str, list[mx.array | None]] = {}
+        for (_, _, lr), records in grouped.items():
+            stacked = mx.stack([record[2] for record in records])
+            orthogonal = self._newton_schulz_stacked(stacked)
+            for idx, (name, chunk_idx, _, dtype) in enumerate(records):
+                update_piece = orthogonal[idx].astype(dtype) * lr
+                if chunk_idx is None:
+                    updates[name] = bases[name] - update_piece
+                else:
+                    pieces = qkv_updates.setdefault(name, [None, None, None])
+                    pieces[chunk_idx] = update_piece
+
+        for name, pieces in qkv_updates.items():
+            if any(piece is None for piece in pieces):
+                raise RuntimeError(f"incomplete grouped qkv update for {name}")
+            updates[name] = bases[name] - mx.concatenate(pieces, axis=0)
+
+        if updates:
+            model.update(tree_unflatten(list(updates.items())))
+
     def _orthogonal_update(self, name: str, update: mx.array, dtype) -> mx.array:
         if self.settings.qkv_split and is_qkv_parameter_name(name) and update.shape[0] % 3 == 0:
             pieces = []
             for chunk in mx.split(update, 3, axis=0):
-                orthogonal = muon_newton_schulz_mlx(
-                    chunk,
-                    ns_steps=self.settings.ns_steps,
-                    ns_coefficients=self.settings.ns_coefficients,
-                    eps=self.settings.eps,
-                ).astype(dtype)
+                orthogonal = self._newton_schulz(chunk).astype(dtype)
                 chunk_lr = adjusted_muon_lr(
                     self.learning_rate, tuple(chunk.shape), self.settings.adjust_lr_fn
                 )
                 pieces.append(orthogonal * chunk_lr)
             return mx.concatenate(pieces, axis=0)
-        orthogonal = muon_newton_schulz_mlx(
+        orthogonal = self._newton_schulz(update).astype(dtype)
+        return orthogonal * adjusted_muon_lr(
+            self.learning_rate, tuple(update.shape), self.settings.adjust_lr_fn
+        )
+
+    def _newton_schulz(self, update: mx.array) -> mx.array:
+        if self._compiled_muon_ns is not None:
+            return self._compiled_muon_ns(update)
+        return muon_newton_schulz_mlx(
             update,
             ns_steps=self.settings.ns_steps,
             ns_coefficients=self.settings.ns_coefficients,
             eps=self.settings.eps,
-        ).astype(dtype)
-        return orthogonal * adjusted_muon_lr(
-            self.learning_rate, tuple(update.shape), self.settings.adjust_lr_fn
+        )
+
+    def _newton_schulz_stacked(self, update: mx.array) -> mx.array:
+        if self.compile_muon_ns:
+            key = (tuple(int(dim) for dim in update.shape), str(update.dtype))
+            compiled = self._compiled_stacked_muon_ns.get(key)
+            if compiled is None:
+                ns_steps = self.settings.ns_steps
+                ns_coefficients = self.settings.ns_coefficients
+                eps = self.settings.eps
+
+                @mx.compile
+                def _compiled_stacked_muon_ns(stacked_update: mx.array) -> mx.array:
+                    return _muon_newton_schulz_stacked_mlx(
+                        stacked_update,
+                        ns_steps=ns_steps,
+                        ns_coefficients=ns_coefficients,
+                        eps=eps,
+                    )
+
+                compiled = _compiled_stacked_muon_ns
+                self._compiled_stacked_muon_ns[key] = compiled
+            return compiled(update)
+        return _muon_newton_schulz_stacked_mlx(
+            update,
+            ns_steps=self.settings.ns_steps,
+            ns_coefficients=self.settings.ns_coefficients,
+            eps=self.settings.eps,
         )
 
     def state_trees(self) -> dict:
@@ -226,4 +374,7 @@ def configure_mlx_optimizer(
         weight_decay=weight_decay,
         betas=(0.9, 0.95),
         settings=muon_settings_from_config(config),
+        grouped_muon=bool(getattr(config, "grouped_muon", False)),
+        compile_muon_ns=bool(getattr(config, "compile_muon_ns", False)),
+        muon_route=str(getattr(config, "muon_route", "all")),
     )

@@ -55,11 +55,22 @@ class SpakieConfig:
     norm_type: str = _D.get("norm_type", "layernorm")
     loss_layout: str = _D.get("loss_layout", "flat")
     residual_type: str = _D.get("residual_type", "serial")
+    attention_backend: str = _D.get("attention_backend", "sdpa")
     swiglu_hidden: int = _D.get("swiglu_hidden", 0)
     max_seq_len: int = _D["max_seq_len"]
     dropout: float = _D["dropout"]
     bias: bool = _D["bias"]
     activation_checkpointing: bool = _D["activation_checkpointing"]
+    mlp_checkpointing: bool = _D.get("mlp_checkpointing", False)
+    compact_valid_mlp: bool = _D.get("compact_valid_mlp", False)
+    compact_valid_projections: bool = _D.get("compact_valid_projections", False)
+    addmm_residual_projections: bool = _D.get("addmm_residual_projections", False)
+    mlp_addmm_linears: bool = _D.get("mlp_addmm_linears", False)
+    fused_residual_rmsnorm: bool = _D.get("fused_residual_rmsnorm", False)
+    grouped_muon: bool = _D.get("grouped_muon", False)
+    compile_muon_ns: bool = _D.get("compile_muon_ns", False)
+    muon_route: str = _D.get("muon_route", "all")
+    contiguous_linear_inputs: bool = _D.get("contiguous_linear_inputs", False)
     # When > 0 and < B*T, compute logits + cross-entropy in chunks of this many
     # tokens during training, avoiding the (B*T, vocab_size) materialization.
     # 0 disables chunking. Only used in the MLX backend's training path.
@@ -80,6 +91,7 @@ class SpakieConfig:
     pretrain_optimizer: str = _D["pretrain_optimizer"]
     pretrain_lr_schedule: str = _D.get("pretrain_lr_schedule", "cosine")
     pretrain_trapezoid_decay_frac: float = _D.get("pretrain_trapezoid_decay_frac", 0.2)
+    pretrain_vmap_accum_step: bool = _D.get("pretrain_vmap_accum_step", False)
 
     # SFT
     sft_batch_size: int = _D["sft_batch_size"]
@@ -190,6 +202,12 @@ class SpakieConfig:
         self.residual_type = (self.residual_type or "serial").lower()
         if self.residual_type not in {"serial", "parallel"}:
             raise ValueError("residual_type must be 'serial' or 'parallel'")
+        self.attention_backend = (self.attention_backend or "sdpa").lower()
+        if self.attention_backend not in {"sdpa", "mfa", "mfa-varlen"}:
+            raise ValueError("attention_backend must be 'sdpa', 'mfa', or 'mfa-varlen'")
+        self.muon_route = (self.muon_route or "all").lower()
+        if self.muon_route not in {"all", "mlp", "attn", "none"}:
+            raise ValueError("muon_route must be 'all', 'mlp', 'attn', or 'none'")
         if self.swiglu_hidden < 0:
             raise ValueError("swiglu_hidden must be >= 0")
         self.target_processed_tokens = derive_processed_token_target(self.target_train_tokens, self.train_split_fraction)

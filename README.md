@@ -81,15 +81,19 @@ Default runtime behavior:
 - `--device auto` prefers `cuda`, then `mps`, then `cpu`
 - `--precision auto` resolves to `bf16` on CUDA, `bf16` on MPS, and `fp32` on CPU
 
-MLX training and fine-tuning support:
+Common MLX runtime flags:
 
 ```bash
 --mlx-compile / --no-mlx-compile
 --mlx-prefetch / --no-mlx-prefetch
 --mlx-memory-gb <value>
 --mlx-wired-gb <value>
+--mlx-cache-gb <value>
 --mlx-profile
 ```
+
+MLX pretraining also supports `--mlx-vmap-accum-step /
+--no-mlx-vmap-accum-step`.
 
 ## Data Sources
 
@@ -195,6 +199,12 @@ Useful SFT options:
 --no-model-prompt
 ```
 
+On MLX, SFT batches are length-bucketed with right-padding bucket trim by
+default. This keeps the transformer math dense and unchanged while avoiding a
+large amount of padded-token work on chat datasets. The conservative defaults
+are `--sft-sampler sortish`, `--sft-bucket-multiple 128`, and no SFT packing or
+varlen attention.
+
 `prepare_sft.py` also adds a small repeated assistant-behavior seed set by
 default. This anchors greetings, identity questions, and simple factual answers
 so a lightly fine-tuned model is less likely to continue pretraining-style web
@@ -260,13 +270,13 @@ The repo currently supports these presets:
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
 | `92m` | 12 | 768 | 12 | 12 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
 | `180m` | 16 | 896 | 14 | 2 | SwiGLU hidden 2048 | 96 | 2 | 32 | 4 | Mid-size MLX-optimized preset |
-| `300m` | 24 | 1024 | 16 | 16 | GELU `d_ff=4096` | 64 | 2 | 16 | 2 | Config and pipeline default preset |
+| `300m` | 10 | 1280 | 20 | 20 | GELU `d_ff=9088` | 64 | 3 | 16 | 2 | Config and pipeline default preset; MLX pretrain vmap accumulation enabled; MLX SFT uses sortish length buckets with padding trim |
 
 Shared model defaults:
 
 - `vocab_size = 16384`
 - `max_seq_len = 512`
-- `dropout = 0.1`
+- `dropout = 0.0`
 - `bias = false`
 - learned positional embeddings
 - weight-tied LM head

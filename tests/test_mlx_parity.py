@@ -187,6 +187,36 @@ class TorchMLXForwardParityTests(unittest.TestCase):
             self.assertEqual(tuple(v.shape), (1, n_kv_heads, prompt.shape[1] + 1, config.d_model // config.n_heads))
         mx.eval(*next_cache_tensors)
 
+    def test_packed_segments_match_separate_mlx_logits(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        mlx_model = SpakieGPTMLX(config)
+        mlx_model.eval()
+
+        first = np.array([[3, 7, 11, 2]], dtype=np.int32)
+        second = np.array([[5, 9, 13]], dtype=np.int32)
+        packed = np.array([[3, 7, 11, 2, 5, 9, 13]], dtype=np.int32)
+        segments = np.array([[0, 0, 0, 0, 1, 1, 1]], dtype=np.int32)
+        positions = np.array([[0, 1, 2, 3, 0, 1, 2]], dtype=np.int32)
+
+        first_logits, _, _ = mlx_model(mx.array(first))
+        second_logits, _, _ = mlx_model(mx.array(second))
+        packed_logits, _, _ = mlx_model(
+            mx.array(packed),
+            segment_ids=mx.array(segments),
+            position_ids=mx.array(positions),
+        )
+        mx.eval(first_logits, second_logits, packed_logits)
+
+        first_np = np.asarray(first_logits.astype(mx.float32))
+        second_np = np.asarray(second_logits.astype(mx.float32))
+        packed_np = np.asarray(packed_logits.astype(mx.float32))
+        self.assertLess(np.max(np.abs(first_np[0] - packed_np[0, :4])), 1e-5)
+        self.assertLess(np.max(np.abs(second_np[0] - packed_np[0, 4:7])), 1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

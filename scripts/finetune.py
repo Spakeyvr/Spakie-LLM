@@ -33,6 +33,7 @@ def apply_optimizer_args(config, args) -> None:
     config.muon_momentum = args.muon_momentum
     config.muon_nesterov = args.muon_nesterov
     config.muon_qkv_split = args.muon_qkv_split
+    config.grouped_muon = args.grouped_muon
 
 
 def print_optimizer_banner(kind: str, *, stage: str) -> None:
@@ -292,13 +293,40 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     from model.transformer_mlx import SpakieGPTMLX
     from runtime.mlx_backend import configure_metal_limits, load_safetensors, resolve_mlx_runtime
     from tokenizer.train_tokenizer import SpakieTokenizer
-    from training.dataset_mlx import ChatSFTDatasetMLX, SubsetView, train_val_split_mlx
+    from training.dataset_mlx import (
+        ChatSFTDatasetMLX,
+        PretokenizedChatSFTDatasetMLX,
+        SubsetView,
+        train_val_split_mlx,
+    )
     from training.finetune_mlx import finetune_mlx
 
+    if args.attention_backend is not None:
+        config.attention_backend = args.attention_backend
+    if args.mlp_checkpointing is not None:
+        config.mlp_checkpointing = args.mlp_checkpointing
+    if args.compact_valid_mlp is not None:
+        config.compact_valid_mlp = args.compact_valid_mlp
+    if args.compact_valid_projections is not None:
+        config.compact_valid_projections = args.compact_valid_projections
+    if args.addmm_residual_projections is not None:
+        config.addmm_residual_projections = args.addmm_residual_projections
+    if args.contiguous_linear_inputs is not None:
+        config.contiguous_linear_inputs = args.contiguous_linear_inputs
+    if (
+        args.attention_backend is not None
+        or args.mlp_checkpointing is not None
+        or args.compact_valid_mlp is not None
+        or args.compact_valid_projections is not None
+        or args.addmm_residual_projections is not None
+        or args.contiguous_linear_inputs is not None
+    ):
+        config.refresh_derived_fields()
     runtime = resolve_mlx_runtime(args.precision)
     applied_limits = configure_metal_limits(
         max_gb=args.mlx_memory_gb if args.mlx_memory_gb > 0 else None,
         wired_gb=args.mlx_wired_gb if args.mlx_wired_gb > 0 else None,
+        cache_gb=args.mlx_cache_gb if args.mlx_cache_gb >= 0 else None,
     )
     print(f"Backend: mlx")
     print(f"Device: metal (mlx)")
@@ -306,7 +334,30 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     print(f"Preset: {config.preset_name}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print_optimizer_banner(config.sft_optimizer, stage="SFT")
-    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | Profile: {args.mlx_profile}")
+    print(
+        f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | "
+        f"Profile: {args.mlx_profile}"
+    )
+    print(
+        "Microbatch eval: "
+        f"loss={args.mlx_eval_microbatch_loss} | "
+        f"defer_final={args.mlx_defer_final_microbatch_eval}"
+    )
+    print(
+        f"SFT bucket multiple: {args.sft_bucket_multiple} | "
+        f"SFT length bucket size: {args.sft_length_bucket_size} | "
+        f"SFT sampler: {args.sft_sampler} | "
+        f"Pack SFT: {args.sft_pack} | "
+        f"Gather SFT loss: {args.sft_gather_loss} | "
+        f"Pretokenize SFT: {args.pretokenize_sft} | "
+        f"Async step eval: {args.mlx_async_step_eval}"
+    )
+    print(f"Attention backend: {config.attention_backend}")
+    print(f"MLP checkpointing: {config.mlp_checkpointing}")
+    print(f"Compact valid MLP: {config.compact_valid_mlp}")
+    print(f"Compact valid projections: {config.compact_valid_projections}")
+    print(f"Addmm residual projections: {config.addmm_residual_projections}")
+    print(f"Contiguous linear inputs: {config.contiguous_linear_inputs}")
     if applied_limits:
         human_limits = ", ".join(
             f"{k}={v / (1024 ** 3):.1f}GB" for k, v in applied_limits.items()
@@ -344,6 +395,13 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         dataset = SubsetView(dataset, range(min(args.max_examples, len(dataset))))
     elif args.smoke:
         dataset = SubsetView(dataset, range(min(512, len(dataset))))
+    if args.pretokenize_sft:
+        print("Pretokenizing SFT dataset into in-memory NumPy arrays...")
+        try:
+            dataset = PretokenizedChatSFTDatasetMLX(dataset)
+        except KeyboardInterrupt:
+            print("\nInterrupted while pretokenizing SFT dataset.")
+            sys.exit(130)
     print(f"SFT examples: {len(dataset)}")
 
     train_idx, val_idx = train_val_split_mlx(dataset)
@@ -363,6 +421,16 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
             use_compile=args.mlx_compile,
             use_prefetch=args.mlx_prefetch,
             profile=args.mlx_profile,
+            eval_microbatch_loss=args.mlx_eval_microbatch_loss,
+            defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
+            sft_pack=args.sft_pack,
+            sft_gather_loss=args.sft_gather_loss,
+            sft_bucket_multiple=args.sft_bucket_multiple,
+            sft_length_bucket_size=args.sft_length_bucket_size,
+            sft_sampler=args.sft_sampler,
+            async_step_eval=args.mlx_async_step_eval,
+            max_steps=args.max_steps,
+            loss_log_path=args.loss_log,
         )
     except Exception as exc:
         if config.sft_optimizer == "muon" and args.allow_adamw_fallback:
@@ -379,6 +447,16 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
                 use_compile=args.mlx_compile,
                 use_prefetch=args.mlx_prefetch,
                 profile=args.mlx_profile,
+                eval_microbatch_loss=args.mlx_eval_microbatch_loss,
+                defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
+                sft_pack=args.sft_pack,
+                sft_gather_loss=args.sft_gather_loss,
+                sft_bucket_multiple=args.sft_bucket_multiple,
+                sft_length_bucket_size=args.sft_length_bucket_size,
+                sft_sampler=args.sft_sampler,
+                async_step_eval=args.mlx_async_step_eval,
+                max_steps=args.max_steps,
+                loss_log_path=args.loss_log,
             )
         else:
             raise
@@ -399,6 +477,18 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="Run a one-epoch subset smoke test")
     parser.add_argument("--max-examples", type=int, default=0, help="Optional cap on loaded SFT examples")
     parser.add_argument("--epochs", type=int, default=0, help="Override number of SFT epochs")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="Stop MLX SFT after this many optimizer steps (0 = full epochs)",
+    )
+    parser.add_argument(
+        "--loss-log",
+        type=str,
+        default="",
+        help="Optional CSV path for MLX SFT per-optimizer-step training loss",
+    )
     parser.add_argument("--lr", type=float, default=0.0, help="Override SFT learning rate")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
@@ -442,6 +532,12 @@ def main():
         help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently",
     )
     parser.add_argument(
+        "--grouped-muon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Batch same-shape MLX Muon Newton-Schulz updates across layers",
+    )
+    parser.add_argument(
         "--mlx-compile",
         dest="mlx_compile",
         action=argparse.BooleanOptionalAction,
@@ -469,11 +565,111 @@ def main():
         help="Collect rolling MLX timing buckets and print them at epoch boundaries",
     )
     parser.add_argument(
+        "--mlx-eval-microbatch-loss",
+        dest="mlx_eval_microbatch_loss",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the scalar loss in each MLX microbatch materialization",
+    )
+    parser.add_argument(
+        "--mlx-defer-final-microbatch-eval",
+        dest="mlx_defer_final_microbatch_eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip microbatch async_eval on the final microbatch before optimizer sync",
+    )
+    parser.add_argument(
+        "--sft-bucket-multiple",
+        type=int,
+        default=128,
+        help="Round trimmed SFT sequence length up to this multiple",
+    )
+    parser.add_argument(
+        "--sft-length-bucket-size",
+        type=int,
+        default=2048,
+        help="Number of examples per SFT sortish length bucket",
+    )
+    parser.add_argument(
+        "--sft-sampler",
+        choices=("sortish", "sorted", "homogeneous-step-sorted"),
+        default="sortish",
+        help="SFT length sampler: sortish buckets, globally sorted shuffled batches, or same-shape optimizer-step groups",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=("sdpa", "mfa", "mfa-varlen"),
+        default=None,
+        help="Override MLX attention backend",
+    )
+    parser.add_argument(
+        "--mlp-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Checkpoint only MLP submodules during MLX training",
+    )
+    parser.add_argument(
+        "--compact-valid-mlp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run MLX SFT MLP submodules only on fixed-shape non-padding rows",
+    )
+    parser.add_argument(
+        "--compact-valid-projections",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run MLX SFT QKV/out projections only on fixed-shape non-padding rows",
+    )
+    parser.add_argument(
+        "--addmm-residual-projections",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Fuse residual adds into MLX attention/MLP output projections with mx.addmm",
+    )
+    parser.add_argument(
+        "--contiguous-linear-inputs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force row-contiguous inputs before large MLX linear projections",
+    )
+    parser.add_argument(
+        "--sft-pack",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pack logical SFT batches into fewer block-causal physical rows",
+    )
+    parser.add_argument(
+        "--sft-gather-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute SFT vocabulary loss only on supervised target positions",
+    )
+    parser.add_argument(
+        "--pretokenize-sft",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Cache MLX SFT input/label arrays in memory before fine-tuning",
+    )
+    parser.add_argument(
+        "--mlx-async-step-eval",
+        dest="mlx_async_step_eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use mx.async_eval after each MLX optimizer step",
+    )
+    parser.add_argument(
         "--mlx-wired-gb",
         dest="mlx_wired_gb",
         type=float,
         default=0.0,
         help="Set the MLX Metal wired-memory limit in GB (0 = leave default)",
+    )
+    parser.add_argument(
+        "--mlx-cache-gb",
+        dest="mlx_cache_gb",
+        type=float,
+        default=-1.0,
+        help="Set the MLX Metal cache limit in GB (-1 = leave default, 0 = disable cache)",
     )
     args = parser.parse_args()
 

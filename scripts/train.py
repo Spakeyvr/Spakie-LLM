@@ -26,6 +26,8 @@ def apply_optimizer_args(config, args) -> None:
     config.muon_momentum = args.muon_momentum
     config.muon_nesterov = args.muon_nesterov
     config.muon_qkv_split = args.muon_qkv_split
+    config.grouped_muon = args.grouped_muon
+    config.contiguous_linear_inputs = args.contiguous_linear_inputs
 
 
 def optimizer_kind_from_resume_state(resume_state, *, backend: str) -> str:
@@ -142,8 +144,11 @@ def run_torch_pretrain(args, config):
     print(f"Preset: {config.preset_name}")
     print(f"Attention KV heads: {config.n_kv_heads or config.n_heads}/{config.n_heads}")
     print(f"MLP: {config.mlp_type}")
+    print(f"Loss layout: {config.loss_layout}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
+    print(f"Pretrain batch size: {config.pretrain_batch_size}")
+    print(f"Pretrain grad accum: {config.pretrain_grad_accum_steps}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
     print(f"Max steps: {config.pretrain_max_steps:,}")
     print(f"DataLoader workers: {args.num_workers}")
@@ -246,6 +251,7 @@ def run_mlx_pretrain(args, config):
     applied_limits = configure_metal_limits(
         max_gb=args.mlx_memory_gb if args.mlx_memory_gb > 0 else None,
         wired_gb=args.mlx_wired_gb if args.mlx_wired_gb > 0 else None,
+        cache_gb=args.mlx_cache_gb if args.mlx_cache_gb >= 0 else None,
     )
     print(f"Backend: mlx")
     print(f"Device: metal (mlx)")
@@ -253,12 +259,22 @@ def run_mlx_pretrain(args, config):
     print(f"Preset: {config.preset_name}")
     print(f"Attention KV heads: {config.n_kv_heads or config.n_heads}/{config.n_heads}")
     print(f"MLP: {config.mlp_type}")
+    print(f"Loss layout: {config.loss_layout}")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print(f"Tokens/step: {config.pretrain_tokens_per_step():,}")
     print(f"Target train tokens: {config.pretrain_target_tokens:,}")
     print(f"Max steps: {config.pretrain_max_steps:,}")
     print_optimizer_banner(config.pretrain_optimizer, stage="Pretraining")
-    print(f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | Profile: {args.mlx_profile}")
+    print(
+        f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | "
+        f"Profile: {args.mlx_profile} | VMap accum: {args.mlx_vmap_accum_step}"
+    )
+    print(
+        "Microbatch eval: "
+        f"loss={args.mlx_eval_microbatch_loss} | "
+        f"loss_final={args.mlx_eval_loss_final_microbatch} | "
+        f"defer_final={args.mlx_defer_final_microbatch_eval}"
+    )
     if applied_limits:
         human_limits = ", ".join(
             f"{k}={v / (1024 ** 3):.1f}GB" for k, v in applied_limits.items()
@@ -321,6 +337,10 @@ def run_mlx_pretrain(args, config):
             use_compile=args.mlx_compile,
             use_prefetch=args.mlx_prefetch,
             profile=args.mlx_profile,
+            eval_microbatch_loss=args.mlx_eval_microbatch_loss,
+            eval_loss_final_microbatch=args.mlx_eval_loss_final_microbatch,
+            defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
+            use_vmap_accum_step=args.mlx_vmap_accum_step,
         )
     except Exception as exc:
         if config.pretrain_optimizer == "muon" and args.allow_adamw_fallback:
@@ -337,6 +357,10 @@ def run_mlx_pretrain(args, config):
                 use_compile=args.mlx_compile,
                 use_prefetch=args.mlx_prefetch,
                 profile=args.mlx_profile,
+                eval_microbatch_loss=args.mlx_eval_microbatch_loss,
+                eval_loss_final_microbatch=args.mlx_eval_loss_final_microbatch,
+                defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
+                use_vmap_accum_step=args.mlx_vmap_accum_step,
             )
         else:
             raise
@@ -344,7 +368,7 @@ def run_mlx_pretrain(args, config):
 
 def main():
     parser = argparse.ArgumentParser(description="CLI entry point for pretraining")
-    parser.add_argument("--preset", type=str, default="92m", help="Model preset to use (92m or 180m)")
+    parser.add_argument("--preset", type=str, default="92m", help="Model preset to use (92m, 180m, or 300m)")
     parser.add_argument("--backend", choices=("torch", "mlx"), default="mlx",
                         help="Training backend — mlx (Apple Silicon) or torch (MPS/CUDA/CPU)")
     parser.add_argument("--smoke", action="store_true", help="Run a short 100-step smoke test")
@@ -357,6 +381,24 @@ def main():
         help="Override the pretraining token budget",
     )
     parser.add_argument("--max-steps", type=int, default=0, help="Override max training steps")
+    parser.add_argument(
+        "--pretrain-batch-size",
+        type=int,
+        default=0,
+        help="Override pretraining microbatch size",
+    )
+    parser.add_argument(
+        "--pretrain-grad-accum",
+        type=int,
+        default=0,
+        help="Override pretraining gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--pretrain-warmup-steps",
+        type=int,
+        default=0,
+        help="Override pretraining LR warmup steps",
+    )
     parser.add_argument(
         "--additional-steps",
         type=int,
@@ -425,6 +467,12 @@ def main():
         default=-1.0,
         help="Fraction of training at the end used for linear decay (trapezoid schedule)",
     )
+    parser.add_argument(
+        "--loss-layout",
+        choices=("flat", "3d", "custom"),
+        default="",
+        help="Override MLX training loss layout",
+    )
     parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
     parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum")
     parser.add_argument(
@@ -440,6 +488,18 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently",
+    )
+    parser.add_argument(
+        "--grouped-muon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Batch same-shape MLX Muon Newton-Schulz updates across layers",
+    )
+    parser.add_argument(
+        "--contiguous-linear-inputs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force row-contiguous inputs before large MLX linear projections",
     )
     parser.add_argument(
         "--mlx-compile",
@@ -469,11 +529,46 @@ def main():
         help="Collect rolling MLX timing buckets and print them at eval boundaries",
     )
     parser.add_argument(
+        "--mlx-eval-microbatch-loss",
+        dest="mlx_eval_microbatch_loss",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the scalar loss in each MLX microbatch materialization",
+    )
+    parser.add_argument(
+        "--mlx-eval-loss-final-microbatch",
+        dest="mlx_eval_loss_final_microbatch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --no-mlx-eval-microbatch-loss is used, include loss only on final microbatch eval",
+    )
+    parser.add_argument(
+        "--mlx-defer-final-microbatch-eval",
+        dest="mlx_defer_final_microbatch_eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip microbatch async_eval on the final microbatch before optimizer sync",
+    )
+    parser.add_argument(
+        "--mlx-vmap-accum-step",
+        dest="mlx_vmap_accum_step",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Vectorize pretrain gradient accumulation into one MLX value_and_grad call (default: preset config)",
+    )
+    parser.add_argument(
         "--mlx-wired-gb",
         dest="mlx_wired_gb",
         type=float,
         default=0.0,
         help="Set the MLX Metal wired-memory limit in GB (0 = leave default)",
+    )
+    parser.add_argument(
+        "--mlx-cache-gb",
+        dest="mlx_cache_gb",
+        type=float,
+        default=-1.0,
+        help="Set the MLX Metal cache limit in GB (-1 = leave default, 0 = disable cache)",
     )
     args = parser.parse_args()
 
@@ -483,6 +578,18 @@ def main():
         config.pretrain_lr_schedule = args.lr_schedule
     if args.trapezoid_decay_frac >= 0:
         config.pretrain_trapezoid_decay_frac = args.trapezoid_decay_frac
+    if args.loss_layout:
+        config.loss_layout = args.loss_layout
+    if args.pretrain_batch_size > 0:
+        config.pretrain_batch_size = args.pretrain_batch_size
+    if args.pretrain_grad_accum > 0:
+        config.pretrain_grad_accum_steps = args.pretrain_grad_accum
+    if args.pretrain_batch_size > 0 or args.pretrain_grad_accum > 0:
+        config.refresh_derived_fields()
+    if args.pretrain_warmup_steps > 0:
+        config.pretrain_warmup_steps = args.pretrain_warmup_steps
+    if args.mlx_vmap_accum_step is None:
+        args.mlx_vmap_accum_step = bool(getattr(config, "pretrain_vmap_accum_step", False))
     if args.output_dir:
         config.checkpoint_dir = args.output_dir
     if args.eval_interval > 0:

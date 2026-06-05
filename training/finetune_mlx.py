@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import time
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,14 +22,20 @@ from runtime.mlx_backend import (
     save_meta_json,
 )
 from training.dataset_mlx import (
+    append_packed_varlen_attention_metadata,
+    append_supervised_loss_indices,
+    append_valid_token_indices,
+    HomogeneousStepSortedBatchSamplerMLX,
     LengthBucketBatchSamplerMLX,
+    pack_sft_batch,
     sequence_lengths,
+    SortedLengthBatchSamplerMLX,
     stack_batch,
     trim_right_padding_bucket,
 )
 from training.mlx_profile import MLXProfile, now
 from training.optimizers_mlx import configure_mlx_optimizer
-from training.pretrain_mlx import _accum_grads, _arrays_to_mx, _build_microbatch_step
+from training.pretrain_mlx import _accum_grads, _build_microbatch_step
 from training.prefetch_mlx import BatchPrefetcher
 
 
@@ -79,6 +86,16 @@ def finetune_mlx(
     use_compile: bool = True,
     use_prefetch: bool = True,
     profile: bool = False,
+    eval_microbatch_loss: bool = True,
+    defer_final_microbatch_eval: bool = False,
+    sft_pack: bool = False,
+    sft_gather_loss: bool = False,
+    sft_bucket_multiple: int = 128,
+    sft_length_bucket_size: int = 2048,
+    sft_sampler: str = "sortish",
+    async_step_eval: bool = False,
+    max_steps: int = 0,
+    loss_log_path: str | None = None,
 ) -> float:
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)
@@ -93,9 +110,28 @@ def finetune_mlx(
     )
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
-    train_sampler = LengthBucketBatchSamplerMLX(
-        sequence_lengths(train_dataset), config.sft_batch_size, drop_last=True, seed=0
-    )
+    lengths = sequence_lengths(train_dataset)
+    if sft_sampler == "homogeneous-step-sorted":
+        train_sampler = HomogeneousStepSortedBatchSamplerMLX(
+            lengths,
+            config.sft_batch_size,
+            config.sft_grad_accum_steps,
+            bucket_multiple=sft_bucket_multiple,
+            drop_last=True,
+            seed=0,
+        )
+    elif sft_sampler == "sorted":
+        train_sampler = SortedLengthBatchSamplerMLX(
+            lengths, config.sft_batch_size, drop_last=True, seed=0
+        )
+    else:
+        train_sampler = LengthBucketBatchSamplerMLX(
+            lengths,
+            config.sft_batch_size,
+            bucket_size=max(config.sft_batch_size, sft_length_bucket_size),
+            drop_last=True,
+            seed=0,
+        )
     steps_per_epoch = len(train_dataset) // config.sft_batch_size
     total_steps = max(1, (steps_per_epoch * config.sft_epochs) // config.sft_grad_accum_steps)
 
@@ -103,12 +139,53 @@ def finetune_mlx(
     patience_counter = 0
     global_step = 0
     interrupted = False
+    reached_max_steps = False
     accum_scale = 1.0 / config.sft_grad_accum_steps
     microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
+    varlen_value_and_grad_cache = {}
+
+    def varlen_microbatch_step(batch_mx, cu_key: tuple[int, ...] | None = None):
+        x_arg, y_arg, seg_arg, pos_arg, idx_arg, cu_arg = batch_mx[:6]
+        if cu_key is None:
+            raise RuntimeError("mfa-varlen SFT requires a precomputed static cu-seqlens key")
+        static_cu_key = cu_key
+        step = varlen_value_and_grad_cache.get(static_cu_key)
+        if step is None:
+            def loss_fn(model_mod, x_in, y_in, seg_in, pos_in, idx_in):
+                _, loss, _ = model_mod(
+                    x_in,
+                    y_in,
+                    return_cache=False,
+                    ignore_index=-100,
+                    segment_ids=seg_in,
+                    position_ids=pos_in,
+                    varlen_indices=idx_in,
+                    varlen_cu_seqlens=cu_arg,
+                )
+                return loss * accum_scale
+
+            value_and_grad = nn.value_and_grad(model, loss_fn)
+            if use_compile:
+                @partial(mx.compile, inputs=[model.state], outputs=[model.state])
+                def step(x_in, y_in, seg_in, pos_in, idx_in):
+                    return value_and_grad(model, x_in, y_in, seg_in, pos_in, idx_in)
+            else:
+                def step(x_in, y_in, seg_in, pos_in, idx_in):
+                    return value_and_grad(model, x_in, y_in, seg_in, pos_in, idx_in)
+            varlen_value_and_grad_cache[static_cu_key] = step
+        return step(x_arg, y_arg, seg_arg, pos_arg, idx_arg)
+
     profiler = MLXProfile(enabled=profile)
+    loss_log = None
+    if loss_log_path:
+        os.makedirs(os.path.dirname(loss_log_path) or ".", exist_ok=True)
+        loss_log = open(loss_log_path, "w", encoding="utf-8")
+        loss_log.write("step,loss,lr\n")
 
     try:
         for epoch in range(config.sft_epochs):
+            if reached_max_steps:
+                break
             model.train()
             epoch_loss = 0.0
             n_micro = 0
@@ -136,34 +213,97 @@ def finetune_mlx(
                     batch_indices = next(train_iter)
                 return stack_batch(train_dataset, batch_indices)
 
+            def arrays_to_mx_batch(batch_np):
+                if profiler.enabled:
+                    convert_start = now()
+                batch_mx = tuple(mx.array(array) for array in batch_np)
+                if profiler.enabled:
+                    mx.eval(*batch_mx)
+                    profiler.add("numpy_to_mlx", now() - convert_start)
+                return batch_mx
+
             try:
                 for _ in pbar:
                     if profiler.enabled:
                         batch_start = now()
-                        x_np, y_np = next_batch()
+                        batch_np = next_batch()
                         profiler.add("batch_fetch", now() - batch_start)
                     else:
-                        x_np, y_np = next_batch()
-                    x_np, y_np = trim_right_padding_bucket(x_np, y_np)
-                    x, y = _arrays_to_mx(x_np, y_np, profiler)
+                        batch_np = next_batch()
+                    x_np, y_np = batch_np[:2]
+                    if sft_pack:
+                        if profiler.enabled:
+                            pack_start = now()
+                        x_np, y_np = trim_right_padding_bucket(
+                            x_np, y_np, bucket_multiple=sft_bucket_multiple
+                        )
+                        batch_np = pack_sft_batch(x_np, y_np, max_seq_len=x_np.shape[1])
+                        if profiler.enabled:
+                            profiler.add("sft_pack", now() - pack_start)
+                        if getattr(config, "attention_backend", "sdpa") == "mfa-varlen":
+                            batch_np = append_packed_varlen_attention_metadata(batch_np)
+                        if sft_gather_loss:
+                            batch_np = append_supervised_loss_indices(
+                                batch_np, bucket_multiple=sft_bucket_multiple
+                            )
+                    else:
+                        batch_np = trim_right_padding_bucket(
+                            x_np, y_np, bucket_multiple=sft_bucket_multiple
+                        )
+                        if config.compact_valid_mlp or config.compact_valid_projections:
+                            batch_np = append_valid_token_indices(
+                                batch_np, bucket_multiple=sft_bucket_multiple
+                            )
+                        if sft_gather_loss:
+                            batch_np = append_supervised_loss_indices(
+                                batch_np, bucket_multiple=sft_bucket_multiple
+                            )
+                    use_varlen_step = sft_pack and config.attention_backend == "mfa-varlen"
+                    varlen_cu_key = (
+                        tuple(int(v) for v in batch_np[5])
+                        if use_varlen_step and len(batch_np) >= 6
+                        else None
+                    )
+                    batch_mx = arrays_to_mx_batch(batch_np)
 
                     # Loss-fn has accum_scale baked in.
                     if profiler.enabled:
                         step_start = now()
-                        loss, grads = microbatch_step(x, y)
-                        mx.eval(loss, grads)
+                        loss, grads = (
+                            varlen_microbatch_step(batch_mx, varlen_cu_key)
+                            if use_varlen_step
+                            else microbatch_step(*batch_mx)
+                        )
+                        if eval_microbatch_loss:
+                            mx.eval(loss, grads)
+                        else:
+                            mx.eval(grads)
                         profiler.add("forward_backward", now() - step_start)
                     else:
-                        loss, grads = microbatch_step(x, y)
+                        loss, grads = (
+                            varlen_microbatch_step(batch_mx, varlen_cu_key)
+                            if use_varlen_step
+                            else microbatch_step(*batch_mx)
+                        )
                     accum_grads = _accum_grads(accum_grads, grads)
                     # loss is pre-scaled by accum_scale; sum lazily and only
                     # materialize at end of the optimizer step (or for postfix
                     # every accum_steps microbatches). Avoids forcing a CPU↔GPU
                     # sync between microbatches.
                     accum_loss_lazy = accum_loss_lazy + loss.astype(mx.float32)
-                    mx.async_eval(accum_grads, accum_loss_lazy)
                     n_micro += 1
                     micro_in_step += 1
+                    should_eval_microbatch = not (
+                        defer_final_microbatch_eval
+                        and micro_in_step == config.sft_grad_accum_steps
+                    )
+                    if should_eval_microbatch:
+                        eval_target = (
+                            (accum_grads, accum_loss_lazy)
+                            if eval_microbatch_loss
+                            else accum_grads
+                        )
+                        mx.async_eval(eval_target)
 
                     if micro_in_step == config.sft_grad_accum_steps:
                         if profiler.enabled:
@@ -186,7 +326,10 @@ def finetune_mlx(
                         )
                         optimizer.set_lr(lr)
                         optimizer.update(model, clipped)
-                        mx.eval(model.parameters(), optimizer.state_trees())
+                        if async_step_eval:
+                            mx.async_eval(model.parameters(), optimizer.state_trees())
+                        else:
+                            mx.eval(model.parameters(), optimizer.state_trees())
                         if profiler.enabled:
                             profiler.add("opt_step", now() - opt_start)
 
@@ -194,17 +337,31 @@ def finetune_mlx(
                         # = mean per-microbatch unscaled loss. Times accum_steps
                         # gives the sum of unscaled losses for this optimizer step,
                         # matching the previous per-microbatch accumulation.
-                        step_sum_loss = float(accum_loss_lazy.item()) * config.sft_grad_accum_steps
+                        step_mean_loss = float(accum_loss_lazy.item())
+                        step_sum_loss = step_mean_loss * config.sft_grad_accum_steps
                         epoch_loss += step_sum_loss
                         accum_grads = None
                         accum_loss_lazy = mx.array(0.0, dtype=mx.float32)
                         micro_in_step = 0
                         global_step += 1
+                        if loss_log is not None:
+                            loss_log.write(f"{global_step},{step_mean_loss:.8f},{lr:.12g}\n")
+                            loss_log.flush()
                         pbar.set_postfix(loss=f"{epoch_loss / max(n_micro, 1):.4f}")
+                        if max_steps > 0 and global_step >= max_steps:
+                            reached_max_steps = True
+                            break
             finally:
                 if prefetcher is not None:
                     prefetcher.close()
                 pbar.close()
+
+            if reached_max_steps:
+                print(f"Reached max SFT optimizer steps: {global_step}")
+                if profiler.enabled:
+                    print(profiler.format_report(window_label=f"{global_step} optimizer steps"))
+                    profiler.reset()
+                break
 
             # Validation
             if profiler.enabled:
@@ -306,6 +463,10 @@ def finetune_mlx(
 
     if interrupted:
         print(f"SFT stopped early. Best val loss so far: {best_val_loss:.4f}")
+    elif reached_max_steps:
+        print(f"SFT stopped at max_steps={global_step}. Best val loss so far: {best_val_loss:.4f}")
     else:
         print(f"SFT complete. Best val loss: {best_val_loss:.4f}")
+    if loss_log is not None:
+        loss_log.close()
     return best_val_loss

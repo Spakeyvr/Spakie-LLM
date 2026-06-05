@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 PROFILE_BUCKETS = (
     "batch_fetch",
+    "sft_pack",
     "numpy_to_mlx",
     "forward_backward",
     "opt_step",
@@ -17,6 +18,7 @@ PROFILE_BUCKETS = (
 
 PROFILE_LABELS = {
     "batch_fetch": "batch_fetch",
+    "sft_pack": "sft_pack",
     "numpy_to_mlx": "numpy_to_mlx",
     "forward_backward": "forward_backward",
     "opt_step": "opt_step",

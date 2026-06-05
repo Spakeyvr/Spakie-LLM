@@ -52,6 +52,7 @@ defaults:
   pretrain_eval_batches: 20
   pretrain_patience: 5
   pretrain_optimizer: muon
+  pretrain_vmap_accum_step: false
   # Learning-rate schedule. "trapezoid" (default) is warmup -> constant-at-peak
   # -> linear-decay (tail controlled by pretrain_trapezoid_decay_frac); on a
   # controlled synthetic next-token task at 92m (60 steps, 3 seeds) it drove
@@ -172,7 +173,8 @@ presets:
     d_ff: 9088
     activation_checkpointing: false
     pretrain_batch_size: 64
-    pretrain_grad_accum_steps: 2
+    pretrain_grad_accum_steps: 3
+    pretrain_vmap_accum_step: true
     pretrain_lr: 6.0e-4
     pretrain_grad_clip: 0.0
     sft_batch_size: 16

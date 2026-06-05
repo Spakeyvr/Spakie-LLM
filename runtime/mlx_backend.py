@@ -44,7 +44,9 @@ def resolve_mlx_runtime(precision_name: str = "auto") -> MLXRuntimeSettings:
 
 
 def configure_metal_limits(
-    max_gb: float | None = None, wired_gb: float | None = None
+    max_gb: float | None = None,
+    wired_gb: float | None = None,
+    cache_gb: float | None = None,
 ) -> dict[str, int]:
     """Optionally raise Metal memory/wired limits on Apple Silicon.
 
@@ -65,6 +67,11 @@ def configure_metal_limits(
         setter = getattr(mx, "set_wired_limit", mx.metal.set_wired_limit)
         setter(limit)
         applied["wired_limit"] = limit
+    if cache_gb is not None and cache_gb >= 0:
+        limit = int(cache_gb * (1024 ** 3))
+        setter = getattr(mx, "set_cache_limit", mx.metal.set_cache_limit)
+        setter(limit)
+        applied["cache_limit"] = limit
     return applied
 
 

@@ -124,8 +124,91 @@ def _build_loss_and_grad(
     use this for pretraining where targets never contain -100; it avoids
     materializing two extra (B*T) tensors per microbatch.
     """
-    def loss_fn(model, x, y):
-        _, loss, _ = model(x, y, return_cache=False, ignore_index=ignore_index)
+    def loss_fn(model, *batch):
+        if len(batch) == 2:
+            x, y = batch
+            segment_ids = None
+            position_ids = None
+            loss_indices = None
+            loss_targets = None
+            loss_mask = None
+            varlen_indices = None
+            varlen_cu_seqlens = None
+            valid_indices = None
+            valid_mask = None
+        elif len(batch) == 4:
+            x, y = batch[:2]
+            loss_indices = None
+            loss_targets = None
+            loss_mask = None
+            varlen_indices = None
+            varlen_cu_seqlens = None
+            if batch[2].ndim == 1:
+                valid_indices, valid_mask = batch[2], batch[3]
+                segment_ids = None
+                position_ids = None
+            else:
+                segment_ids, position_ids = batch[2], batch[3]
+                valid_indices = None
+                valid_mask = None
+        elif len(batch) == 5:
+            x, y, loss_indices, loss_targets, loss_mask = batch
+            segment_ids = None
+            position_ids = None
+            varlen_indices = None
+            varlen_cu_seqlens = None
+            valid_indices = None
+            valid_mask = None
+        elif len(batch) == 6:
+            x, y, segment_ids, position_ids, varlen_indices, varlen_cu_seqlens = batch
+            loss_indices = None
+            loss_targets = None
+            loss_mask = None
+            valid_indices = None
+            valid_mask = None
+        elif len(batch) == 7:
+            varlen_indices = None
+            varlen_cu_seqlens = None
+            x, y = batch[:2]
+            if batch[2].ndim == 1:
+                valid_indices, valid_mask, loss_indices, loss_targets, loss_mask = batch[2:]
+                segment_ids = None
+                position_ids = None
+            else:
+                segment_ids, position_ids, loss_indices, loss_targets, loss_mask = batch[2:]
+                valid_indices = None
+                valid_mask = None
+        elif len(batch) == 9:
+            (
+                x,
+                y,
+                segment_ids,
+                position_ids,
+                varlen_indices,
+                varlen_cu_seqlens,
+                loss_indices,
+                loss_targets,
+                loss_mask,
+            ) = batch
+            valid_indices = None
+            valid_mask = None
+        else:
+            raise ValueError(f"unsupported MLX training batch with {len(batch)} arrays")
+        _, loss, _ = model(
+            x,
+            y,
+            return_cache=False,
+            ignore_index=ignore_index,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+            loss_indices=loss_indices,
+            loss_targets=loss_targets,
+            loss_mask=loss_mask,
+            varlen_indices=varlen_indices,
+            varlen_cu_seqlens=varlen_cu_seqlens,
+            valid_indices=valid_indices,
+            valid_mask=valid_mask,
+        )
         return loss * accum_scale
 
     return nn.value_and_grad(model, loss_fn)
@@ -150,8 +233,8 @@ def _build_microbatch_step(
     value_and_grad = _build_loss_and_grad(model, accum_scale, ignore_index=ignore_index)
 
     if not compile_step:
-        def step(x, y):
-            return value_and_grad(model, x, y)
+        def step(*batch):
+            return value_and_grad(model, *batch)
         return step
 
     state = [model.state]
@@ -159,8 +242,51 @@ def _build_microbatch_step(
         state.append(mx.random.state)
 
     @partial(mx.compile, inputs=state, outputs=state, shapeless=shapeless)
-    def step(x, y):
-        return value_and_grad(model, x, y)
+    def step(*batch):
+        return value_and_grad(model, *batch)
+
+    return step
+
+
+def _build_vmap_accum_step(
+    model: SpakieGPTMLX,
+    *,
+    compile_step: bool,
+    ignore_index: int | None = -100,
+):
+    """Return a callable `step(xs, ys) -> (loss, grads)` for stacked microbatches.
+
+    `xs` and `ys` have shape (grad_accum, batch, seq). The returned loss is the
+    mean of the per-microbatch mean losses, matching the existing loop that
+    scales each microbatch by 1 / grad_accum before accumulating gradients.
+    """
+
+    def loss_fn(model, xs, ys):
+        def one_loss(x, y):
+            _, loss, _ = model(
+                x,
+                y,
+                return_cache=False,
+                ignore_index=ignore_index,
+            )
+            return loss
+
+        return mx.vmap(one_loss)(xs, ys).mean()
+
+    value_and_grad = nn.value_and_grad(model, loss_fn)
+
+    if not compile_step:
+        def step(xs, ys):
+            return value_and_grad(model, xs, ys)
+        return step
+
+    state = [model.state]
+    if getattr(model.config, "dropout", 0.0) > 0.0:
+        state.append(mx.random.state)
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(xs, ys):
+        return value_and_grad(model, xs, ys)
 
     return step
 
@@ -475,6 +601,10 @@ def pretrain_mlx(
     use_compile: bool = True,
     use_prefetch: bool = True,
     profile: bool = False,
+    eval_microbatch_loss: bool = True,
+    eval_loss_final_microbatch: bool = False,
+    defer_final_microbatch_eval: bool = False,
+    use_vmap_accum_step: bool = False,
 ) -> float:
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)
@@ -521,6 +651,13 @@ def pretrain_mlx(
     microbatch_step = _build_microbatch_step(
         model, accum_scale, compile_step=use_compile, ignore_index=None
     )
+    vmap_accum_step = None
+    if use_vmap_accum_step:
+        if config.pretrain_grad_accum_steps < 2:
+            raise ValueError("use_vmap_accum_step requires pretrain_grad_accum_steps >= 2")
+        vmap_accum_step = _build_vmap_accum_step(
+            model, compile_step=use_compile, ignore_index=None
+        )
 
     ckpt_writer = AsyncCheckpointWriter()
     profiler = MLXProfile(enabled=profile)
@@ -574,30 +711,71 @@ def pretrain_mlx(
             accum_grads = None
             accum_loss = mx.array(0.0, dtype=mx.float32)
 
-            for _ in range(config.pretrain_grad_accum_steps):
-                if profiler.enabled:
-                    batch_start = now()
-                    x_np, y_np = next_batch()
-                    profiler.add("batch_fetch", now() - batch_start)
-                else:
-                    x_np, y_np = next_batch()
-                x, y = _arrays_to_mx(x_np, y_np, profiler)
+            if vmap_accum_step is not None:
+                xs = []
+                ys = []
+                for _ in range(config.pretrain_grad_accum_steps):
+                    if profiler.enabled:
+                        batch_start = now()
+                        x_np, y_np = next_batch()
+                        profiler.add("batch_fetch", now() - batch_start)
+                    else:
+                        x_np, y_np = next_batch()
+                    x, y = _arrays_to_mx(x_np, y_np, profiler)
+                    xs.append(x)
+                    ys.append(y)
+                    tokens_processed += x.size
 
-                # Loss-fn has accum_scale baked in, so grads and loss are pre-scaled.
                 if profiler.enabled:
                     step_start = now()
-                    loss, grads = microbatch_step(x, y)
-                    mx.eval(loss, grads)
+                    accum_loss, accum_grads = vmap_accum_step(mx.stack(xs), mx.stack(ys))
+                    mx.async_eval(accum_grads, accum_loss)
                     profiler.add("forward_backward", now() - step_start)
                 else:
-                    loss, grads = microbatch_step(x, y)
-                accum_grads = _accum_grads(accum_grads, grads)
-                accum_loss = accum_loss + loss.astype(mx.float32)
-                # Materialize after each microbatch so MLX frees the per-microbatch
-                # activation/intermediate graph. async_eval lets Python queue the
-                # next batch while Metal drains the current graph.
-                mx.async_eval(accum_grads, accum_loss)
-                tokens_processed += x.size
+                    accum_loss, accum_grads = vmap_accum_step(mx.stack(xs), mx.stack(ys))
+                    mx.async_eval(accum_grads, accum_loss)
+            else:
+                for micro_idx in range(config.pretrain_grad_accum_steps):
+                    if profiler.enabled:
+                        batch_start = now()
+                        x_np, y_np = next_batch()
+                        profiler.add("batch_fetch", now() - batch_start)
+                    else:
+                        x_np, y_np = next_batch()
+                    x, y = _arrays_to_mx(x_np, y_np, profiler)
+
+                    # Loss-fn has accum_scale baked in, so grads and loss are pre-scaled.
+                    if profiler.enabled:
+                        step_start = now()
+                        loss, grads = microbatch_step(x, y)
+                        if eval_microbatch_loss:
+                            mx.eval(loss, grads)
+                        else:
+                            mx.eval(grads)
+                        profiler.add("forward_backward", now() - step_start)
+                    else:
+                        loss, grads = microbatch_step(x, y)
+                    accum_grads = _accum_grads(accum_grads, grads)
+                    accum_loss = accum_loss + loss.astype(mx.float32)
+                    # Materialize after each microbatch so MLX frees the per-microbatch
+                    # activation/intermediate graph. async_eval lets Python queue the
+                    # next batch while Metal drains the current graph.
+                    should_eval_microbatch = not (
+                        defer_final_microbatch_eval
+                        and micro_idx == config.pretrain_grad_accum_steps - 1
+                    )
+                    if should_eval_microbatch:
+                        include_loss = eval_microbatch_loss or (
+                            eval_loss_final_microbatch
+                            and micro_idx == config.pretrain_grad_accum_steps - 1
+                        )
+                        eval_target = (
+                            (accum_grads, accum_loss)
+                            if include_loss
+                            else accum_grads
+                        )
+                        mx.async_eval(eval_target)
+                    tokens_processed += x.size
 
             if profiler.enabled:
                 opt_start = now()
