@@ -729,11 +729,17 @@ def pretrain_mlx(
                 if profiler.enabled:
                     step_start = now()
                     accum_loss, accum_grads = vmap_accum_step(mx.stack(xs), mx.stack(ys))
-                    mx.async_eval(accum_grads, accum_loss)
+                    if global_step < int(getattr(config, "pretrain_vmap_sync_warmup_steps", 0) or 0):
+                        mx.eval(accum_grads, accum_loss)
+                    else:
+                        mx.async_eval(accum_grads, accum_loss)
                     profiler.add("forward_backward", now() - step_start)
                 else:
                     accum_loss, accum_grads = vmap_accum_step(mx.stack(xs), mx.stack(ys))
-                    mx.async_eval(accum_grads, accum_loss)
+                    if global_step < int(getattr(config, "pretrain_vmap_sync_warmup_steps", 0) or 0):
+                        mx.eval(accum_grads, accum_loss)
+                    else:
+                        mx.async_eval(accum_grads, accum_loss)
             else:
                 for micro_idx in range(config.pretrain_grad_accum_steps):
                     if profiler.enabled:
@@ -795,7 +801,7 @@ def pretrain_mlx(
             optimizer.set_lr(lr)
             optimizer.update(model, clipped_grads)
 
-            mx.eval(model.parameters(), optimizer.state_trees())
+            mx.eval(model.parameters(), optimizer.state_trees(), accum_loss)
             accum_loss_val = None
             if profiler.enabled:
                 profiler.add("opt_step", now() - opt_start)
@@ -841,6 +847,43 @@ def pretrain_mlx(
                     )
                 pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
                 break
+
+            checkpoint_interval = int(getattr(config, "pretrain_checkpoint_interval", 0) or 0)
+            if checkpoint_interval > 0 and global_step % checkpoint_interval == 0:
+                rolling_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.safetensors")
+                if profiler.enabled:
+                    checkpoint_start = now()
+                    save_training_checkpoint_mlx(
+                        rolling_path,
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        global_step=global_step,
+                        tokens_processed=tokens_processed,
+                        best_val_loss=best_val_loss,
+                        val_loss=last_val_loss,
+                        elapsed_time=time.time() - start_time,
+                        train_sampler=train_sampler,
+                        writer=ckpt_writer,
+                        sync=True,
+                    )
+                    profiler.add("checkpoint", now() - checkpoint_start)
+                else:
+                    save_training_checkpoint_mlx(
+                        rolling_path,
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        global_step=global_step,
+                        tokens_processed=tokens_processed,
+                        best_val_loss=best_val_loss,
+                        val_loss=last_val_loss,
+                        elapsed_time=time.time() - start_time,
+                        train_sampler=train_sampler,
+                        writer=ckpt_writer,
+                        sync=True,
+                    )
+                pbar.write(f"  -> saved rolling checkpoint at step {global_step}")
 
             if global_step % config.pretrain_eval_interval == 0:
                 if profiler.enabled:

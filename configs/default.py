@@ -87,11 +87,13 @@ class SpakieConfig:
     pretrain_grad_clip: float = _D["pretrain_grad_clip"]
     pretrain_eval_interval: int = _D["pretrain_eval_interval"]
     pretrain_eval_batches: int = _D["pretrain_eval_batches"]
+    pretrain_checkpoint_interval: int = _D.get("pretrain_checkpoint_interval", 0)
     pretrain_patience: int = _D["pretrain_patience"]
     pretrain_optimizer: str = _D["pretrain_optimizer"]
     pretrain_lr_schedule: str = _D.get("pretrain_lr_schedule", "cosine")
     pretrain_trapezoid_decay_frac: float = _D.get("pretrain_trapezoid_decay_frac", 0.2)
     pretrain_vmap_accum_step: bool = _D.get("pretrain_vmap_accum_step", False)
+    pretrain_vmap_sync_warmup_steps: int = _D.get("pretrain_vmap_sync_warmup_steps", 0)
 
     # SFT
     sft_batch_size: int = _D["sft_batch_size"]

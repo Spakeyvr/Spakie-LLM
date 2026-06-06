@@ -139,6 +139,7 @@ Useful training options:
 --output-dir <dir>
 --eval-interval <steps>
 --eval-batches <batches>
+--checkpoint-interval <steps>
 ```
 
 Pipeline runner:
@@ -270,7 +271,7 @@ The repo currently supports these presets:
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
 | `92m` | 12 | 768 | 12 | 12 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
 | `180m` | 16 | 896 | 14 | 2 | SwiGLU hidden 2048 | 96 | 2 | 32 | 4 | Mid-size MLX-optimized preset |
-| `300m` | 10 | 1280 | 20 | 20 | GELU `d_ff=9088` | 64 | 3 | 16 | 2 | Config and pipeline default preset; MLX pretrain vmap accumulation enabled; MLX SFT uses sortish length buckets with padding trim |
+| `300m` | 10 | 1280 | 20 | 20 | GELU `d_ff=9088` | 128 | 2 | 16 | 2 | Config and pipeline default preset; MLX SFT uses sortish length buckets with padding trim |
 
 Shared model defaults:
 

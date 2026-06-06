@@ -424,6 +424,12 @@ def main():
         help="Override number of validation batches used at each pretraining eval",
     )
     parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=0,
+        help="Write a rolling pretrain_interrupt checkpoint every N optimizer steps (0 = config default/off)",
+    )
+    parser.add_argument(
         "--reset-best-loss",
         action="store_true",
         help="When resuming, reset best loss so the first validation in a new output dir saves",
@@ -557,6 +563,13 @@ def main():
         help="Vectorize pretrain gradient accumulation into one MLX value_and_grad call (default: preset config)",
     )
     parser.add_argument(
+        "--mlx-vmap-sync-warmup-steps",
+        dest="mlx_vmap_sync_warmup_steps",
+        type=int,
+        default=-1,
+        help="Synchronously drain the first N MLX vmap accumulation steps before switching to async (-1 = preset config)",
+    )
+    parser.add_argument(
         "--mlx-wired-gb",
         dest="mlx_wired_gb",
         type=float,
@@ -590,12 +603,16 @@ def main():
         config.pretrain_warmup_steps = args.pretrain_warmup_steps
     if args.mlx_vmap_accum_step is None:
         args.mlx_vmap_accum_step = bool(getattr(config, "pretrain_vmap_accum_step", False))
+    if args.mlx_vmap_sync_warmup_steps >= 0:
+        config.pretrain_vmap_sync_warmup_steps = args.mlx_vmap_sync_warmup_steps
     if args.output_dir:
         config.checkpoint_dir = args.output_dir
     if args.eval_interval > 0:
         config.pretrain_eval_interval = args.eval_interval
     if args.eval_batches > 0:
         config.pretrain_eval_batches = args.eval_batches
+    if args.checkpoint_interval > 0:
+        config.pretrain_checkpoint_interval = args.checkpoint_interval
     if args.target_tokens > 0:
         config.pretrain_target_tokens = args.target_tokens
         config.refresh_derived_fields()

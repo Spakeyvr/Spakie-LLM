@@ -1,10 +1,32 @@
 # Token Throughput Research
 
-This note summarizes the throughput work that produced the accepted 300M pretrain speedup, plus the main ideas that were tested and rejected.
+This note summarizes the throughput work, including the 300M pretrain candidate
+that looked good in benchmarks but was later rejected for system stability, plus
+the SFT improvement that remains accepted.
 
-## Accepted 300M Pretrain Change
+## Current Stable 300M Pretrain Default
 
-The useful win is MLX vmap-based gradient accumulation for the 300M pretrain preset.
+The real `scripts/train.py` 300M pretrain default is the non-vmap `B128/G2`
+path:
+
+- Preset: `300m`
+- Batch/accumulation: `B128/G2`
+- Tokens per optimizer step: `131,072`
+- `pretrain_vmap_accum_step: false`
+- Throughput: `13,032 tok/s` on a short real-trainer probe with eval and
+  rolling checkpoints enabled.
+- Speedup: `+27.6%` over the fixed `B64/G2` baseline.
+- Evidence: `bench_results/stability_300m_b128g2_real_train_*.log`
+
+The faster vmap candidate below is kept as an experimental opt-in path only.
+It produced strong benchmark numbers, but repeated full-trainer attempts caused
+macOS kernel watchdog panics during early steps on the M5/macOS 26.5.1 test
+machine. A kernel-panicing path is not considered committable as a default.
+
+## Rejected 300M Pretrain Candidate
+
+MLX vmap-based gradient accumulation was the strongest 300M pretrain speed
+candidate.
 
 Baseline:
 
@@ -14,7 +36,7 @@ Baseline:
 - Throughput: `10,210 tok/s`
 - Evidence: `bench_results/fixed_baseline_300m_pretrain_20260603_122214.log`
 
-Accepted candidate:
+Candidate:
 
 - Preset: `300m`
 - Batch/accumulation: `B64/G3`
@@ -45,7 +67,7 @@ Validation-loss check:
   - `bench_results/valcheck_300m_baseline_b64g2_20260605_232529.log`
   - `bench_results/valcheck_300m_vmap_b64g3_20260605_233445.log`
 
-## Why It Helped
+## Why It Helped In Benchmarks
 
 The original MLX pretrain path paid too much overhead around gradient accumulation. The accepted path stacks the accumulation microbatches and uses `mx.vmap` inside a compiled training step, so MLX sees one larger, more regular unit of work instead of a looser Python-side accumulation loop.
 
@@ -55,10 +77,11 @@ This does not make every GEMM individually faster. The win comes from better amo
 
 The key plumbing is:
 
-- `configs/default.yaml`: 300M now uses `pretrain_grad_accum_steps: 3` and `pretrain_vmap_accum_step: true`.
+- `configs/default.yaml`: 300M defaults to `pretrain_batch_size: 128`,
+  `pretrain_grad_accum_steps: 2`, and `pretrain_vmap_accum_step: false`.
 - `configs/default.py`: exposes `pretrain_vmap_accum_step`.
 - `scripts/train.py`: resolves the config default and passes it into MLX pretraining.
-- `training/pretrain_mlx.py`: adds the vmap accumulation training step and keeps the ordinary path available.
+- `training/pretrain_mlx.py`: keeps the vmap accumulation training step available, but the ordinary path is the default.
 - `scripts/benchmark_mlx_training.py`: can benchmark the vmap accumulation path with fixed shapes.
 
 ## Other Presets
@@ -69,7 +92,7 @@ The vmap accumulation idea was checked against smaller presets and was not adopt
 - `92m` vmap probe `B46/G2`: `23,109 tok/s`, worse than baseline.
 - `180m` baseline `B96/G2`: `14,818 tok/s`.
 
-So the 300M preset is the only preset changed by the accepted default. The smaller presets are effectively unaffected.
+The smaller presets are unaffected by the vmap experiment.
 
 ## Stable SFT Improvement
 
@@ -116,10 +139,14 @@ These were tried because they were plausible, but did not survive sustained benc
 - Grouped Muon and optimizer-route variants: useful to understand optimizer cost, but did not close the target gap safely.
 - Custom Metal/residual RMSNorm/GEMM probes: no validated sustained win over the accepted dense MLX path.
 - FP16/dtype/GEMM shape audits: useful diagnostics, but no clean hidden dtype or shape fast-path miss was found that beat the accepted default.
+- 300M MLX vmap pretrain accumulation: excellent benchmark throughput and loss
+  parity, but rejected as a default after repeated real-trainer macOS kernel
+  watchdog panics during early steps.
 
 ## Current Recommendation
 
-Merge the scoped 300M pretrain improvement plus the conservative MLX SFT
-sortish-bucket/right-trim path. Keep packing, varlen attention, compaction,
-custom kernels, grouped Muon, and other benchmark-only branches opt-in until
-they have separate sustained evidence.
+Use the stable non-vmap `B128/G2` 300M pretrain default for real runs. Keep the
+conservative MLX SFT sortish-bucket/right-trim path. Keep vmap pretrain
+accumulation, packing, varlen attention, compaction, custom kernels, grouped
+Muon, and other benchmark-only branches opt-in until they have separate
+sustained full-trainer evidence.
