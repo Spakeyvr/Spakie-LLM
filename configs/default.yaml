@@ -198,7 +198,7 @@ sft_source_limits:
   no_robots: 10000
   smoltalk: 25000
   squad: 0
-  triviaqa: 0
+  triviaqa: 3000
   arc_challenge: 0
   openbookqa: 0
 
