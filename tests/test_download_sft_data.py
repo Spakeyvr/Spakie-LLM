@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import scripts.download_sft_data as download_sft_data
+from configs.default import SpakieConfig
 
 
 class FakeDataset:
@@ -34,27 +35,28 @@ class FakeDataset:
 
 class DownloadSFTDataTests(unittest.TestCase):
     def test_main_skips_zero_limit_sources(self):
+        # Use a controlled limits config (decoupled from the live YAML, whose
+        # values legitimately change): squad disabled, triviaqa enabled.
+        controlled = SpakieConfig()
+        controlled.sft_source_limits = {"squad": 0, "triviaqa": 3000}
         with tempfile.TemporaryDirectory() as tmpdir:
             argv = [
                 "download_sft_data.py",
                 "--sources",
-                "squad,triviaqa,arc_challenge,openbookqa",
+                "squad,triviaqa",
                 "--output-dir",
                 tmpdir,
             ]
             with (
                 patch.object(sys, "argv", argv),
+                patch.object(download_sft_data, "SpakieConfig", return_value=controlled),
                 patch.object(download_sft_data, "load_squad") as load_squad,
-                patch.object(download_sft_data, "load_triviaqa") as load_triviaqa,
-                patch.object(download_sft_data, "load_arc") as load_arc,
-                patch.object(download_sft_data, "load_openbookqa") as load_openbookqa,
+                patch.object(download_sft_data, "load_triviaqa", return_value=[]) as load_triviaqa,
             ):
                 download_sft_data.main()
 
         load_squad.assert_not_called()
-        load_triviaqa.assert_not_called()
-        load_arc.assert_not_called()
-        load_openbookqa.assert_not_called()
+        load_triviaqa.assert_called_once()
 
     def test_load_no_robots_preserves_clean_chat_messages(self):
         rows = FakeDataset([

@@ -17,6 +17,7 @@ from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from model.utils import count_parameters
 from runtime import RuntimeSettings, autocast_context
+from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers import configure_torch_optimizer, set_optimizer_lr
 
 
@@ -191,7 +192,8 @@ def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, run
 
 def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
              config: SpakieConfig, runtime: RuntimeSettings,
-             resume_state: dict[str, object] | None = None):
+             resume_state: dict[str, object] | None = None,
+             allow_adamw_fallback: bool = False):
     model.to(runtime.device)
     model.train()
     optimizer = configure_torch_optimizer(
@@ -282,7 +284,26 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     if p.grad is not None and not p.grad.is_contiguous():
                         p.grad = p.grad.contiguous()
 
-            optimizer.step()
+            try:
+                optimizer.step()
+            except Exception as exc:
+                if should_adamw_fallback(
+                    exc, optimizer, config, stage="pretrain", allow=allow_adamw_fallback
+                ):
+                    print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
+                    config.pretrain_optimizer = "adamw"
+                    print(adamw_fallback_warning("Pretraining"))
+                    optimizer = configure_torch_optimizer(
+                        model,
+                        config,
+                        runtime,
+                        kind="adamw",
+                        lr=config.pretrain_lr,
+                        weight_decay=config.pretrain_weight_decay,
+                    )
+                    optimizer.step()
+                else:
+                    raise
             global_step += 1
             pbar.update(1)
 

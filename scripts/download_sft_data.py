@@ -143,10 +143,12 @@ def load_sciq(limit: int, seed: int) -> list[dict]:
     examples = []
     for row in rows:
         question = trim(row.get("question", ""))
-        support = trim(row.get("support", ""))
         answer = trim(row.get("correct_answer", ""))
-        user_text = f"Question: {question}\n\nReference: {support}\n\nAnswer clearly."
-        example = make_example(user_text, answer)
+        # SciQ's `support` field is noisy retrieved evidence that is frequently
+        # unrelated to the question; including it teaches the model to ignore
+        # context and bloats the prompt. The questions are self-contained, so we
+        # keep this as clean factual Q -> A.
+        example = make_example(question, answer)
         if example is not None:
             examples.append(example)
     return examples
@@ -268,7 +270,7 @@ def main() -> None:
     parser.add_argument(
         "--sources",
         type=str,
-        default="alpaca,no_robots,smoltalk,squad,triviaqa,arc_challenge,openbookqa",
+        default="alpaca,no_robots,smoltalk,squad,triviaqa,sciq,arc_challenge,openbookqa,boolq",
         help="Comma-separated SFT sources to download",
     )
     parser.add_argument(
@@ -287,8 +289,10 @@ def main() -> None:
         "smoltalk": lambda limit: load_smoltalk(limit, args.seed),
         "squad": lambda limit: load_squad(limit, args.seed),
         "triviaqa": lambda limit: load_triviaqa(limit, args.seed),
+        "sciq": lambda limit: load_sciq(limit, args.seed),
         "arc_challenge": lambda limit: load_arc("ARC-Challenge", limit, args.seed, "Challenge"),
         "openbookqa": lambda limit: load_openbookqa(limit, args.seed),
+        "boolq": lambda limit: load_boolq(limit, args.seed),
     }
     requested_sources = [source.strip() for source in args.sources.split(",") if source.strip()]
     unknown_sources = sorted(set(requested_sources) - set(source_builders))

@@ -10,7 +10,7 @@ from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -34,36 +34,168 @@ from training.dataset_mlx import (
     trim_right_padding_bucket,
 )
 from training.mlx_profile import MLXProfile, now
+from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.pretrain_mlx import _accum_grads, _build_microbatch_step
 from training.prefetch_mlx import BatchPrefetcher
 
 
-def _save_sft_checkpoint(base_path: str, model: SpakieGPTMLX, meta: dict) -> None:
+def _save_sft_checkpoint(
+    base_path: str,
+    model: SpakieGPTMLX,
+    meta: dict,
+    *,
+    optimizer=None,
+) -> None:
     os.makedirs(os.path.dirname(base_path) or ".", exist_ok=True)
     flat = {f"model.{k}": v for k, v in tree_flatten(model.parameters())}
+    if optimizer is not None:
+        opt_state = optimizer.state_trees()
+        for section_name, section_tree in opt_state.items():
+            for key, value in tree_flatten(section_tree):
+                if isinstance(value, mx.array):
+                    flat[f"optimizer.{section_name}.{key}"] = value
+    if flat:
+        mx.eval(*flat.values())
     mx.save_safetensors(base_path, flat, metadata={})
     save_meta_json(base_path + ".meta.json", meta)
 
 
-def _evaluate_sft_loss(model: SpakieGPTMLX, val_dataset, batch_size: int) -> float:
+def _prepare_sft_batch_np(
+    batch_np: tuple,
+    *,
+    config: SpakieConfig,
+    sft_pack: bool,
+    sft_gather_loss: bool,
+    sft_bucket_multiple: int,
+) -> tuple:
+    x_np, y_np = batch_np[:2]
+    if sft_pack:
+        x_np, y_np = trim_right_padding_bucket(
+            x_np, y_np, bucket_multiple=sft_bucket_multiple
+        )
+        batch_np = pack_sft_batch(x_np, y_np, max_seq_len=x_np.shape[1])
+        if getattr(config, "attention_backend", "sdpa") == "mfa-varlen":
+            batch_np = append_packed_varlen_attention_metadata(batch_np)
+        if sft_gather_loss:
+            batch_np = append_supervised_loss_indices(
+                batch_np, bucket_multiple=sft_bucket_multiple
+            )
+    else:
+        batch_np = trim_right_padding_bucket(
+            x_np, y_np, bucket_multiple=sft_bucket_multiple
+        )
+        if config.compact_valid_mlp or config.compact_valid_projections:
+            batch_np = append_valid_token_indices(
+                batch_np, bucket_multiple=sft_bucket_multiple
+            )
+        if sft_gather_loss:
+            batch_np = append_supervised_loss_indices(
+                batch_np, bucket_multiple=sft_bucket_multiple
+            )
+    return batch_np
+
+
+def _forward_sft_eval_loss(model: SpakieGPTMLX, batch_np: tuple, *, use_varlen: bool) -> mx.array:
+    batch_mx = tuple(mx.array(array) for array in batch_np)
+    if use_varlen and len(batch_mx) >= 6:
+        x, y, segment_ids, position_ids, varlen_indices, varlen_cu_seqlens = batch_mx[:6]
+        _, loss, _ = model(
+            x,
+            y,
+            return_cache=False,
+            ignore_index=-100,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+            varlen_indices=varlen_indices,
+            varlen_cu_seqlens=varlen_cu_seqlens,
+        )
+        return loss
+    if len(batch_mx) == 7 and batch_mx[2].ndim == 1:
+        x, y, valid_indices, valid_mask, loss_indices, loss_targets, loss_mask = batch_mx
+        _, loss, _ = model(
+            x,
+            y,
+            return_cache=False,
+            ignore_index=-100,
+            valid_indices=valid_indices,
+            valid_mask=valid_mask,
+            loss_indices=loss_indices,
+            loss_targets=loss_targets,
+            loss_mask=loss_mask,
+        )
+        return loss
+    if len(batch_mx) == 7:
+        x, y, segment_ids, position_ids, loss_indices, loss_targets, loss_mask = batch_mx
+        _, loss, _ = model(
+            x,
+            y,
+            return_cache=False,
+            ignore_index=-100,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+            loss_indices=loss_indices,
+            loss_targets=loss_targets,
+            loss_mask=loss_mask,
+        )
+        return loss
+    if len(batch_mx) == 5:
+        x, y, loss_indices, loss_targets, loss_mask = batch_mx
+        _, loss, _ = model(
+            x,
+            y,
+            return_cache=False,
+            ignore_index=-100,
+            loss_indices=loss_indices,
+            loss_targets=loss_targets,
+            loss_mask=loss_mask,
+        )
+        return loss
+    x, y = batch_mx[:2]
+    _, loss, _ = model(x, y, return_cache=False, ignore_index=-100)
+    return loss
+
+
+def _scale_partial_accum_grads(accum_grads, config: SpakieConfig, micro_in_step: int):
+    if micro_in_step <= 0:
+        raise ValueError("micro_in_step must be positive")
+    if micro_in_step == config.sft_grad_accum_steps:
+        return accum_grads
+    scale = config.sft_grad_accum_steps / micro_in_step
+    return tree_map(lambda grad: grad * scale, accum_grads)
+
+
+def _evaluate_sft_loss(
+    model: SpakieGPTMLX,
+    val_dataset,
+    batch_size: int,
+    *,
+    config: SpakieConfig,
+    sft_pack: bool,
+    sft_gather_loss: bool,
+    sft_bucket_multiple: int,
+) -> float:
     was_training = model.training
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    use_varlen = sft_pack and config.attention_backend == "mfa-varlen"
 
     try:
         for start in range(0, len(val_dataset), batch_size):
             stop = min(start + batch_size, len(val_dataset))
-            x_np, y_np = stack_batch(val_dataset, range(start, stop))
-            valid_tokens = int((y_np != -100).sum())
+            batch_np = stack_batch(val_dataset, range(start, stop))
+            valid_tokens = int((batch_np[1] != -100).sum())
             if valid_tokens == 0:
                 continue
-            x_np, y_np = trim_right_padding_bucket(x_np, y_np)
-
-            x = mx.array(x_np)
-            y = mx.array(y_np)
-            _, loss, _ = model(x, y, return_cache=False)
+            batch_np = _prepare_sft_batch_np(
+                batch_np,
+                config=config,
+                sft_pack=sft_pack,
+                sft_gather_loss=sft_gather_loss,
+                sft_bucket_multiple=sft_bucket_multiple,
+            )
+            loss = _forward_sft_eval_loss(model, batch_np, use_varlen=use_varlen)
             mx.eval(loss)
             total_loss += float(loss.item()) * valid_tokens
             total_tokens += valid_tokens
@@ -96,6 +228,7 @@ def finetune_mlx(
     async_step_eval: bool = False,
     max_steps: int = 0,
     loss_log_path: str | None = None,
+    allow_adamw_fallback: bool = False,
 ) -> float:
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)
@@ -133,7 +266,7 @@ def finetune_mlx(
             seed=0,
         )
     steps_per_epoch = len(train_dataset) // config.sft_batch_size
-    total_steps = max(1, (steps_per_epoch * config.sft_epochs) // config.sft_grad_accum_steps)
+    total_steps = max(1, math.ceil(steps_per_epoch * config.sft_epochs / config.sft_grad_accum_steps))
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -166,7 +299,11 @@ def finetune_mlx(
 
             value_and_grad = nn.value_and_grad(model, loss_fn)
             if use_compile:
-                @partial(mx.compile, inputs=[model.state], outputs=[model.state])
+                compile_state = [model.state]
+                if getattr(model.config, "dropout", 0.0) > 0.0:
+                    compile_state.append(mx.random.state)
+
+                @partial(mx.compile, inputs=compile_state, outputs=compile_state)
                 def step(x_in, y_in, seg_in, pos_in, idx_in):
                     return value_and_grad(model, x_in, y_in, seg_in, pos_in, idx_in)
             else:
@@ -174,6 +311,60 @@ def finetune_mlx(
                     return value_and_grad(model, x_in, y_in, seg_in, pos_in, idx_in)
             varlen_value_and_grad_cache[static_cu_key] = step
         return step(x_arg, y_arg, seg_arg, pos_arg, idx_arg)
+
+    def run_optimizer_step(
+        accum_grads,
+        accum_loss_lazy: mx.array,
+        *,
+        micro_in_step: int,
+    ) -> tuple[object, mx.array, int, float, float]:
+        nonlocal optimizer, global_step, epoch_loss, reached_max_steps
+
+        accum_grads = _scale_partial_accum_grads(accum_grads, config, micro_in_step)
+        mx.eval(accum_grads, accum_loss_lazy)
+        clipped, _ = (
+            (accum_grads, None)
+            if config.sft_grad_clip <= 0
+            else clip_grads(accum_grads, config.sft_grad_clip)
+        )
+        progress = global_step / max(total_steps, 1)
+        lr = config.sft_lr * 0.1 + 0.5 * config.sft_lr * 0.9 * (
+            1 + math.cos(math.pi * progress)
+        )
+        optimizer.set_lr(lr)
+        try:
+            optimizer.update(model, clipped)
+        except Exception as exc:
+            if should_adamw_fallback(exc, optimizer, config, stage="sft", allow=allow_adamw_fallback):
+                print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
+                config.sft_optimizer = "adamw"
+                print(adamw_fallback_warning("SFT"))
+                optimizer = configure_mlx_optimizer(
+                    model,
+                    config,
+                    kind="adamw",
+                    learning_rate=config.sft_lr,
+                    weight_decay=config.sft_weight_decay,
+                )
+                optimizer.set_lr(lr)
+                optimizer.update(model, clipped)
+            else:
+                raise
+        if async_step_eval:
+            mx.async_eval(model.parameters(), optimizer.state_trees())
+        else:
+            mx.eval(model.parameters(), optimizer.state_trees())
+
+        step_sum_loss = float(accum_loss_lazy.item()) * config.sft_grad_accum_steps
+        step_mean_loss = step_sum_loss / max(micro_in_step, 1)
+        epoch_loss += step_sum_loss
+        global_step += 1
+        if loss_log is not None:
+            loss_log.write(f"{global_step},{step_mean_loss:.8f},{lr:.12g}\n")
+            loss_log.flush()
+        if max_steps > 0 and global_step >= max_steps:
+            reached_max_steps = True
+        return None, mx.array(0.0, dtype=mx.float32), 0, step_mean_loss, lr
 
     profiler = MLXProfile(enabled=profile)
     loss_log = None
@@ -230,34 +421,17 @@ def finetune_mlx(
                         profiler.add("batch_fetch", now() - batch_start)
                     else:
                         batch_np = next_batch()
-                    x_np, y_np = batch_np[:2]
-                    if sft_pack:
-                        if profiler.enabled:
-                            pack_start = now()
-                        x_np, y_np = trim_right_padding_bucket(
-                            x_np, y_np, bucket_multiple=sft_bucket_multiple
-                        )
-                        batch_np = pack_sft_batch(x_np, y_np, max_seq_len=x_np.shape[1])
-                        if profiler.enabled:
-                            profiler.add("sft_pack", now() - pack_start)
-                        if getattr(config, "attention_backend", "sdpa") == "mfa-varlen":
-                            batch_np = append_packed_varlen_attention_metadata(batch_np)
-                        if sft_gather_loss:
-                            batch_np = append_supervised_loss_indices(
-                                batch_np, bucket_multiple=sft_bucket_multiple
-                            )
-                    else:
-                        batch_np = trim_right_padding_bucket(
-                            x_np, y_np, bucket_multiple=sft_bucket_multiple
-                        )
-                        if config.compact_valid_mlp or config.compact_valid_projections:
-                            batch_np = append_valid_token_indices(
-                                batch_np, bucket_multiple=sft_bucket_multiple
-                            )
-                        if sft_gather_loss:
-                            batch_np = append_supervised_loss_indices(
-                                batch_np, bucket_multiple=sft_bucket_multiple
-                            )
+                    if profiler.enabled and sft_pack:
+                        pack_start = now()
+                    batch_np = _prepare_sft_batch_np(
+                        batch_np,
+                        config=config,
+                        sft_pack=sft_pack,
+                        sft_gather_loss=sft_gather_loss,
+                        sft_bucket_multiple=sft_bucket_multiple,
+                    )
+                    if profiler.enabled and sft_pack:
+                        profiler.add("sft_pack", now() - pack_start)
                     use_varlen_step = sft_pack and config.attention_backend == "mfa-varlen"
                     varlen_cu_key = (
                         tuple(int(v) for v in batch_np[5])
@@ -308,53 +482,31 @@ def finetune_mlx(
                     if micro_in_step == config.sft_grad_accum_steps:
                         if profiler.enabled:
                             opt_start = now()
-                            clipped, _ = (
-                                (accum_grads, None)
-                                if config.sft_grad_clip <= 0
-                                else clip_grads(accum_grads, config.sft_grad_clip)
-                            )
-                        else:
-                            clipped, _ = (
-                                (accum_grads, None)
-                                if config.sft_grad_clip <= 0
-                                else clip_grads(accum_grads, config.sft_grad_clip)
-                            )
-
-                        progress = global_step / max(total_steps, 1)
-                        lr = config.sft_lr * 0.1 + 0.5 * config.sft_lr * 0.9 * (
-                            1 + math.cos(math.pi * progress)
+                        accum_grads, accum_loss_lazy, micro_in_step, step_mean_loss, _lr = run_optimizer_step(
+                            accum_grads,
+                            accum_loss_lazy,
+                            micro_in_step=micro_in_step,
                         )
-                        optimizer.set_lr(lr)
-                        optimizer.update(model, clipped)
-                        if async_step_eval:
-                            mx.async_eval(model.parameters(), optimizer.state_trees())
-                        else:
-                            mx.eval(model.parameters(), optimizer.state_trees())
                         if profiler.enabled:
                             profiler.add("opt_step", now() - opt_start)
-
-                        # accum_loss_lazy = sum of accum_steps pre-scaled losses
-                        # = mean per-microbatch unscaled loss. Times accum_steps
-                        # gives the sum of unscaled losses for this optimizer step,
-                        # matching the previous per-microbatch accumulation.
-                        step_mean_loss = float(accum_loss_lazy.item())
-                        step_sum_loss = step_mean_loss * config.sft_grad_accum_steps
-                        epoch_loss += step_sum_loss
-                        accum_grads = None
-                        accum_loss_lazy = mx.array(0.0, dtype=mx.float32)
-                        micro_in_step = 0
-                        global_step += 1
-                        if loss_log is not None:
-                            loss_log.write(f"{global_step},{step_mean_loss:.8f},{lr:.12g}\n")
-                            loss_log.flush()
                         pbar.set_postfix(loss=f"{epoch_loss / max(n_micro, 1):.4f}")
-                        if max_steps > 0 and global_step >= max_steps:
-                            reached_max_steps = True
+                        if reached_max_steps:
                             break
             finally:
                 if prefetcher is not None:
                     prefetcher.close()
                 pbar.close()
+
+            if micro_in_step > 0:
+                if profiler.enabled:
+                    opt_start = now()
+                accum_grads, accum_loss_lazy, micro_in_step, _step_mean_loss, _lr = run_optimizer_step(
+                    accum_grads,
+                    accum_loss_lazy,
+                    micro_in_step=micro_in_step,
+                )
+                if profiler.enabled:
+                    profiler.add("opt_step", now() - opt_start)
 
             if reached_max_steps:
                 print(f"Reached max SFT optimizer steps: {global_step}")
@@ -366,10 +518,26 @@ def finetune_mlx(
             # Validation
             if profiler.enabled:
                 eval_start = now()
-                val_loss = _evaluate_sft_loss(model, val_dataset, config.sft_batch_size)
+                val_loss = _evaluate_sft_loss(
+                    model,
+                    val_dataset,
+                    config.sft_batch_size,
+                    config=config,
+                    sft_pack=sft_pack,
+                    sft_gather_loss=sft_gather_loss,
+                    sft_bucket_multiple=sft_bucket_multiple,
+                )
                 profiler.add("eval", now() - eval_start)
             else:
-                val_loss = _evaluate_sft_loss(model, val_dataset, config.sft_batch_size)
+                val_loss = _evaluate_sft_loss(
+                    model,
+                    val_dataset,
+                    config.sft_batch_size,
+                    config=config,
+                    sft_pack=sft_pack,
+                    sft_gather_loss=sft_gather_loss,
+                    sft_bucket_multiple=sft_bucket_multiple,
+                )
 
             print(
                 f"Epoch {epoch + 1} | train_loss {epoch_loss / max(n_micro, 1):.4f} | "
@@ -442,6 +610,7 @@ def finetune_mlx(
                     else "",
                     "muon_verified": config.muon_verified,
                 },
+                optimizer=optimizer,
             )
             profiler.add("checkpoint", now() - checkpoint_start)
         else:
@@ -458,6 +627,7 @@ def finetune_mlx(
                     else "",
                     "muon_verified": config.muon_verified,
                 },
+                optimizer=optimizer,
             )
         print(f"\nInterrupted during fine-tuning. Saved checkpoint to {interrupt_path}")
 

@@ -90,9 +90,6 @@ The vmap accumulation idea was checked against smaller presets and was not adopt
 
 - `92m` baseline `B92/G1`: `32,965 tok/s`.
 - `92m` vmap probe `B46/G2`: `23,109 tok/s`, worse than baseline.
-- `180m` baseline `B96/G2`: `14,818 tok/s`.
-
-The smaller presets are unaffected by the vmap experiment.
 
 ## Stable SFT Improvement
 
@@ -142,6 +139,63 @@ These were tried because they were plausible, but did not survive sustained benc
 - 300M MLX vmap pretrain accumulation: excellent benchmark throughput and loss
   parity, but rejected as a default after repeated real-trainer macOS kernel
   watchdog panics during early steps.
+
+## 92M Probes (June 2026, seed-matched 60-step real-data runs)
+
+- GQA `n_kv_heads: 4` matched full-MHA loss step-for-step (final loss identical,
+  max delta 0.81%) with strictly less attention compute. Adopted as the 92m
+  default. Evidence: `bench_results/claude_opt/92m_real_{base,gqa}.csv`.
+- Param-matched SwiGLU (`swiglu_hidden: 2048`) ran 4.2% worse on the same probe
+  with no throughput gain. Not adopted at 92m.
+- Disabling grad clip was loss-safe (<2% delta) but gave no measurable
+  throughput win at 92m. Not adopted.
+- Sequential single-run throughput comparisons drifted up to ~15% from thermal
+  soak; use the loss CSVs and interleaved cycles, not back-to-back tok/s.
+
+## QK-Norm (June 2026, opt-in)
+
+Per-head RMSNorm on Q and K before attention (Qwen3/Gemma2 style), gated by the
+new `qk_norm` config flag (default `false`). Motivation: the Kimi K2 team report
+that attention-logit growth under Muon is more common than under AdamW, and this
+project trains with Muon at 10 NS steps.
+
+- Implemented in both backends (`model/transformer.py`,
+  `model/transformer_mlx.py`) with a Torch↔MLX forward-parity test
+  (`tests/test_mlx_parity.py::test_forward_logits_match_with_qk_norm`, randomized
+  gains, max abs logit diff < 1e-3).
+- Not supported with the `mfa-varlen` attention backend (raises); that path is a
+  benchmark-only opt-in and never combined with qk_norm.
+- 92m seed-matched 60-step real-data probe: final loss identical, max per-step
+  delta 0.90%, marginally lower loss in the first ~20 steps. Throughput cost is
+  small (single-digit %, partly thermal). Evidence:
+  `bench_results/claude_opt/92m_real_qknorm_{off,on}.csv`.
+
+Kept opt-in rather than enabled on a preset: a 60-step probe confirms it is
+loss-safe but cannot demonstrate the actual payoff (stability over long runs /
+headroom to raise LR). Recommended next step before adopting as a default: a
+longer run, ideally with an increased `pretrain_lr`, to show qk_norm prevents a
+spike or allows a higher stable LR. Enable per-run with `--qk-norm` on
+`scripts/train.py` or set `qk_norm: true` in a preset.
+
+## 180M Probes (June 2026, 50-step seed-matched real-data runs)
+
+All easy levers were tried and none beat the existing `B96/G2` pretrain and
+`B32/G4` SFT defaults; nothing was adopted. Evidence: `bench_results/claude_180m/*.log`.
+Throughput drifts down several percent across sequential runs from thermal soak;
+a soaked baseline re-run (21.7k tok/s pretrain, 76s SFT epoch) is the fair
+comparison for later runs.
+
+- Pretrain `B128/G2`: 19.4k tok/s vs baseline 21.7–22.5k — clearly slower at
+  this size (matches the larger-microbatch collapse pattern), val_loss fine.
+- Pretrain `B96/G1`: 17.8k tok/s — Muon step overhead unamortized; worst.
+- Pretrain `B96/G3`: 21.0k tok/s — no win over G2.
+- Pretrain `muon_ns_steps 5`: ~+1–2% tok/s, but val_loss 7.097 vs 7.058
+  baseline (+0.039 at 50 steps) — over tolerance, scrapped.
+- SFT `B64/G2`, `B32/G8`, `--sft-length-bucket-size 512`: all within thermal
+  noise of the 76s baseline epoch; no win.
+
+Kept side improvement: `scripts/finetune.py` now accepts `--sft-batch-size`
+and `--sft-grad-accum` overrides (config defaults unchanged).
 
 ## Current Recommendation
 

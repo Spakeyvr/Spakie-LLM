@@ -17,6 +17,7 @@ sys.path.insert(0, ROOT)
 from training.muon_core import (
     MUON_BF16_MAX_ABS,
     MUON_BF16_MAX_REL,
+    muon_parity_tolerance_scale,
     MUON_FP32_MAX_ABS,
     MUON_FP32_MAX_REL,
     MUON_NS_COEFFICIENTS,
@@ -146,8 +147,9 @@ def run_muon_parity_check(
     torch_device = _resolve_torch_reference_device(torch_reference_device)
     dtypes = ("fp32", "bf16") if include_bf16 else ("fp32",)
     for dtype in dtypes:
-        max_abs_threshold = MUON_BF16_MAX_ABS if dtype == "bf16" else MUON_FP32_MAX_ABS
-        max_rel_threshold = MUON_BF16_MAX_REL if dtype == "bf16" else MUON_FP32_MAX_REL
+        tolerance_scale = muon_parity_tolerance_scale(ns_steps)
+        max_abs_threshold = (MUON_BF16_MAX_ABS if dtype == "bf16" else MUON_FP32_MAX_ABS) * tolerance_scale
+        max_rel_threshold = (MUON_BF16_MAX_REL if dtype == "bf16" else MUON_FP32_MAX_REL) * tolerance_scale
         for index, case in enumerate(CASES):
             matrix = _make_matrix(case.shape, seed=20260501 + index)
             torch_out = _torch_reference(matrix, dtype=dtype, ns_steps=ns_steps, device=torch_device)

@@ -34,6 +34,12 @@ class CausalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+        if config.qk_norm:
+            self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-5)
+            self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-5)
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -44,8 +50,14 @@ class CausalSelfAttention(nn.Module):
             q = self.q_proj(x)
             kv = self.kv_proj(x)
             k, v = kv.split(self.n_kv_heads * self.head_dim, dim=2)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.head_dim)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim)
+        # QK-norm normalizes over head_dim (the last axis) before the transpose.
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         dropout_p = self.attn_dropout.p if self.training else 0.0

@@ -25,6 +25,7 @@ defaults:
   mlp_type: gelu
   gelu_variant: fast
   norm_type: rmsnorm
+  qk_norm: false
   loss_layout: custom
   residual_type: serial
   # Hidden size for SwiGLU MLPs. 0 uses d_ff. Only used when mlp_type=swiglu.
@@ -78,7 +79,9 @@ defaults:
   allow_adamw_fallback: false
   muon_momentum: 0.95
   muon_nesterov: true
-  muon_ns_steps: 2
+  # DeepSeek-V4 trains with 10 NS iterations; their two-stage coefficient
+  # schedule is not supported here, so the tuned single triple is reused.
+  muon_ns_steps: 10
   muon_ns_coefficients: [3.4445, -4.7750, 2.0315]
   muon_eps: 1.0e-7
   muon_adjust_lr_fn: match_rms_adamw
@@ -141,6 +144,9 @@ presets:
     n_layers: 12
     d_model: 768
     n_heads: 12
+    # 4 KV heads matched the full-MHA loss trajectory step-for-step on a
+    # 60-step real-data probe (final loss identical, max delta 0.81%).
+    n_kv_heads: 4
     d_ff: 3072
     activation_checkpointing: false
     pretrain_batch_size: 92
@@ -171,7 +177,7 @@ presets:
     n_layers: 10
     d_model: 1280
     n_heads: 20
-    n_kv_heads: 0
+    n_kv_heads: 4
     d_ff: 9088
     activation_checkpointing: false
     pretrain_batch_size: 128
@@ -194,13 +200,22 @@ source_min_doc_chars:
   dictionary: 80
 
 sft_source_limits:
-  alpaca: 4000
-  no_robots: 10000
-  smoltalk: 25000
-  squad: 0
+  # Caps are applied AFTER length filtering, so each number is usable, fully
+  # in-window examples. The mix is tilted toward concise, single-turn answering:
+  # DeepSeek-distilled and custom are uncapped (best fit + concise), smoltalk is
+  # held down because most of it overflows the 512-token window and is verbose.
+  alpaca: 12000
+  no_robots: 8000
+  smoltalk: 6000
+  # Short factual / multiple-choice QA: teaches concise factual answering and
+  # context grounding. These fit the 512-token window well (boolq/squad lose
+  # their long-passage rows to the length filter, which is fine).
+  squad: 5000
   triviaqa: 3000
-  arc_challenge: 0
-  openbookqa: 0
+  sciq: 6000
+  arc_challenge: 2000
+  openbookqa: 5000
+  boolq: 3000
 
 corpus_source_plan:
   fineweb-edu:

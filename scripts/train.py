@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from configs.default import (
+    SUPPORTED_PRESETS,
     get_preset_config,
     inherit_attention_shape_from_tensors,
     inherit_mlp_shape_from_tensors,
@@ -19,15 +20,23 @@ from training.muon_core import (
 
 
 def apply_optimizer_args(config, args) -> None:
-    config.pretrain_optimizer = args.optimizer
-    config.allow_adamw_fallback = args.allow_adamw_fallback
-    config.muon_adjust_lr_fn = args.muon_adjust_lr_fn
-    config.muon_ns_steps = args.muon_ns_steps
-    config.muon_momentum = args.muon_momentum
-    config.muon_nesterov = args.muon_nesterov
-    config.muon_qkv_split = args.muon_qkv_split
-    config.grouped_muon = args.grouped_muon
-    config.contiguous_linear_inputs = args.contiguous_linear_inputs
+    # CLI optimizer flags default to None so per-preset config values stay
+    # authoritative unless the user passes an explicit override.
+    overrides = {
+        "pretrain_optimizer": args.optimizer,
+        "muon_adjust_lr_fn": args.muon_adjust_lr_fn,
+        "muon_ns_steps": args.muon_ns_steps,
+        "muon_momentum": args.muon_momentum,
+        "muon_nesterov": args.muon_nesterov,
+        "muon_qkv_split": args.muon_qkv_split,
+        "grouped_muon": args.grouped_muon,
+        "contiguous_linear_inputs": args.contiguous_linear_inputs,
+    }
+    for field_name, value in overrides.items():
+        if value is not None:
+            setattr(config, field_name, value)
+    if args.allow_adamw_fallback:
+        config.allow_adamw_fallback = True
 
 
 def optimizer_kind_from_resume_state(resume_state, *, backend: str) -> str:
@@ -61,6 +70,55 @@ def print_optimizer_banner(kind: str, *, stage: str) -> None:
         print(adamw_fallback_warning(stage))
     else:
         print("Optimizer: Muon (required default)")
+
+
+def apply_pretrain_cli_overrides(config, args) -> None:
+    apply_optimizer_args(config, args)
+    if args.lr_schedule:
+        config.pretrain_lr_schedule = args.lr_schedule
+    if args.trapezoid_decay_frac >= 0:
+        config.pretrain_trapezoid_decay_frac = args.trapezoid_decay_frac
+    if args.loss_layout:
+        config.loss_layout = args.loss_layout
+    if args.qk_norm is not None:
+        config.qk_norm = args.qk_norm
+    if args.pretrain_batch_size > 0:
+        config.pretrain_batch_size = args.pretrain_batch_size
+    if args.pretrain_grad_accum > 0:
+        config.pretrain_grad_accum_steps = args.pretrain_grad_accum
+    if args.pretrain_batch_size > 0 or args.pretrain_grad_accum > 0:
+        config.refresh_derived_fields()
+    if args.pretrain_warmup_steps > 0:
+        config.pretrain_warmup_steps = args.pretrain_warmup_steps
+    if args.mlx_vmap_accum_step is None:
+        args.mlx_vmap_accum_step = bool(getattr(config, "pretrain_vmap_accum_step", False))
+    if args.mlx_vmap_accum_step and config.pretrain_grad_accum_steps < 2:
+        print("vmap accumulation requires pretrain_grad_accum_steps >= 2; using the standard accumulation path.")
+        args.mlx_vmap_accum_step = False
+    if args.mlx_vmap_sync_warmup_steps >= 0:
+        config.pretrain_vmap_sync_warmup_steps = args.mlx_vmap_sync_warmup_steps
+    if args.output_dir:
+        config.checkpoint_dir = args.output_dir
+    if args.eval_interval > 0:
+        config.pretrain_eval_interval = args.eval_interval
+    if args.eval_batches > 0:
+        config.pretrain_eval_batches = args.eval_batches
+    if args.checkpoint_interval > 0:
+        config.pretrain_checkpoint_interval = args.checkpoint_interval
+    if args.target_tokens > 0:
+        config.pretrain_target_tokens = args.target_tokens
+        config.refresh_derived_fields()
+    if args.max_steps > 0:
+        config.pretrain_max_steps = args.max_steps
+        if args.target_tokens <= 0:
+            config.pretrain_target_tokens = config.pretrain_tokens_per_step() * args.max_steps
+    if args.smoke:
+        config.checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_pretrain")
+        smoke_token_budget = config.pretrain_tokens_per_step() * 100
+        config.pretrain_target_tokens = min(config.pretrain_target_tokens or smoke_token_budget, smoke_token_budget)
+        config.pretrain_max_steps = min(config.pretrain_max_steps or 100, 100)
+        config.pretrain_eval_interval = min(config.pretrain_eval_interval, 50)
+        config.pretrain_eval_batches = min(config.pretrain_eval_batches, 4)
 
 
 def verify_muon_for_full_mlx_pretrain(args, config) -> None:
@@ -109,7 +167,11 @@ def run_torch_pretrain(args, config):
         checkpoint_config = resume_state.get("config")
         if checkpoint_config is not None:
             config = checkpoint_config
-        apply_optimizer_args(config, args)
+        else:
+            model_tensors = resume_state.get("model", {})
+            config = inherit_attention_shape_from_tensors(config, model_tensors)
+            config = inherit_mlp_shape_from_tensors(config, model_tensors)
+        apply_pretrain_cli_overrides(config, args)
         check_resume_optimizer(
             resume_state,
             config.pretrain_optimizer,
@@ -181,15 +243,15 @@ def run_torch_pretrain(args, config):
         print(f"Resuming from: {resume_path}")
         print(f"Resume step: {resume_state.get('step', 0):,}")
         print(f"Resume tokens: {resume_state.get('tokens_processed', 0):,}")
-    try:
-        pretrain(model, train_loader, val_loader, config, runtime, resume_state=resume_state)
-    except Exception as exc:
-        if config.pretrain_optimizer == "muon" and args.allow_adamw_fallback:
-            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
-            config.pretrain_optimizer = "adamw"
-            pretrain(model, train_loader, val_loader, config, runtime, resume_state=None)
-        else:
-            raise
+    pretrain(
+        model,
+        train_loader,
+        val_loader,
+        config,
+        runtime,
+        resume_state=resume_state,
+        allow_adamw_fallback=config.allow_adamw_fallback,
+    )
 
 
 def run_mlx_pretrain(args, config):
@@ -325,50 +387,34 @@ def run_mlx_pretrain(args, config):
         print(f"Resume step: {resume_state['meta'].get('step', 0):,}")
         print(f"Resume tokens: {resume_state['meta'].get('tokens_processed', 0):,}")
 
-    try:
-        pretrain_mlx(
-            model,
-            train_ds,
-            val_ds,
-            train_sampler,
-            config,
-            runtime,
-            resume_state=resume_state,
-            use_compile=args.mlx_compile,
-            use_prefetch=args.mlx_prefetch,
-            profile=args.mlx_profile,
-            eval_microbatch_loss=args.mlx_eval_microbatch_loss,
-            eval_loss_final_microbatch=args.mlx_eval_loss_final_microbatch,
-            defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
-            use_vmap_accum_step=args.mlx_vmap_accum_step,
-        )
-    except Exception as exc:
-        if config.pretrain_optimizer == "muon" and args.allow_adamw_fallback:
-            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
-            config.pretrain_optimizer = "adamw"
-            pretrain_mlx(
-                model,
-                train_ds,
-                val_ds,
-                train_sampler,
-                config,
-                runtime,
-                resume_state=None,
-                use_compile=args.mlx_compile,
-                use_prefetch=args.mlx_prefetch,
-                profile=args.mlx_profile,
-                eval_microbatch_loss=args.mlx_eval_microbatch_loss,
-                eval_loss_final_microbatch=args.mlx_eval_loss_final_microbatch,
-                defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
-                use_vmap_accum_step=args.mlx_vmap_accum_step,
-            )
-        else:
-            raise
+    pretrain_mlx(
+        model,
+        train_ds,
+        val_ds,
+        train_sampler,
+        config,
+        runtime,
+        resume_state=resume_state,
+        use_compile=args.mlx_compile,
+        use_prefetch=args.mlx_prefetch,
+        profile=args.mlx_profile,
+        eval_microbatch_loss=args.mlx_eval_microbatch_loss,
+        eval_loss_final_microbatch=args.mlx_eval_loss_final_microbatch,
+        defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
+        use_vmap_accum_step=args.mlx_vmap_accum_step,
+        allow_adamw_fallback=config.allow_adamw_fallback,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="CLI entry point for pretraining")
-    parser.add_argument("--preset", type=str, default="92m", help="Model preset to use (92m, 180m, or 300m)")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=SUPPORTED_PRESETS,
+        default="92m",
+        help=f"Model preset to use ({', '.join(SUPPORTED_PRESETS)})",
+    )
     parser.add_argument("--backend", choices=("torch", "mlx"), default="mlx",
                         help="Training backend — mlx (Apple Silicon) or torch (MPS/CUDA/CPU)")
     parser.add_argument("--smoke", action="store_true", help="Run a short 100-step smoke test")
@@ -442,8 +488,8 @@ def main():
     parser.add_argument(
         "--optimizer",
         choices=OPTIMIZER_CHOICES,
-        default="muon",
-        help="Optimizer to use. Muon is the required default; AdamW is fallback-only and not recommended.",
+        default=None,
+        help="Optimizer to use (default: preset config, normally muon). AdamW is fallback-only and not recommended.",
     )
     parser.add_argument(
         "--allow-adamw-fallback",
@@ -458,8 +504,8 @@ def main():
     parser.add_argument(
         "--muon-adjust-lr-fn",
         choices=MUON_ADJUST_LR_CHOICES,
-        default="match_rms_adamw",
-        help="Muon LR adjustment. match_rms_adamw reuses AdamW-tuned LR/WD.",
+        default=None,
+        help="Muon LR adjustment (default: preset config). match_rms_adamw reuses AdamW-tuned LR/WD.",
     )
     parser.add_argument(
         "--lr-schedule",
@@ -479,33 +525,40 @@ def main():
         default="",
         help="Override MLX training loss layout",
     )
-    parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
-    parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum")
+    parser.add_argument(
+        "--qk-norm",
+        dest="qk_norm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply RMSNorm to per-head Q and K before attention (default: preset config)",
+    )
+    parser.add_argument("--muon-ns-steps", type=int, default=None, help="Muon Newton-Schulz iteration count (default: preset config)")
+    parser.add_argument("--muon-momentum", type=float, default=None, help="Muon momentum (default: preset config)")
     parser.add_argument(
         "--muon-nesterov",
         dest="muon_nesterov",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use Muon Nesterov momentum",
+        default=None,
+        help="Use Muon Nesterov momentum (default: preset config)",
     )
     parser.add_argument(
         "--muon-qkv-split",
         dest="muon_qkv_split",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently",
+        default=None,
+        help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently (default: preset config)",
     )
     parser.add_argument(
         "--grouped-muon",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Batch same-shape MLX Muon Newton-Schulz updates across layers",
+        default=None,
+        help="Batch same-shape MLX Muon Newton-Schulz updates across layers (default: preset config)",
     )
     parser.add_argument(
         "--contiguous-linear-inputs",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Force row-contiguous inputs before large MLX linear projections",
+        default=None,
+        help="Force row-contiguous inputs before large MLX linear projections (default: preset config)",
     )
     parser.add_argument(
         "--mlx-compile",
@@ -586,47 +639,7 @@ def main():
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
-    apply_optimizer_args(config, args)
-    if args.lr_schedule:
-        config.pretrain_lr_schedule = args.lr_schedule
-    if args.trapezoid_decay_frac >= 0:
-        config.pretrain_trapezoid_decay_frac = args.trapezoid_decay_frac
-    if args.loss_layout:
-        config.loss_layout = args.loss_layout
-    if args.pretrain_batch_size > 0:
-        config.pretrain_batch_size = args.pretrain_batch_size
-    if args.pretrain_grad_accum > 0:
-        config.pretrain_grad_accum_steps = args.pretrain_grad_accum
-    if args.pretrain_batch_size > 0 or args.pretrain_grad_accum > 0:
-        config.refresh_derived_fields()
-    if args.pretrain_warmup_steps > 0:
-        config.pretrain_warmup_steps = args.pretrain_warmup_steps
-    if args.mlx_vmap_accum_step is None:
-        args.mlx_vmap_accum_step = bool(getattr(config, "pretrain_vmap_accum_step", False))
-    if args.mlx_vmap_sync_warmup_steps >= 0:
-        config.pretrain_vmap_sync_warmup_steps = args.mlx_vmap_sync_warmup_steps
-    if args.output_dir:
-        config.checkpoint_dir = args.output_dir
-    if args.eval_interval > 0:
-        config.pretrain_eval_interval = args.eval_interval
-    if args.eval_batches > 0:
-        config.pretrain_eval_batches = args.eval_batches
-    if args.checkpoint_interval > 0:
-        config.pretrain_checkpoint_interval = args.checkpoint_interval
-    if args.target_tokens > 0:
-        config.pretrain_target_tokens = args.target_tokens
-        config.refresh_derived_fields()
-    if args.max_steps > 0:
-        config.pretrain_max_steps = args.max_steps
-        if args.target_tokens <= 0:
-            config.pretrain_target_tokens = config.pretrain_tokens_per_step() * args.max_steps
-    if args.smoke:
-        config.checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_pretrain")
-        smoke_token_budget = config.pretrain_tokens_per_step() * 100
-        config.pretrain_target_tokens = min(config.pretrain_target_tokens or smoke_token_budget, smoke_token_budget)
-        config.pretrain_max_steps = min(config.pretrain_max_steps or 100, 100)
-        config.pretrain_eval_interval = min(config.pretrain_eval_interval, 50)
-        config.pretrain_eval_batches = min(config.pretrain_eval_batches, 4)
+    apply_pretrain_cli_overrides(config, args)
 
     verify_muon_for_full_mlx_pretrain(args, config)
 

@@ -13,6 +13,13 @@ MUON_FP32_MAX_ABS = 5e-3
 MUON_FP32_MAX_REL = 5e-2
 MUON_BF16_MAX_ABS = 2e-2
 MUON_BF16_MAX_REL = 5e-2
+# The tolerances above were validated at 5 NS iterations; per-iteration BF16
+# rounding noise compounds roughly linearly with iteration count.
+MUON_TOLERANCE_BASELINE_NS_STEPS = 5
+
+
+def muon_parity_tolerance_scale(ns_steps: int) -> float:
+    return max(1.0, ns_steps / MUON_TOLERANCE_BASELINE_NS_STEPS)
 
 
 @dataclass(frozen=True)
@@ -98,4 +105,16 @@ def adamw_fallback_warning(stage: str) -> str:
     return (
         f"WARNING: {stage} is using AdamW as an explicit fallback. "
         "Muon is the required default and strongly preferred optimizer for Spakie training."
+    )
+
+
+def optimizer_kind(optimizer, config, *, stage: str) -> str:
+    """Return the active optimizer kind for pretrain or SFT."""
+    field = "pretrain_optimizer" if stage == "pretrain" else "sft_optimizer"
+    return str(getattr(optimizer, "optimizer_kind", getattr(config, field, "muon")))
+
+
+def should_adamw_fallback(exc: BaseException, optimizer, config, *, stage: str, allow: bool) -> bool:
+    return allow and optimizer_kind(optimizer, config, stage=stage) == "muon" and not isinstance(
+        exc, KeyboardInterrupt
     )

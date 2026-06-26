@@ -82,6 +82,12 @@ class TorchMLXForwardParityTests(unittest.TestCase):
                     state[f"{src_prefix}.attn.kv_proj.weight"]
                 )
             overrides[f"{src_prefix}.attn.out_proj.weight"] = mx.array(state[f"{src_prefix}.attn.out_proj.weight"])
+            q_norm_key = f"{src_prefix}.attn.q_norm.weight"
+            if q_norm_key in state:
+                overrides[q_norm_key] = mx.array(state[q_norm_key])
+                overrides[f"{src_prefix}.attn.k_norm.weight"] = mx.array(
+                    state[f"{src_prefix}.attn.k_norm.weight"]
+                )
             fc1_key = f"{src_prefix}.mlp.fc1.weight"
             if fc1_key in state:
                 overrides[fc1_key] = mx.array(state[fc1_key])
@@ -115,6 +121,41 @@ class TorchMLXForwardParityTests(unittest.TestCase):
 
         ids = np.array([[3, 7, 11, 1, 5, 9, 2, 4]], dtype=np.int32)
 
+        with torch.no_grad():
+            torch_logits, _ = torch_model(torch.from_numpy(ids.astype(np.int64)))
+        torch_logits_np = torch_logits.detach().cpu().numpy()
+
+        mlx_logits, _, _ = mlx_model(mx.array(ids))
+        mx.eval(mlx_logits)
+        mlx_logits_np = np.asarray(mlx_logits.astype(mx.float32))
+
+        self.assertEqual(torch_logits_np.shape, mlx_logits_np.shape)
+        max_abs = np.max(np.abs(torch_logits_np - mlx_logits_np))
+        self.assertLess(max_abs, 1e-3, f"max abs logit diff = {max_abs}")
+
+    def test_forward_logits_match_with_qk_norm(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        config.qk_norm = True
+
+        torch.manual_seed(1)
+        torch_model = SpakieGPT(config)
+        # Randomize the QK-norm gains so the test catches axis/order bugs that a
+        # ones-initialized norm would hide.
+        with torch.no_grad():
+            for block in torch_model.blocks:
+                block.attn.q_norm.weight.normal_(mean=1.0, std=0.1)
+                block.attn.k_norm.weight.normal_(mean=1.0, std=0.1)
+        torch_model.eval()
+
+        mlx_model = SpakieGPTMLX(config)
+        mlx_model.eval()
+        self._copy_torch_weights_into_mlx(torch_model, mlx_model)
+
+        ids = np.array([[3, 7, 11, 1, 5, 9, 2, 4]], dtype=np.int32)
         with torch.no_grad():
             torch_logits, _ = torch_model(torch.from_numpy(ids.astype(np.int64)))
         torch_logits_np = torch_logits.detach().cpu().numpy()

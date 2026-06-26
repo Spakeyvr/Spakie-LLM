@@ -35,6 +35,7 @@ from training.dataset_mlx import (
     stack_batch,
 )
 from training.mlx_profile import MLXProfile, now
+from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.prefetch_mlx import BatchPrefetcher
 
@@ -605,6 +606,7 @@ def pretrain_mlx(
     eval_loss_final_microbatch: bool = False,
     defer_final_microbatch_eval: bool = False,
     use_vmap_accum_step: bool = False,
+    allow_adamw_fallback: bool = False,
 ) -> float:
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)
@@ -799,7 +801,26 @@ def pretrain_mlx(
 
             lr = get_lr(global_step, config)
             optimizer.set_lr(lr)
-            optimizer.update(model, clipped_grads)
+            try:
+                optimizer.update(model, clipped_grads)
+            except Exception as exc:
+                if should_adamw_fallback(
+                    exc, optimizer, config, stage="pretrain", allow=allow_adamw_fallback
+                ):
+                    print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
+                    config.pretrain_optimizer = "adamw"
+                    print(adamw_fallback_warning("Pretraining"))
+                    optimizer = configure_mlx_optimizer(
+                        model,
+                        config,
+                        kind="adamw",
+                        learning_rate=config.pretrain_lr,
+                        weight_decay=config.pretrain_weight_decay,
+                    )
+                    optimizer.set_lr(lr)
+                    optimizer.update(model, clipped_grads)
+                else:
+                    raise
 
             mx.eval(model.parameters(), optimizer.state_trees(), accum_loss)
             accum_loss_val = None

@@ -88,6 +88,65 @@ class PrepareSFTTests(unittest.TestCase):
         self.assertIn("filtered 3 tool/template artifact examples", log)
         self.assertIn("skipped 1 malformed lines", log)
 
+    def test_fits_context_drops_overlong_and_overly_verbose(self):
+        # Fake tokenizer: one token per whitespace-delimited word.
+        class WordTokenizer:
+            def encode(self, text):
+                return text.split()
+
+        tok = WordTokenizer()
+        short = [
+            {"role": "user", "content": "a b c"},
+            {"role": "assistant", "content": "x y"},
+        ]
+        # total = (3+2) + (2+2) = 9 tokens
+        self.assertTrue(prepare_sft.fits_context(short, tok, max_seq_len=16, max_assistant_tokens=0))
+        # Window too small -> dropped (would truncate the answer).
+        self.assertFalse(prepare_sft.fits_context(short, tok, max_seq_len=6, max_assistant_tokens=0))
+        # Fits the window but exceeds the assistant-length cap -> dropped.
+        self.assertFalse(prepare_sft.fits_context(short, tok, max_seq_len=16, max_assistant_tokens=2))
+        # max_seq_len=0 disables filtering entirely.
+        self.assertTrue(prepare_sft.fits_context(short, tok, max_seq_len=0, max_assistant_tokens=0))
+
+    def test_load_source_drops_examples_over_context_window(self):
+        class WordTokenizer:
+            def encode(self, text):
+                return text.split()
+
+        rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "short q"},
+                    {"role": "assistant", "content": "ok"},
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "word " * 50},
+                    {"role": "assistant", "content": "answer that never fits the window"},
+                ]
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                examples = prepare_sft.load_source(
+                    str(path),
+                    None,
+                    limit=0,
+                    seed=42,
+                    tokenizer=WordTokenizer(),
+                    max_seq_len=16,
+                )
+
+        self.assertEqual(len(examples), 1)
+        self.assertEqual(examples[0]["messages"][0]["content"], "short q")
+        self.assertIn("dropped 1 examples over the 16-token window", output.getvalue())
+
     def test_build_assistant_seed_examples_repeats_and_injects_system(self):
         examples = prepare_sft.build_assistant_seed_examples("System prompt.", repeats=2)
 

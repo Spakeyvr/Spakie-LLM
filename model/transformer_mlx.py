@@ -118,6 +118,14 @@ class CausalSelfAttentionMLX(nn.Module):
         self.attn_dropout_p = config.dropout
         self.resid_dropout = nn.Dropout(config.dropout)
         self.attention_backend = config.attention_backend
+        if config.qk_norm:
+            if config.attention_backend == "mfa-varlen":
+                raise ValueError("qk_norm is not supported with the mfa-varlen attention backend")
+            self.q_norm = nn.RMSNorm(self.head_dim)
+            self.k_norm = nn.RMSNorm(self.head_dim)
+        else:
+            self.q_norm = None
+            self.k_norm = None
         self.addmm_residual_projections = config.addmm_residual_projections
         self.contiguous_linear_inputs = config.contiguous_linear_inputs
         self.compact_valid_projections = config.compact_valid_projections
@@ -205,8 +213,14 @@ class CausalSelfAttentionMLX(nn.Module):
         if used_varlen_qkv:
             new_cache = None
         else:
-            q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-            k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            q = q.reshape(B, T, self.n_heads, self.head_dim)
+            k = k.reshape(B, T, self.n_kv_heads, self.head_dim)
+            # QK-norm normalizes over head_dim (the last axis) before the transpose.
+            if self.q_norm is not None:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+            q = q.transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
             v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
             if cache is not None:
@@ -607,6 +621,9 @@ class SpakieGPTMLX(nn.Module):
             )
             if config.bias:
                 overrides[f"{prefix}.attn.out_proj.bias"] = mx.zeros_like(block.attn.out_proj.bias)
+            if block.attn.q_norm is not None:
+                overrides[f"{prefix}.attn.q_norm.weight"] = mx.ones_like(block.attn.q_norm.weight)
+                overrides[f"{prefix}.attn.k_norm.weight"] = mx.ones_like(block.attn.k_norm.weight)
 
             if block.mlp.mlp_type == "swiglu":
                 overrides[f"{prefix}.mlp.gate_up.weight"] = _normal(

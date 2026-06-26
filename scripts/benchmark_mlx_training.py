@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import mlx.core as mx
 import mlx.nn as nn
 
-from configs.default import get_preset_config
+from configs.default import SUPPORTED_PRESETS, get_preset_config
 from runtime.mlx_backend import clip_grads, configure_metal_limits, resolve_mlx_runtime
 from tokenizer.train_tokenizer import SpakieTokenizer
 from training.dataset_mlx import (
@@ -972,9 +972,22 @@ def _benchmark_steps(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark MLX training throughput without checkpoint writes")
     parser.add_argument("--task", choices=("pretrain", "sft"), default="pretrain", help="Training task to benchmark")
-    parser.add_argument("--preset", type=str, default="92m", help="Model preset to use")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=SUPPORTED_PRESETS,
+        default="92m",
+        help=f"Model preset to use ({', '.join(SUPPORTED_PRESETS)})",
+    )
     parser.add_argument("--steps", type=int, default=10, help="Number of timed optimizer steps")
-    parser.add_argument("--warmup-steps", type=int, default=2, help="Untimed warmup optimizer steps")
+    parser.add_argument(
+        "--warmup-steps",
+        "--thermal-warmup",
+        dest="warmup_steps",
+        type=int,
+        default=2,
+        help="Untimed warmup optimizer steps before timing (also brings the chip to a steady thermal state)",
+    )
     parser.add_argument(
         "--loss-log",
         type=str,
@@ -1065,6 +1078,12 @@ def main() -> None:
     )
     parser.add_argument("--mlp-type", choices=("gelu", "swiglu"), default=None, help="Override MLP block type")
     parser.add_argument("--swiglu-hidden", type=int, default=None, help="Override SwiGLU hidden size")
+    parser.add_argument(
+        "--qk-norm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply RMSNorm to per-head Q and K before attention",
+    )
     parser.add_argument("--norm-type", choices=("layernorm", "rmsnorm"), default=None, help="Override norm type")
     parser.add_argument("--loss-layout", choices=("flat", "3d", "custom"), default=None, help="Override MLX training loss layout")
     parser.add_argument("--residual-type", choices=("serial", "parallel"), default=None, help="Override residual block type")
@@ -1341,6 +1360,8 @@ def main() -> None:
         config.swiglu_hidden = args.swiglu_hidden
     if args.norm_type is not None:
         config.norm_type = args.norm_type
+    if args.qk_norm is not None:
+        config.qk_norm = args.qk_norm
     if args.loss_layout is not None:
         config.loss_layout = args.loss_layout
     if args.residual_type is not None:

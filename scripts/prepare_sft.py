@@ -8,6 +8,13 @@ is picked up automatically; sources without a cap entry are taken in full.
 System messages are stripped by default, which works better for small models
 where every control token has to earn its keep. Pass --system to inject exactly
 one system message into every example.
+
+Examples are length-filtered against the model's context window: any conversation
+whose rendered token length (role tokens + content + eos for every turn) exceeds
+``--max-seq-len`` is dropped rather than silently truncated. Truncation used to
+cut assistant answers mid-sentence — the model never saw the closing ``<eos>`` and
+learned to ramble without stopping. ``--max-assistant-tokens`` additionally caps
+how verbose a single answer may be, biasing the mix toward concise replies.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
+from tokenizer.train_tokenizer import SpakieTokenizer
 
 
 # Templated prefixes injected by scripts/download_sft_data.py (squad, sciq, boolq, arc, openbookqa).
@@ -49,7 +57,54 @@ DISALLOWED_SFT_MARKERS = (
     "You are an expert in composing functions",
 )
 
-ASSISTANT_BEHAVIOR_SEEDS = (
+
+# Natural-language phrasing swaps used to diversify the behavior seeds. Repeating
+# a single exact prompt string (e.g. "What is the capital of France?") dozens of
+# times teaches the model to memorize that literal rather than generalize, so it
+# breaks on "What's the capital of France?". Expanding each seed into contraction
+# and punctuation variants makes the anchored behavior phrasing-robust.
+_PHRASING_SWAPS = (
+    ("What is", "What's"),
+    ("What are", "What're"),
+    ("Who is", "Who's"),
+    ("How is", "How's"),
+    ("That is", "That's"),
+    ("Where is", "Where's"),
+    ("It is", "It's"),
+)
+
+
+def expand_user_phrasings(user_text: str) -> list[str]:
+    """Return phrasing variants of a seed prompt (contractions, trailing '?')."""
+    variants = {user_text}
+    for full, short in _PHRASING_SWAPS:
+        for current in list(variants):
+            if full in current:
+                variants.add(current.replace(full, short))
+            if short in current:
+                variants.add(current.replace(short, full))
+    # Both with and without a trailing question mark, so the model does not tie
+    # the answer to the presence of punctuation.
+    for current in list(variants):
+        if current.endswith("?"):
+            variants.add(current[:-1])
+    return sorted(variants)
+
+
+def expand_seed_pairs(pairs: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+    """Expand (user, assistant) seeds across user phrasing variants, deduped."""
+    expanded: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for user_text, assistant_text in pairs:
+        for variant in expand_user_phrasings(user_text):
+            key = (variant, assistant_text)
+            if key not in seen:
+                seen.add(key)
+                expanded.append(key)
+    return tuple(expanded)
+
+
+_ASSISTANT_BEHAVIOR_SEED_PAIRS = (
     ("Hi", "Hello! How can I help you today?"),
     ("Hello", "Hello! How can I help?"),
     ("Hey", "Hi! What would you like help with?"),
@@ -76,20 +131,21 @@ ASSISTANT_BEHAVIOR_SEEDS = (
     ("Please answer as an assistant, not as a fictional character.", "Understood. I will answer directly as an AI assistant."),
 )
 
-ANTI_ECHO_SEEDS = (
+_ANTI_ECHO_SEED_PAIRS = (
     ("What's Python", "Python is a popular programming language used for software, data, automation, and AI."),
-    ("What's Python?", "Python is a popular programming language used for software, data, automation, and AI."),
-    ("What is Python?", "Python is a popular programming language used for software, data, automation, and AI."),
     ("Tell me about Python", "Python is a programming language used for scripting, web development, data analysis, automation, and AI."),
     ("What's gravity", "Gravity is the force that pulls objects with mass toward each other."),
-    ("What's gravity?", "Gravity is the force that pulls objects with mass toward each other."),
-    ("What is gravity?", "Gravity is the force that pulls objects with mass toward each other."),
     ("What are atoms?", "Atoms are tiny building blocks of matter."),
     ("Explain sleep", "Sleep helps the body rest and repair itself. It also supports memory, focus, mood, and energy."),
     ("How do I study?", "Start by reviewing the main ideas, then practice with questions. Short, focused study sessions usually work better than cramming."),
     ("Hi", "Hello! How can I help?"),
     ("Hello", "Hello! How can I help?"),
 )
+
+# Public seed sets: each base pair fanned out across phrasing variants so the
+# anchored behavior generalizes across contractions and punctuation.
+ASSISTANT_BEHAVIOR_SEEDS = expand_seed_pairs(_ASSISTANT_BEHAVIOR_SEED_PAIRS)
+ANTI_ECHO_SEEDS = expand_seed_pairs(_ANTI_ECHO_SEED_PAIRS)
 
 
 def strip_question_template(content: str) -> str:
@@ -210,6 +266,45 @@ def build_pair_seed_examples(
     return examples
 
 
+def rendered_token_lengths(messages: list[dict], tokenizer: SpakieTokenizer) -> tuple[int, int]:
+    """Return (total_tokens, assistant_tokens) for a rendered conversation.
+
+    Mirrors how ``ChatSFTDataset``/``ChatSFTDatasetMLX`` tokenize each turn:
+    one role token + the content tokens + one ``<eos>``. Used to decide whether
+    a conversation fits the context window without truncating any answer.
+    """
+    total = 0
+    assistant = 0
+    for msg in messages:
+        n = len(tokenizer.encode(msg.get("content", ""))) + 2  # role token + eos
+        total += n
+        if msg.get("role") == "assistant":
+            assistant += n
+    return total, assistant
+
+
+def fits_context(
+    messages: list[dict],
+    tokenizer: SpakieTokenizer,
+    max_seq_len: int,
+    max_assistant_tokens: int,
+) -> bool:
+    """True if the conversation fits the window and respects the answer-length cap.
+
+    The dataset builds ``input_ids[: max_seq_len + 1]`` then shifts to length
+    ``max_seq_len``, so a conversation of exactly ``max_seq_len + 1`` tokens is
+    still fully supervised (its final ``<eos>`` survives the shift).
+    """
+    if max_seq_len <= 0:
+        return True
+    total, assistant = rendered_token_lengths(messages, tokenizer)
+    if total > max_seq_len + 1:
+        return False
+    if max_assistant_tokens > 0 and assistant > max_assistant_tokens:
+        return False
+    return True
+
+
 def signature(example: dict) -> tuple:
     # Dedup on user/assistant content only — the system prompt is uniform.
     return tuple(
@@ -219,10 +314,19 @@ def signature(example: dict) -> tuple:
     )
 
 
-def load_source(path: str, system_prompt: str | None, limit: int, seed: int) -> list[dict]:
+def load_source(
+    path: str,
+    system_prompt: str | None,
+    limit: int,
+    seed: int,
+    tokenizer: SpakieTokenizer | None = None,
+    max_seq_len: int = 0,
+    max_assistant_tokens: int = 0,
+) -> list[dict]:
     examples: list[dict] = []
     malformed = 0
     filtered = 0
+    too_long = 0
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -240,11 +344,23 @@ def load_source(path: str, system_prompt: str | None, limit: int, seed: int) -> 
             if example is None:
                 malformed += 1
                 continue
+            if tokenizer is not None and not fits_context(
+                example["messages"], tokenizer, max_seq_len, max_assistant_tokens
+            ):
+                too_long += 1
+                continue
             examples.append(example)
     if malformed:
         print(f"    warning: skipped {malformed} malformed lines in {os.path.basename(path)}")
     if filtered:
         print(f"    filtered {filtered} tool/template artifact examples in {os.path.basename(path)}")
+    if too_long:
+        print(
+            f"    dropped {too_long} examples over the {max_seq_len}-token window "
+            f"in {os.path.basename(path)} (would truncate an answer)"
+        )
+    # Length-filter before applying the cap so each source contributes `limit`
+    # usable examples rather than `limit` rows of which some are then discarded.
     if limit > 0 and len(examples) > limit:
         random.Random(seed).shuffle(examples)
         examples = examples[:limit]
@@ -279,6 +395,24 @@ def main() -> None:
         help="Global cap on total merged examples (0 = no cap)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed")
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=config.max_seq_len,
+        help=(
+            "Drop conversations whose rendered token length exceeds this window "
+            f"(default: model max_seq_len = {config.max_seq_len}). 0 disables length filtering."
+        ),
+    )
+    parser.add_argument(
+        "--max-assistant-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Drop examples whose combined assistant turns exceed this many tokens "
+            "(0 = no cap). Biases the mix toward concise answers."
+        ),
+    )
     parser.add_argument(
         "--assistant-seed-repeats",
         type=int,
@@ -332,12 +466,37 @@ def main() -> None:
 
     print(f"System prompt: {system_label}")
 
+    tokenizer: SpakieTokenizer | None = None
+    if args.max_seq_len > 0:
+        tokenizer_model = config.tokenizer_prefix + ".model"
+        if not os.path.exists(tokenizer_model):
+            print(
+                f"Tokenizer not found at {tokenizer_model}; cannot length-filter. "
+                "Train the tokenizer first or pass --max-seq-len 0."
+            )
+            sys.exit(2)
+        tokenizer = SpakieTokenizer(tokenizer_model)
+        cap_note = (
+            f", assistant<= {args.max_assistant_tokens}" if args.max_assistant_tokens > 0 else ""
+        )
+        print(f"Length filter: total<= {args.max_seq_len} tokens{cap_note}")
+    else:
+        print("Length filter: disabled")
+
     all_examples: list[dict] = []
     counts: Counter[str] = Counter()
     for path in paths:
         source_name = os.path.splitext(os.path.basename(path))[0]
         limit = config.sft_source_limits.get(source_name, 0)
-        examples = load_source(path, system_prompt, limit, args.seed)
+        examples = load_source(
+            path,
+            system_prompt,
+            limit,
+            args.seed,
+            tokenizer,
+            args.max_seq_len,
+            args.max_assistant_tokens,
+        )
         counts[source_name] = len(examples)
         cap_note = f" (cap {limit:,})" if limit > 0 else ""
         print(f"  {source_name}: {len(examples):,} examples{cap_note}")

@@ -53,6 +53,10 @@ class SpakieConfig:
     mlp_type: str = _D.get("mlp_type", "gelu")
     gelu_variant: str = _D.get("gelu_variant", "exact")
     norm_type: str = _D.get("norm_type", "layernorm")
+    # RMSNorm applied to per-head Q and K before attention (Qwen3/Gemma2 style).
+    # Stabilizes attention logits — especially valuable under Muon, which is more
+    # prone to attention-logit growth than AdamW. Off by default for back-compat.
+    qk_norm: bool = _D.get("qk_norm", False)
     loss_layout: str = _D.get("loss_layout", "flat")
     residual_type: str = _D.get("residual_type", "serial")
     attention_backend: str = _D.get("attention_backend", "sdpa")
@@ -337,6 +341,7 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
         "dropout",
         "bias",
         "activation_checkpointing",
+        "qk_norm",
     ):
         if hasattr(checkpoint_config, field_name):
             setattr(config, field_name, getattr(checkpoint_config, field_name))
@@ -345,6 +350,9 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
 
 def inherit_attention_shape_from_tensors(config: SpakieConfig, tensors: dict) -> SpakieConfig:
     """Infer MHA vs GQA from checkpoint tensor names/shapes for MLX safetensors."""
+    # QK-norm leaves per-head q_norm/k_norm gains in the checkpoint; detect them
+    # so chat/finetune rebuild the matching module structure.
+    config.qk_norm = any(name.endswith(".attn.q_norm.weight") for name in tensors)
     if any(name.endswith(".attn.qkv.weight") for name in tensors):
         config.n_kv_heads = 0
         return config

@@ -1,11 +1,13 @@
 """CLI entry point for SFT fine-tuning (PyTorch or MLX backend)."""
 
 import argparse
+import json
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from configs.default import (
+    DEFAULT_PRESET,
     SUPPORTED_PRESETS,
     checkpoint_search_dirs,
     get_preset_config,
@@ -26,14 +28,22 @@ _MLX_EXTS = (".safetensors",)
 
 
 def apply_optimizer_args(config, args) -> None:
-    config.sft_optimizer = args.optimizer
-    config.allow_adamw_fallback = args.allow_adamw_fallback
-    config.muon_adjust_lr_fn = args.muon_adjust_lr_fn
-    config.muon_ns_steps = args.muon_ns_steps
-    config.muon_momentum = args.muon_momentum
-    config.muon_nesterov = args.muon_nesterov
-    config.muon_qkv_split = args.muon_qkv_split
-    config.grouped_muon = args.grouped_muon
+    # CLI optimizer flags default to None so per-preset config values stay
+    # authoritative unless the user passes an explicit override.
+    overrides = {
+        "sft_optimizer": args.optimizer,
+        "muon_adjust_lr_fn": args.muon_adjust_lr_fn,
+        "muon_ns_steps": args.muon_ns_steps,
+        "muon_momentum": args.muon_momentum,
+        "muon_nesterov": args.muon_nesterov,
+        "muon_qkv_split": args.muon_qkv_split,
+        "grouped_muon": args.grouped_muon,
+    }
+    for field_name, value in overrides.items():
+        if value is not None:
+            setattr(config, field_name, value)
+    if args.allow_adamw_fallback:
+        config.allow_adamw_fallback = True
 
 
 def print_optimizer_banner(kind: str, *, stage: str) -> None:
@@ -86,6 +96,25 @@ def list_available_models(backend: str, preset_name: str | None = None) -> list[
     return available_models
 
 
+def infer_preset_from_checkpoint(checkpoint_path: str) -> str | None:
+    """Best-effort read of `preset_name` from a checkpoint's sidecar meta JSON.
+
+    MLX checkpoints write `<path>.meta.json`; torch `.pt` files carry the preset
+    inside the archive (not read here). Returns None when the preset can't be
+    determined or isn't a supported preset.
+    """
+    meta_path = checkpoint_path + ".meta.json"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                preset = json.load(handle).get("preset_name")
+        except (OSError, json.JSONDecodeError):
+            preset = None
+        if preset in SUPPORTED_PRESETS:
+            return preset
+    return None
+
+
 def resolve_source_checkpoint(
     available_models: list[tuple[str, str]],
     requested: str | None,
@@ -100,6 +129,11 @@ def resolve_source_checkpoint(
         for discovered_preset, path in available_models:
             if os.path.abspath(path) == os.path.abspath(candidate):
                 return discovered_preset, candidate
+        # An explicit path that exists but lives outside the standard per-preset
+        # checkpoint dirs: infer the preset from its own metadata so it still
+        # resolves (falling back to the default preset) rather than erroring out.
+        if os.path.exists(candidate):
+            return (infer_preset_from_checkpoint(candidate) or DEFAULT_PRESET), candidate
         return None, candidate
 
     alias_to_model = {
@@ -257,33 +291,17 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
     train_ds, val_ds = train_val_split(dataset)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    try:
-        finetune(
-            model,
-            train_ds,
-            val_ds,
-            config,
-            runtime,
-            num_workers=args.num_workers,
-            best_checkpoint_name=output_name,
-            interrupt_checkpoint_name=interrupt_name_for(output_name),
-        )
-    except Exception as exc:
-        if config.sft_optimizer == "muon" and args.allow_adamw_fallback:
-            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
-            config.sft_optimizer = "adamw"
-            finetune(
-                model,
-                train_ds,
-                val_ds,
-                config,
-                runtime,
-                num_workers=args.num_workers,
-                best_checkpoint_name=output_name,
-                interrupt_checkpoint_name=interrupt_name_for(output_name),
-            )
-        else:
-            raise
+    finetune(
+        model,
+        train_ds,
+        val_ds,
+        config,
+        runtime,
+        num_workers=args.num_workers,
+        best_checkpoint_name=output_name,
+        interrupt_checkpoint_name=interrupt_name_for(output_name),
+        allow_adamw_fallback=config.allow_adamw_fallback,
+    )
 
 
 def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_dir):
@@ -409,62 +427,40 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     val_ds = SubsetView(dataset, val_idx)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    try:
-        finetune_mlx(
-            model,
-            train_ds,
-            val_ds,
-            config,
-            runtime,
-            best_checkpoint_name=output_name,
-            interrupt_checkpoint_name=interrupt_name_for(output_name),
-            use_compile=args.mlx_compile,
-            use_prefetch=args.mlx_prefetch,
-            profile=args.mlx_profile,
-            eval_microbatch_loss=args.mlx_eval_microbatch_loss,
-            defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
-            sft_pack=args.sft_pack,
-            sft_gather_loss=args.sft_gather_loss,
-            sft_bucket_multiple=args.sft_bucket_multiple,
-            sft_length_bucket_size=args.sft_length_bucket_size,
-            sft_sampler=args.sft_sampler,
-            async_step_eval=args.mlx_async_step_eval,
-            max_steps=args.max_steps,
-            loss_log_path=args.loss_log,
-        )
-    except Exception as exc:
-        if config.sft_optimizer == "muon" and args.allow_adamw_fallback:
-            print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
-            config.sft_optimizer = "adamw"
-            finetune_mlx(
-                model,
-                train_ds,
-                val_ds,
-                config,
-                runtime,
-                best_checkpoint_name=output_name,
-                interrupt_checkpoint_name=interrupt_name_for(output_name),
-                use_compile=args.mlx_compile,
-                use_prefetch=args.mlx_prefetch,
-                profile=args.mlx_profile,
-                eval_microbatch_loss=args.mlx_eval_microbatch_loss,
-                defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
-                sft_pack=args.sft_pack,
-                sft_gather_loss=args.sft_gather_loss,
-                sft_bucket_multiple=args.sft_bucket_multiple,
-                sft_length_bucket_size=args.sft_length_bucket_size,
-                sft_sampler=args.sft_sampler,
-                async_step_eval=args.mlx_async_step_eval,
-                max_steps=args.max_steps,
-                loss_log_path=args.loss_log,
-            )
-        else:
-            raise
+    finetune_mlx(
+        model,
+        train_ds,
+        val_ds,
+        config,
+        runtime,
+        best_checkpoint_name=output_name,
+        interrupt_checkpoint_name=interrupt_name_for(output_name),
+        use_compile=args.mlx_compile,
+        use_prefetch=args.mlx_prefetch,
+        profile=args.mlx_profile,
+        eval_microbatch_loss=args.mlx_eval_microbatch_loss,
+        defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
+        sft_pack=args.sft_pack,
+        sft_gather_loss=args.sft_gather_loss,
+        sft_bucket_multiple=args.sft_bucket_multiple,
+        sft_length_bucket_size=args.sft_length_bucket_size,
+        sft_sampler=args.sft_sampler,
+        async_step_eval=args.mlx_async_step_eval,
+        max_steps=args.max_steps,
+        loss_log_path=args.loss_log,
+        allow_adamw_fallback=config.allow_adamw_fallback,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="CLI entry point for SFT fine-tuning")
-    parser.add_argument("--preset", type=str, default=None, help="Model preset to use (default: infer from selected source checkpoint)")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=SUPPORTED_PRESETS,
+        default=None,
+        help="Model preset to use (default: infer from selected source checkpoint)",
+    )
     parser.add_argument("--backend", choices=("torch", "mlx"), default="mlx",
                         help="Training backend")
     parser.add_argument("--train-jsonl", type=str, default="", help="Path to SFT JSONL file")
@@ -477,6 +473,8 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="Run a one-epoch subset smoke test")
     parser.add_argument("--max-examples", type=int, default=0, help="Optional cap on loaded SFT examples")
     parser.add_argument("--epochs", type=int, default=0, help="Override number of SFT epochs")
+    parser.add_argument("--sft-batch-size", type=int, default=0, help="Override SFT microbatch size")
+    parser.add_argument("--sft-grad-accum", type=int, default=0, help="Override SFT gradient accumulation steps")
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -496,8 +494,8 @@ def main():
     parser.add_argument(
         "--optimizer",
         choices=OPTIMIZER_CHOICES,
-        default="muon",
-        help="Optimizer to use. Muon is the required default; AdamW is fallback-only and not recommended.",
+        default=None,
+        help="Optimizer to use (default: preset config, normally muon). AdamW is fallback-only and not recommended.",
     )
     parser.add_argument(
         "--allow-adamw-fallback",
@@ -512,30 +510,30 @@ def main():
     parser.add_argument(
         "--muon-adjust-lr-fn",
         choices=MUON_ADJUST_LR_CHOICES,
-        default="match_rms_adamw",
-        help="Muon LR adjustment. match_rms_adamw reuses AdamW-tuned LR/WD.",
+        default=None,
+        help="Muon LR adjustment (default: preset config). match_rms_adamw reuses AdamW-tuned LR/WD.",
     )
-    parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
-    parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum")
+    parser.add_argument("--muon-ns-steps", type=int, default=None, help="Muon Newton-Schulz iteration count (default: preset config)")
+    parser.add_argument("--muon-momentum", type=float, default=None, help="Muon momentum (default: preset config)")
     parser.add_argument(
         "--muon-nesterov",
         dest="muon_nesterov",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use Muon Nesterov momentum",
+        default=None,
+        help="Use Muon Nesterov momentum (default: preset config)",
     )
     parser.add_argument(
         "--muon-qkv-split",
         dest="muon_qkv_split",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently",
+        default=None,
+        help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently (default: preset config)",
     )
     parser.add_argument(
         "--grouped-muon",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Batch same-shape MLX Muon Newton-Schulz updates across layers",
+        default=None,
+        help="Batch same-shape MLX Muon Newton-Schulz updates across layers (default: preset config)",
     )
     parser.add_argument(
         "--mlx-compile",
@@ -699,6 +697,10 @@ def main():
     apply_optimizer_args(config, args)
     if args.epochs > 0:
         config.sft_epochs = args.epochs
+    if args.sft_batch_size > 0:
+        config.sft_batch_size = args.sft_batch_size
+    if args.sft_grad_accum > 0:
+        config.sft_grad_accum_steps = args.sft_grad_accum
     if args.lr > 0:
         config.sft_lr = args.lr
     args.source_checkpoint = resolved_source_checkpoint
