@@ -1,5 +1,6 @@
 # Virtual environment
 venv/
+.venv/
 
 # Data (too large for git)
 data/
