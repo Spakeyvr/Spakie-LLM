@@ -22,9 +22,15 @@ from pathlib import Path
 from typing import Callable
 from xml.etree import ElementTree as ET
 
+import datasets
 import requests
 from datasets import load_dataset
 from tqdm import tqdm
+
+# The datasets library prints its own "Resolving data files" / download bars,
+# which clash with our own tqdm bar under concurrent sources. We report our
+# own progress, so silence theirs.
+datasets.disable_progress_bars()
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
