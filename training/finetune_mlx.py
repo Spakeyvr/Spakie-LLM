@@ -265,8 +265,9 @@ def finetune_mlx(
             drop_last=True,
             seed=0,
         )
-    steps_per_epoch = len(train_dataset) // config.sft_batch_size
-    total_steps = max(1, math.ceil(steps_per_epoch * config.sft_epochs / config.sft_grad_accum_steps))
+    microbatches_per_epoch = len(train_dataset) // config.sft_batch_size
+    steps_per_epoch = math.ceil(microbatches_per_epoch / config.sft_grad_accum_steps)
+    total_steps = max(1, steps_per_epoch * config.sft_epochs)
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -321,7 +322,6 @@ def finetune_mlx(
         nonlocal optimizer, global_step, epoch_loss, reached_max_steps
 
         accum_grads = _scale_partial_accum_grads(accum_grads, config, micro_in_step)
-        mx.eval(accum_grads, accum_loss_lazy)
         clipped, _ = (
             (accum_grads, None)
             if config.sft_grad_clip <= 0
@@ -385,7 +385,7 @@ def finetune_mlx(
             micro_in_step = 0
 
             pbar = tqdm(
-                range(steps_per_epoch),
+                range(microbatches_per_epoch),
                 desc=f"SFT[mlx] Epoch {epoch + 1}/{config.sft_epochs}",
             )
             prefetcher = (

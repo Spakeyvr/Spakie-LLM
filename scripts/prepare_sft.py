@@ -88,6 +88,8 @@ def expand_user_phrasings(user_text: str) -> list[str]:
     for current in list(variants):
         if current.endswith("?"):
             variants.add(current[:-1])
+        else:
+            variants.add(current + "?")
     return sorted(variants)
 
 

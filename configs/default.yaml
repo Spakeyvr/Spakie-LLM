@@ -104,7 +104,9 @@ defaults:
   checkpoint_dir: ""
 
   # Corpus planning
-  target_train_tokens: 5000000000
+  # 7.6B train tokens yields an 8B processed-token download target
+  # with the default 95/5 train/val split.
+  target_train_tokens: 7600000000
   target_processed_tokens: 0
   large_corpus_dir: data/raw/large_corpus
   corpus_report_path: data/processed/corpus_report.json

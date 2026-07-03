@@ -301,6 +301,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                         lr=config.pretrain_lr,
                         weight_decay=config.pretrain_weight_decay,
                     )
+                    set_optimizer_lr(optimizer, lr)
                     optimizer.step()
                 else:
                     raise

@@ -282,7 +282,7 @@ def run_mlx_pretrain(args, config):
             resume_state.setdefault("meta", {})["best_val_loss"] = float("inf")
         # Config fields aren't serialized in the safetensors; preset hyperparameters
         # come from get_preset_config. Honor CLI overrides for steps/tokens.
-        apply_optimizer_args(config, args)
+        apply_pretrain_cli_overrides(config, args)
         check_resume_optimizer(
             resume_state,
             config.pretrain_optimizer,

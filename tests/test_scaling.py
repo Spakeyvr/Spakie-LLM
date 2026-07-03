@@ -126,9 +126,16 @@ class ScalingConfigTests(unittest.TestCase):
             }) + "\n", encoding="utf-8")
 
             report_path = root / "processed" / "corpus_report.json"
+            processed_dir = root / "processed"
+            processed_dir.mkdir(parents=True, exist_ok=True)
+            existing_train = processed_dir / "train.npy"
+            existing_val = processed_dir / "val.npy"
+            existing_train.write_bytes(b"pre-existing-train")
+            existing_val.write_bytes(b"pre-existing-val")
+
             config = SpakieConfig(
                 raw_data_dir=str(root / "raw"),
-                processed_data_dir=str(root / "processed"),
+                processed_data_dir=str(processed_dir),
                 corpus_report_path=str(report_path),
                 token_shard_dir=str(root / "processed" / "shards"),
                 target_train_tokens=100,
@@ -153,6 +160,11 @@ class ScalingConfigTests(unittest.TestCase):
             self.assertTrue(report_path.exists())
             self.assertEqual(report["processed_tokens"], 0)
             self.assertEqual(report["source_stats"]["fineweb-edu"]["documents_seen"], 0)
+            # A --dry_run never writes train/val arrays, so an interrupt during
+            # a dry run must not delete pre-existing merged arrays from an
+            # earlier, completed, non-dry-run invocation.
+            self.assertTrue(existing_train.exists())
+            self.assertTrue(existing_val.exists())
 
     def test_token_shard_writer_preserves_token_order_across_boundaries(self):
         with tempfile.TemporaryDirectory() as tmpdir:

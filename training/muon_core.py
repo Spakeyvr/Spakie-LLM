@@ -13,13 +13,6 @@ MUON_FP32_MAX_ABS = 5e-3
 MUON_FP32_MAX_REL = 5e-2
 MUON_BF16_MAX_ABS = 2e-2
 MUON_BF16_MAX_REL = 5e-2
-# The tolerances above were validated at 5 NS iterations; per-iteration BF16
-# rounding noise compounds roughly linearly with iteration count.
-MUON_TOLERANCE_BASELINE_NS_STEPS = 5
-
-
-def muon_parity_tolerance_scale(ns_steps: int) -> float:
-    return max(1.0, ns_steps / MUON_TOLERANCE_BASELINE_NS_STEPS)
 
 
 @dataclass(frozen=True)

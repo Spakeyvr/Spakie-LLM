@@ -14,7 +14,9 @@ import json
 import os
 import random
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -27,6 +29,10 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
 
+
+# Set when the user interrupts. Sources poll it via should_stop() so worker
+# threads can finish the current record, flush progress, and exit cleanly.
+STOP_EVENT = threading.Event()
 
 HEADERS = {"User-Agent": "SpakieLLM/1.0 (educational language model project)"}
 GUTENDEX_API = "https://gutendex.com/books"
@@ -215,37 +221,46 @@ def pick_first(record: dict, fields: tuple[str, ...]) -> str:
 
 _LANGID_MODEL = None
 _LANGID_LOAD_ATTEMPTED = False
+_LANGID_LOCK = threading.Lock()
 
 
 def _load_langid_model(config: SpakieConfig):
-    """Lazy-load fastText lid.176 model, downloading it on first use."""
+    """Lazy-load fastText lid.176 model, downloading it on first use.
+
+    Guarded by a lock so concurrent sources don't race to download or load the
+    model. Preload it once from main() before starting workers to avoid a
+    thundering herd on the very first document.
+    """
     global _LANGID_MODEL, _LANGID_LOAD_ATTEMPTED
-    if _LANGID_MODEL is not None or _LANGID_LOAD_ATTEMPTED:
+    if _LANGID_LOAD_ATTEMPTED:
         return _LANGID_MODEL
-    _LANGID_LOAD_ATTEMPTED = True
-    try:
-        import fasttext
-    except ImportError as exc:
-        print(f"  langid disabled: install fasttext to enable ({exc})")
-        return None
-    model_path = Path(config.langid_model_path)
-    if not model_path.exists():
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  Downloading fastText lid.176 model to {model_path}")
+    with _LANGID_LOCK:
+        if _LANGID_LOAD_ATTEMPTED:
+            return _LANGID_MODEL
+        _LANGID_LOAD_ATTEMPTED = True
         try:
-            response = api_get(config.langid_model_url, timeout=120)
-            model_path.write_bytes(response.content)
-        except Exception as exc:
-            print(f"  langid disabled: failed to download model ({exc})")
+            import fasttext
+        except ImportError as exc:
+            print(f"  langid disabled: install fasttext to enable ({exc})")
             return None
-    try:
-        # fastText prints a deprecation warning on load; silence it.
-        fasttext.FastText.eprint = lambda *_args, **_kwargs: None
-        _LANGID_MODEL = fasttext.load_model(str(model_path))
-    except Exception as exc:
-        print(f"  langid disabled: failed to load model ({exc})")
-        return None
-    return _LANGID_MODEL
+        model_path = Path(config.langid_model_path)
+        if not model_path.exists():
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"  Downloading fastText lid.176 model to {model_path}")
+            try:
+                response = api_get(config.langid_model_url, timeout=120)
+                model_path.write_bytes(response.content)
+            except Exception as exc:
+                print(f"  langid disabled: failed to download model ({exc})")
+                return None
+        try:
+            # fastText prints a deprecation warning on load; silence it.
+            fasttext.FastText.eprint = lambda *_args, **_kwargs: None
+            _LANGID_MODEL = fasttext.load_model(str(model_path))
+        except Exception as exc:
+            print(f"  langid disabled: failed to load model ({exc})")
+            return None
+        return _LANGID_MODEL
 
 
 def is_probably_english(text: str, config: SpakieConfig | None = None) -> bool:
@@ -457,7 +472,8 @@ class SourceState:
         self.new_seen_ids: set[str] = set()
         self.new_seen_urls: set[str] = set()
         self.new_seen_titles: set[str] = set()
-        self.last_reported_docs = int(self.progress.get("docs_written", 0))
+        self.last_save_time = 0.0
+        self.last_report_time = 0.0
 
     def _load_seen(self, path: Path) -> set[str]:
         if self.resume and path.exists():
@@ -509,7 +525,22 @@ class SourceState:
                 handle.write(value + "\n")
         values.clear()
 
+    def maybe_save(self, min_interval: float = 10.0) -> None:
+        """Persist progress at most once per interval to avoid disk churn."""
+        now = time.monotonic()
+        if now - self.last_save_time >= min_interval:
+            self.save()
+            self.last_save_time = now
+
+    def maybe_report(self, min_interval: float = 10.0) -> None:
+        now = time.monotonic()
+        if now - self.last_report_time >= min_interval:
+            print(f"  {self.budget.source_name}: {self.progress_summary()}")
+            self.last_report_time = now
+
     def should_stop(self) -> bool:
+        if STOP_EVENT.is_set():
+            return True
         return (
             self.progress["chars_written"] >= self.budget.target_chars
             or (
@@ -633,19 +664,16 @@ def ingest_hf_source(source_name: str, state: SourceState, english_only: bool) -
     rows_seen = int(state.progress.get("hf_rows_seen", 0))
     record_iter = iter_hf_records(source_name)
     if rows_seen > 0:
+        # HF streaming can't seek, so resume replays already-seen rows and skips
+        # them here (cheap) rather than re-accepting them.
         record_iter = itertools.islice(record_iter, rows_seen, None)
     for record in record_iter:
-        state.progress["hf_rows_seen"] = int(state.progress.get("hf_rows_seen", 0)) + 1
+        state.progress["hf_rows_seen"] += 1
         if state.should_stop():
             break
-        accepted = state.accept(record, english_only=english_only)
-        docs_written = int(state.progress["docs_written"])
-        if accepted and docs_written % 100 == 0 and docs_written != state.last_reported_docs:
-            state.save()
-            print(f"  {source_name}: {state.progress_summary()}")
-            state.last_reported_docs = docs_written
-        if state.should_stop():
-            break
+        state.accept(record, english_only=english_only)
+        state.maybe_save()
+        state.maybe_report()
 
 
 def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
@@ -684,7 +712,8 @@ def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
                     "license": "Public domain",
                 },
             }, english_only=english_only)
-            state.save()
+            state.maybe_save()
+            state.maybe_report()
             time.sleep(0.5)
         next_url = payload.get("next")
 
@@ -729,8 +758,8 @@ def ingest_arxiv(state: SourceState, english_only: bool) -> None:
                     "text": body,
                     "meta": {"source": "arxiv", "license": "arXiv metadata / abstract"},
                 }, english_only=english_only)
-            state.save()
-            print(f"  arxiv: {state.progress_summary()}")
+            state.maybe_save()
+            state.maybe_report()
             time.sleep(0.5)
         if not made_progress:
             break
@@ -792,8 +821,8 @@ def ingest_stackexchange(state: SourceState, english_only: bool) -> None:
                 time.sleep(0.2)
             page += 1
             site_pages[site] = page
-            state.save()
-            print(f"  stackexchange/{site}: {state.progress_summary()}")
+            state.maybe_save()
+            state.maybe_report()
             if not payload.get("has_more"):
                 break
             time.sleep(0.5)
@@ -821,6 +850,27 @@ def parse_sources(raw: str, config: SpakieConfig) -> list[str]:
     return unique_sources
 
 
+def run_source(source_name: str, budget: SourceBudget, config: SpakieConfig, english_only: bool, resume: bool) -> None:
+    """Download a single source end to end. Runs in its own worker thread."""
+    source_dir = Path(config.large_corpus_dir) / source_name
+    source_dir.mkdir(parents=True, exist_ok=True)
+    state = SourceState(source_dir, budget, resume=resume, config=config)
+    print(
+        f"[{source_name}] kind={budget.kind} "
+        f"target_chars={budget.target_chars:,} "
+        f"target_docs={budget.target_docs:,} "
+        f"target_tokens_est={budget.target_tokens_estimate:,}"
+    )
+    try:
+        if source_name in HF_DATASETS:
+            ingest_hf_source(source_name, state, english_only=english_only)
+        else:
+            SOURCE_HANDLERS[source_name](state, english_only)
+    finally:
+        state.close()
+    print(f"  completed [{source_name}] {state.progress_summary()}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download a large pretraining corpus into JSONL shards")
     parser.add_argument("--sources", type=str, default="all", help="Comma-separated list of sources")
@@ -829,6 +879,7 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true", help="Resume from progress manifests")
     parser.add_argument("--reset_source", type=str, default="", help="Comma-separated list of sources to reset")
     parser.add_argument("--english_only", action="store_true", help="Keep only likely English documents")
+    parser.add_argument("--workers", type=int, default=0, help="Concurrent source downloads (0 = one per source)")
     args = parser.parse_args()
 
     config = SpakieConfig()
@@ -842,42 +893,46 @@ def main() -> None:
         target_processed_tokens=target_tokens,
         requested_sources=sources,
     )
-    failures: list[tuple[str, str]] = []
 
+    budgets: dict[str, SourceBudget] = {}
     for source_name in sources:
         if source_name not in source_plan:
             raise ValueError(f"Unsupported source or disabled source plan entry: {source_name}")
         if source_name not in SOURCE_HANDLERS and source_name not in HF_DATASETS:
             raise ValueError(f"Unsupported source: {source_name}")
-
         source_dir = root / source_name
         source_dir.mkdir(parents=True, exist_ok=True)
         if source_name in reset_sources:
             reset_source_dir(source_dir)
+        budgets[source_name] = build_budget(source_name, source_plan[source_name], args.max_docs)
 
-        budget = build_budget(source_name, source_plan[source_name], args.max_docs)
-        state = SourceState(source_dir, budget, resume=args.resume, config=config)
-        print(
-            f"\n[{source_name}] kind={budget.kind} "
-            f"target_chars={budget.target_chars:,} "
-            f"target_docs={budget.target_docs:,} "
-            f"target_tokens_est={budget.target_tokens_estimate:,}"
-        )
+    # Load the langid model once up front so concurrent workers share it instead
+    # of racing to download/load it on their first document.
+    if args.english_only:
+        _load_langid_model(config)
+
+    workers = args.workers if args.workers > 0 else len(sources)
+    workers = max(1, min(workers, len(sources)))
+    print(f"Downloading {len(sources)} source(s) with {workers} concurrent worker(s)")
+
+    failures: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(run_source, name, budgets[name], config, args.english_only, args.resume): name
+            for name in sources
+        }
         try:
-            try:
-                if source_name in HF_DATASETS:
-                    ingest_hf_source(source_name, state, english_only=args.english_only)
-                else:
-                    SOURCE_HANDLERS[source_name](state, args.english_only)
-            except KeyboardInterrupt:
-                print("\nInterrupted while downloading corpus data. Progress has been saved.")
-                return
-            except Exception as exc:
-                failures.append((source_name, str(exc)))
-                print(f"  source failed: {source_name} -> {exc}")
-        finally:
-            state.close()
-        print(f"  completed {state.progress_summary()}")
+            for future in as_completed(futures):
+                source_name = futures[future]
+                exc = future.exception()
+                if exc is not None:
+                    failures.append((source_name, str(exc)))
+                    print(f"  source failed: {source_name} -> {exc}")
+        except KeyboardInterrupt:
+            print("\nInterrupted; signalling workers to flush progress and stop...")
+            STOP_EVENT.set()
+            # Exiting the `with` block waits for workers to reach should_stop()
+            # and close() their shard writers, so progress stays resumable.
 
     if failures:
         print("\nCompleted with source failures:")

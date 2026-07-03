@@ -1232,10 +1232,11 @@ def prepare_data(
             report["partial_token_shards"] = [str(path) for path in shard_paths]
             with report_dest.open("w", encoding="utf-8") as handle:
                 json.dump(report, handle, ensure_ascii=False, indent=2)
-        for stale_path in (processed_dir / "train.npy", processed_dir / "val.npy"):
-            if stale_path.exists():
-                stale_path.unlink()
-                print(f"Removed stale merged array: {stale_path}")
+        if not dry_run:
+            for stale_path in (processed_dir / "train.npy", processed_dir / "val.npy"):
+                if stale_path.exists():
+                    stale_path.unlink()
+                    print(f"Removed stale merged array: {stale_path}")
         print(f"Partial processed tokens: {total_tokens:,}")
         print(f"Partial report: {report_dest}")
         if shard_paths:

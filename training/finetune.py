@@ -113,7 +113,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
         weight_decay=config.sft_weight_decay,
     )
 
-    total_steps = math.ceil(len(train_loader) * config.sft_epochs / config.sft_grad_accum_steps)
+    steps_per_epoch = math.ceil(len(train_loader) / config.sft_grad_accum_steps)
+    total_steps = steps_per_epoch * config.sft_epochs
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     best_val_loss = float("inf")
     patience_counter = 0

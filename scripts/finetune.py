@@ -7,7 +7,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from configs.default import (
-    DEFAULT_PRESET,
     SUPPORTED_PRESETS,
     checkpoint_search_dirs,
     get_preset_config,
@@ -97,12 +96,25 @@ def list_available_models(backend: str, preset_name: str | None = None) -> list[
 
 
 def infer_preset_from_checkpoint(checkpoint_path: str) -> str | None:
-    """Best-effort read of `preset_name` from a checkpoint's sidecar meta JSON.
+    """Best-effort read of `preset_name` from a checkpoint's own metadata.
 
-    MLX checkpoints write `<path>.meta.json`; torch `.pt` files carry the preset
-    inside the archive (not read here). Returns None when the preset can't be
-    determined or isn't a supported preset.
+    MLX checkpoints write `<path>.meta.json`; torch `.pt` files carry a pickled
+    `SpakieConfig` (with `preset_name`) inside the archive. Returns None when
+    the preset can't be determined or isn't a supported preset.
     """
+    if checkpoint_path.endswith(_TORCH_EXTS):
+        import torch
+
+        try:
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except (OSError, RuntimeError):
+            return None
+        checkpoint_config = ckpt.get("config") if isinstance(ckpt, dict) else None
+        preset = getattr(checkpoint_config, "preset_name", None)
+        if preset in SUPPORTED_PRESETS:
+            return preset
+        return None
+
     meta_path = checkpoint_path + ".meta.json"
     if os.path.exists(meta_path):
         try:
@@ -130,10 +142,11 @@ def resolve_source_checkpoint(
             if os.path.abspath(path) == os.path.abspath(candidate):
                 return discovered_preset, candidate
         # An explicit path that exists but lives outside the standard per-preset
-        # checkpoint dirs: infer the preset from its own metadata so it still
-        # resolves (falling back to the default preset) rather than erroring out.
+        # checkpoint dirs: infer the preset from its own metadata.
         if os.path.exists(candidate):
-            return (infer_preset_from_checkpoint(candidate) or DEFAULT_PRESET), candidate
+            inferred = infer_preset_from_checkpoint(candidate)
+            if inferred:
+                return inferred, candidate
         return None, candidate
 
     alias_to_model = {
