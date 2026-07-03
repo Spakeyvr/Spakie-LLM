@@ -174,27 +174,52 @@ STACKEXCHANGE_SITES = [
 ]
 
 
+def _response_error_detail(response: requests.Response) -> str:
+    """Pull the API's own error message out of the body, if there is one.
+
+    requests.raise_for_status() only reports the HTTP status line, which is
+    useless for e.g. Stack Exchange's JSON error bodies that explain *why*
+    (quota exceeded, paging too deep, bad parameter, ...).
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:200]
+    if isinstance(payload, dict):
+        message = payload.get("error_message") or payload.get("message")
+        if message:
+            return str(message)
+    return response.text[:200]
+
+
 def api_get(url: str, *, params: dict | None = None, timeout: int = 60, max_retries: int = 5) -> requests.Response:
     last_error = None
     for attempt in range(max_retries):
         try:
             response = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-            if response.status_code == 200:
-                return response
-            if response.status_code == 429 or response.status_code >= 500:
-                wait = min(2 ** attempt * 3, 60)
-                retry_after = response.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
-                    wait = int(retry_after)
-                log(f"  Retrying {url} after HTTP {response.status_code} ({wait}s)")
-                time.sleep(wait)
-                continue
-            response.raise_for_status()
-        except Exception as exc:
+        except requests.RequestException as exc:
+            # Network-level failure (timeout, connection reset, DNS, ...) is
+            # genuinely transient — worth retrying with backoff.
             last_error = exc
             wait = min(2 ** attempt * 2, 30)
             log(f"  Request failed: {exc} ({wait}s)")
             time.sleep(wait)
+            continue
+        if response.status_code == 200:
+            return response
+        if response.status_code == 429 or response.status_code >= 500:
+            wait = min(2 ** attempt * 3, 60)
+            retry_after = response.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                wait = int(retry_after)
+            log(f"  Retrying {url} after HTTP {response.status_code} ({wait}s)")
+            time.sleep(wait)
+            continue
+        # Any other 4xx (bad request, not found, quota/throttle) is a
+        # permanent rejection of this exact request — retrying it changes
+        # nothing, so fail fast instead of burning a minute of backoff.
+        detail = _response_error_detail(response)
+        raise requests.HTTPError(f"{response.status_code} {response.reason} for {url} — {detail}", response=response)
     if last_error:
         raise last_error
     raise RuntimeError(f"Failed request to {url}")
@@ -811,6 +836,11 @@ def ingest_arxiv(state: SourceState, english_only: bool) -> None:
             break
 
 
+def _is_quota_exhausted(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "quota" in message or "throttle" in message or "too many requests" in message
+
+
 def ingest_stackexchange(state: SourceState, english_only: bool) -> None:
     if state.should_stop():
         state.save()
@@ -832,14 +862,20 @@ def ingest_stackexchange(state: SourceState, english_only: bool) -> None:
                         "filter": "withbody",
                     },
                 ).json()
+                questions = payload.get("items", [])
+                if not questions:
+                    break
+                accepted_ids = [q["accepted_answer_id"] for q in questions if q.get("accepted_answer_id")]
+                answers = fetch_answers(accepted_ids, site)
             except Exception as exc:
+                # Quota/throttle errors are IP-wide, not per-site — every
+                # remaining site would fail the same way, so stop the whole
+                # source instead of burning a doomed request per site.
+                if _is_quota_exhausted(exc):
+                    log(f"  stackexchange: quota/throttle exhausted, stopping source early: {exc}")
+                    return
                 log(f"  Skip Stack Exchange site '{site}': {exc}")
                 break
-            questions = payload.get("items", [])
-            if not questions:
-                break
-            accepted_ids = [q["accepted_answer_id"] for q in questions if q.get("accepted_answer_id")]
-            answers = fetch_answers(accepted_ids, site)
             for question in questions:
                 if state.should_stop():
                     break
