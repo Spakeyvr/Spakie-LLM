@@ -498,6 +498,13 @@ class SourceState:
         # writers from multiple threads.
         self.progress_bar = progress_bar
         self.progress_lock = progress_lock
+        # HF streaming yields records in bursts (fast when a shard is already
+        # buffered locally, stalled while the next one downloads). Updating
+        # the bar on every doc makes tqdm's rate estimate swing wildly between
+        # those bursts and stalls. Accumulate locally and flush on a steady
+        # clock instead, so the shared bar sees evenly spaced updates.
+        self.pending_bar_tokens = 0
+        self.last_bar_flush_time = time.monotonic()
 
     def _load_seen(self, path: Path) -> set[str]:
         if self.resume and path.exists():
@@ -556,6 +563,23 @@ class SourceState:
             self.save()
             self.last_save_time = now
 
+    def maybe_flush_bar(self, min_interval: float = 0.5) -> None:
+        """Push accumulated tokens to the shared bar on a steady clock.
+
+        Flushing per-doc instead of on a timer makes tqdm's rate estimate
+        swing wildly between bursty local batches and network-stalled ones;
+        a steady flush interval smooths that out.
+        """
+        if self.progress_bar is None or self.progress_lock is None or self.pending_bar_tokens == 0:
+            return
+        now = time.monotonic()
+        if now - self.last_bar_flush_time < min_interval:
+            return
+        with self.progress_lock:
+            self.progress_bar.update(self.pending_bar_tokens)
+        self.pending_bar_tokens = 0
+        self.last_bar_flush_time = now
+
     def should_stop(self) -> bool:
         if STOP_EVENT.is_set():
             return True
@@ -591,12 +615,8 @@ class SourceState:
         self.progress["docs_written"] += 1
         self.progress["chars_written"] += len(text)
         self.progress["estimated_tokens"] += token_delta
-        if self.progress_bar is not None and self.progress_lock is not None:
-            # tqdm throttles actual screen redraws internally (~10Hz default),
-            # so updating on every accepted doc is cheap; the lock only guards
-            # the shared counter against concurrent writer threads.
-            with self.progress_lock:
-                self.progress_bar.update(token_delta)
+        self.pending_bar_tokens += token_delta
+        self.maybe_flush_bar()
         if doc_id:
             self.seen_ids.add(doc_id)
             self.new_seen_ids.add(doc_id)
@@ -619,6 +639,10 @@ class SourceState:
     def close(self) -> None:
         self.writer.close()
         self.save()
+        if self.progress_bar is not None and self.progress_lock is not None and self.pending_bar_tokens:
+            with self.progress_lock:
+                self.progress_bar.update(self.pending_bar_tokens)
+            self.pending_bar_tokens = 0
 
 
 def build_budget(source_name: str, source_plan: dict[str, int | str | bool], max_docs: int) -> SourceBudget:
@@ -953,6 +977,10 @@ def main() -> None:
         desc="Downloading corpus",
         unit="tok",
         unit_scale=True,
+        # Lower smoothing = closer to a running average since start rather than
+        # weighting recent (bursty) updates heavily, so the tok/s readout
+        # doesn't swing wildly between buffered bursts and network stalls.
+        smoothing=0.05,
     )
     progress_lock = threading.Lock()
 
