@@ -168,7 +168,7 @@ presets:
     activation_checkpointing: false
     pretrain_batch_size: 96
     pretrain_grad_accum_steps: 2
-    sft_batch_size: 32
+    sft_batch_size: 64
     sft_grad_accum_steps: 4
     sft_lr: 3.0e-5
     sft_epochs: 4
@@ -200,22 +200,48 @@ source_min_doc_chars:
   dictionary: 80
 
 sft_source_limits:
-  # Caps are applied AFTER length filtering, so each number is usable, fully
-  # in-window examples. The mix is tilted toward concise, single-turn answering:
-  # DeepSeek-distilled and custom are uncapped (best fit + concise), smoltalk is
-  # held down because most of it overflows the 512-token window and is verbose.
-  alpaca: 12000
-  no_robots: 8000
-  smoltalk: 6000
-  # Short factual / multiple-choice QA: teaches concise factual answering and
-  # context grounding. These fit the 512-token window well (boolq/squad lose
-  # their long-passage rows to the length filter, which is fine).
-  squad: 5000
-  triviaqa: 3000
-  sciq: 6000
-  arc_challenge: 2000
-  openbookqa: 5000
-  boolq: 3000
+  # `enabled` controls whether download/prepare uses a source. `limit: 0` means
+  # uncapped for local raw JSONL sources during prepare; downloaded sources
+  # should keep a positive limit to avoid accidental full-dataset pulls.
+  DeepSeek-distilled:
+    enabled: true
+    limit: 0
+  custom:
+    enabled: true
+    limit: 0
+  nemotron_instruction_following_chat_v3:
+    enabled: true
+    limit: 50000
+  nemotron_math_v4:
+    enabled: true
+    limit: 25000
+  alpaca:
+    enabled: false
+    limit: 12000
+  no_robots:
+    enabled: false
+    limit: 8000
+  smoltalk:
+    enabled: true
+    limit: 8000
+  squad:
+    enabled: false
+    limit: 5000
+  triviaqa:
+    enabled: true
+    limit: 3000
+  sciq:
+    enabled: false
+    limit: 6000
+  arc_challenge:
+    enabled: false
+    limit: 2000
+  openbookqa:
+    enabled: false
+    limit: 5000
+  boolq:
+    enabled: false
+    limit: 3000
 
 corpus_source_plan:
   fineweb-edu:

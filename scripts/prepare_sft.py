@@ -487,7 +487,10 @@ def main() -> None:
     counts: Counter[str] = Counter()
     for path in paths:
         source_name = os.path.splitext(os.path.basename(path))[0]
-        limit = config.sft_source_limits.get(source_name, 0)
+        if not config.sft_source_enabled(source_name):
+            print(f"  {source_name}: disabled")
+            continue
+        limit = config.sft_source_limit(source_name)
         examples = load_source(
             path,
             system_prompt,

@@ -58,6 +58,37 @@ class DownloadSFTDataTests(unittest.TestCase):
         load_squad.assert_not_called()
         load_triviaqa.assert_called_once()
 
+    def test_parse_sources_all_uses_enabled_downloadable_sources(self):
+        controlled = SpakieConfig()
+        controlled.sft_source_limits = {
+            "DeepSeek-distilled": {"enabled": True, "limit": 0},
+            "custom": {"enabled": True, "limit": 0},
+            "nemotron_instruction_following_chat_v3": {"enabled": True, "limit": 50000},
+            "nemotron_math_v4": {"enabled": True, "limit": 50000},
+            "alpaca": {"enabled": False, "limit": 12000},
+        }
+
+        sources = download_sft_data.parse_sources(
+            "all",
+            controlled,
+            {"alpaca", "nemotron_instruction_following_chat_v3", "nemotron_math_v4"},
+        )
+
+        self.assertEqual(
+            sources,
+            ["nemotron_instruction_following_chat_v3", "nemotron_math_v4"],
+        )
+
+    def test_clean_chat_messages_drops_null_content(self):
+        cleaned = download_sft_data.clean_chat_messages(
+            [
+                {"role": "user", "content": None},
+                {"role": "assistant", "content": "Answer."},
+            ]
+        )
+
+        self.assertEqual(cleaned, [])
+
     def test_load_no_robots_preserves_clean_chat_messages(self):
         rows = FakeDataset([
             {

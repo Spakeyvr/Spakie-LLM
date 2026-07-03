@@ -52,7 +52,8 @@ def clean_chat_messages(messages: object, *, fold_system_into_user: bool = False
         if not isinstance(msg, dict):
             return []
         role = msg.get("role")
-        content = trim(msg.get("content", ""))
+        raw_content = msg.get("content", "")
+        content = "" if raw_content is None else trim(raw_content)
         if role == "system":
             if fold_system_into_user and content:
                 system_parts.append(content)
@@ -70,6 +71,50 @@ def clean_chat_messages(messages: object, *, fold_system_into_user: bool = False
     if not cleaned or cleaned[0]["role"] != "user" or cleaned[-1]["role"] != "assistant":
         return []
     return cleaned
+
+
+def coerce_messages(raw_messages: object) -> list | None:
+    if isinstance(raw_messages, str):
+        try:
+            raw_messages = json.loads(raw_messages)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw_messages, list):
+        return None
+
+    messages = []
+    for item in raw_messages:
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(item, dict):
+            return None
+        messages.append(item)
+    return messages
+
+
+def load_hf_chat_messages(
+    dataset_id: str,
+    split: str,
+    limit: int,
+    seed: int,
+    label: str,
+) -> list[dict]:
+    print(f"Loading {label}...")
+    dataset = load_dataset(dataset_id, split=split, streaming=True)
+    rows = dataset.shuffle(seed=seed, buffer_size=10_000) if limit > 0 else dataset
+
+    examples = []
+    for row in rows:
+        messages = coerce_messages(row.get("messages"))
+        cleaned = clean_chat_messages(messages)
+        if cleaned:
+            examples.append({"messages": cleaned})
+        if limit > 0 and len(examples) >= limit:
+            break
+    return examples
 
 
 def download_alpaca(limit: int, seed: int) -> list[dict]:
@@ -255,12 +300,38 @@ def load_openbookqa(limit: int, seed: int) -> list[dict]:
     return examples
 
 
+def load_nemotron_instruction_following_chat_v3(limit: int, seed: int) -> list[dict]:
+    return load_hf_chat_messages(
+        "nvidia/Nemotron-SFT-Instruction-Following-Chat-v3",
+        "chat",
+        limit,
+        seed,
+        "Nemotron SFT Instruction Following Chat v3",
+    )
+
+
+def load_nemotron_math_v4(limit: int, seed: int) -> list[dict]:
+    return load_hf_chat_messages(
+        "nvidia/Nemotron-SFT-Math-v4",
+        "train",
+        limit,
+        seed,
+        "Nemotron SFT Math v4",
+    )
+
+
 def write_jsonl(path: str, examples: list[dict]) -> None:
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as handle:
         for example in examples:
             handle.write(json.dumps(example, ensure_ascii=False) + "\n")
     os.replace(tmp_path, path)
+
+
+def parse_sources(raw_sources: str, config: SpakieConfig, available_sources: set[str]) -> list[str]:
+    if raw_sources.strip().lower() == "all":
+        return config.enabled_sft_sources(available_sources)
+    return [source.strip() for source in raw_sources.split(",") if source.strip()]
 
 
 def main() -> None:
@@ -270,8 +341,8 @@ def main() -> None:
     parser.add_argument(
         "--sources",
         type=str,
-        default="alpaca,no_robots,smoltalk,squad,triviaqa,sciq,arc_challenge,openbookqa,boolq",
-        help="Comma-separated SFT sources to download",
+        default="all",
+        help="Comma-separated SFT sources to download, or all enabled downloadable sources",
     )
     parser.add_argument(
         "--output-dir",
@@ -293,8 +364,10 @@ def main() -> None:
         "arc_challenge": lambda limit: load_arc("ARC-Challenge", limit, args.seed, "Challenge"),
         "openbookqa": lambda limit: load_openbookqa(limit, args.seed),
         "boolq": lambda limit: load_boolq(limit, args.seed),
+        "nemotron_instruction_following_chat_v3": lambda limit: load_nemotron_instruction_following_chat_v3(limit, args.seed),
+        "nemotron_math_v4": lambda limit: load_nemotron_math_v4(limit, args.seed),
     }
-    requested_sources = [source.strip() for source in args.sources.split(",") if source.strip()]
+    requested_sources = parse_sources(args.sources, config, set(source_builders))
     unknown_sources = sorted(set(requested_sources) - set(source_builders))
     if unknown_sources:
         print(f"Unknown sources: {', '.join(unknown_sources)}")
@@ -302,7 +375,10 @@ def main() -> None:
 
     for source_name in requested_sources:
         builder = source_builders[source_name]
-        limit = config.sft_source_limits.get(source_name, 0)
+        if not config.sft_source_enabled(source_name):
+            print(f"  {source_name}: disabled")
+            continue
+        limit = config.sft_source_limit(source_name)
         if limit <= 0:
             print(f"  {source_name}: disabled (limit {limit})")
             continue

@@ -20,6 +20,13 @@ def default_corpus_source_plan() -> dict[str, dict[str, int | str | bool]]:
     return {k: dict(v) for k, v in _CFG["corpus_source_plan"].items()}
 
 
+def default_sft_source_limits() -> dict[str, int | dict[str, int | bool]]:
+    limits: dict[str, int | dict[str, int | bool]] = {}
+    for source_name, entry in _CFG["sft_source_limits"].items():
+        limits[source_name] = dict(entry) if isinstance(entry, dict) else entry
+    return limits
+
+
 def normalize_corpus_source(source_name: str) -> str:
     source = (source_name or "").strip().lower()
     return CORPUS_SOURCE_ALIASES.get(source, source)
@@ -173,8 +180,8 @@ class SpakieConfig:
     langid_model_path: str = _D["langid_model_path"]
     langid_model_url: str = _D["langid_model_url"]
     corpus_source_plan: dict[str, dict[str, int | str | bool]] = field(default_factory=default_corpus_source_plan)
-    sft_source_limits: dict[str, int] = field(
-        default_factory=lambda: dict(_CFG["sft_source_limits"])
+    sft_source_limits: dict[str, int | dict[str, int | bool]] = field(
+        default_factory=default_sft_source_limits
     )
 
     def __post_init__(self):
@@ -223,6 +230,29 @@ class SpakieConfig:
 
     def pretrain_tokens_per_step(self) -> int:
         return self.pretrain_batch_size * self.pretrain_grad_accum_steps * self.max_seq_len
+
+    def sft_source_enabled(self, source_name: str) -> bool:
+        entry = self.sft_source_limits.get(source_name)
+        if entry is None:
+            return True
+        if isinstance(entry, dict):
+            return bool(entry.get("enabled", True))
+        return int(entry) > 0
+
+    def sft_source_limit(self, source_name: str) -> int:
+        entry = self.sft_source_limits.get(source_name, 0)
+        if isinstance(entry, dict):
+            return int(entry.get("limit", 0))
+        return int(entry)
+
+    def enabled_sft_sources(self, available_sources: set[str] | None = None) -> list[str]:
+        sources = []
+        for source_name in self.sft_source_limits:
+            if available_sources is not None and source_name not in available_sources:
+                continue
+            if self.sft_source_enabled(source_name):
+                sources.append(source_name)
+        return sources
 
     def scaled_corpus_source_plan(
         self,

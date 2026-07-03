@@ -171,12 +171,13 @@ python3 scripts/finetune.py --backend mlx --precision auto
 python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
-The default SFT download includes Alpaca Clean, HuggingFaceH4/no_robots,
-HuggingFaceTB/smoltalk, SQuAD, SciQ, BoolQ, ARC, and OpenBookQA. To download
-only selected sources:
+The default SFT download uses the enabled sources in `configs/default.yaml`.
+The current downloadable defaults are NVIDIA Nemotron instruction-following chat
+v3 and Nemotron math v4, each capped at 50,000 examples. To download only
+selected sources:
 
 ```bash
-python3 scripts/download_sft_data.py --sources smoltalk,no_robots,alpaca
+python3 scripts/download_sft_data.py --sources nemotron_math_v4
 ```
 
 For a small targeted SFT/eval set instead of downloaded SFT sources:
