@@ -24,10 +24,16 @@ from xml.etree import ElementTree as ET
 
 import requests
 from datasets import load_dataset
+from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
+
+
+def log(message: str) -> None:
+    """Print without corrupting any active tqdm progress bars."""
+    tqdm.write(message)
 
 
 # Set when the user interrupts. Sources poll it via should_stop() so worker
@@ -174,14 +180,14 @@ def api_get(url: str, *, params: dict | None = None, timeout: int = 60, max_retr
                 retry_after = response.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
                     wait = int(retry_after)
-                print(f"  Retrying {url} after HTTP {response.status_code} ({wait}s)")
+                log(f"  Retrying {url} after HTTP {response.status_code} ({wait}s)")
                 time.sleep(wait)
                 continue
             response.raise_for_status()
         except Exception as exc:
             last_error = exc
             wait = min(2 ** attempt * 2, 30)
-            print(f"  Request failed: {exc} ({wait}s)")
+            log(f"  Request failed: {exc} ({wait}s)")
             time.sleep(wait)
     if last_error:
         raise last_error
@@ -241,24 +247,24 @@ def _load_langid_model(config: SpakieConfig):
         try:
             import fasttext
         except ImportError as exc:
-            print(f"  langid disabled: install fasttext to enable ({exc})")
+            log(f"  langid disabled: install fasttext to enable ({exc})")
             return None
         model_path = Path(config.langid_model_path)
         if not model_path.exists():
             model_path.parent.mkdir(parents=True, exist_ok=True)
-            print(f"  Downloading fastText lid.176 model to {model_path}")
+            log(f"  Downloading fastText lid.176 model to {model_path}")
             try:
                 response = api_get(config.langid_model_url, timeout=120)
                 model_path.write_bytes(response.content)
             except Exception as exc:
-                print(f"  langid disabled: failed to download model ({exc})")
+                log(f"  langid disabled: failed to download model ({exc})")
                 return None
         try:
             # fastText prints a deprecation warning on load; silence it.
             fasttext.FastText.eprint = lambda *_args, **_kwargs: None
             _LANGID_MODEL = fasttext.load_model(str(model_path))
         except Exception as exc:
-            print(f"  langid disabled: failed to load model ({exc})")
+            log(f"  langid disabled: failed to load model ({exc})")
             return None
         return _LANGID_MODEL
 
@@ -455,7 +461,15 @@ class JsonlShardWriter:
 
 
 class SourceState:
-    def __init__(self, source_dir: Path, budget: SourceBudget, resume: bool, config: SpakieConfig | None = None):
+    def __init__(
+        self,
+        source_dir: Path,
+        budget: SourceBudget,
+        resume: bool,
+        config: SpakieConfig | None = None,
+        progress_bar: tqdm | None = None,
+        progress_lock: threading.Lock | None = None,
+    ):
         self.source_dir = source_dir
         self.progress_path = source_dir / "progress.json"
         self.seen_ids_path = source_dir / "seen_ids.txt"
@@ -473,7 +487,11 @@ class SourceState:
         self.new_seen_urls: set[str] = set()
         self.new_seen_titles: set[str] = set()
         self.last_save_time = 0.0
-        self.last_report_time = 0.0
+        # Shared across all concurrently running sources: one overall bar,
+        # updated under a lock since tqdm's counter isn't safe for concurrent
+        # writers from multiple threads.
+        self.progress_bar = progress_bar
+        self.progress_lock = progress_lock
 
     def _load_seen(self, path: Path) -> set[str]:
         if self.resume and path.exists():
@@ -532,12 +550,6 @@ class SourceState:
             self.save()
             self.last_save_time = now
 
-    def maybe_report(self, min_interval: float = 10.0) -> None:
-        now = time.monotonic()
-        if now - self.last_report_time >= min_interval:
-            print(f"  {self.budget.source_name}: {self.progress_summary()}")
-            self.last_report_time = now
-
     def should_stop(self) -> bool:
         if STOP_EVENT.is_set():
             return True
@@ -569,9 +581,16 @@ class SourceState:
 
         record["text"] = text
         self.writer.write(record)
+        token_delta = max(1, len(text) // 4)
         self.progress["docs_written"] += 1
         self.progress["chars_written"] += len(text)
-        self.progress["estimated_tokens"] += max(1, len(text) // 4)
+        self.progress["estimated_tokens"] += token_delta
+        if self.progress_bar is not None and self.progress_lock is not None:
+            # tqdm throttles actual screen redraws internally (~10Hz default),
+            # so updating on every accepted doc is cheap; the lock only guards
+            # the shared counter against concurrent writer threads.
+            with self.progress_lock:
+                self.progress_bar.update(token_delta)
         if doc_id:
             self.seen_ids.add(doc_id)
             self.new_seen_ids.add(doc_id)
@@ -659,7 +678,7 @@ def iter_hf_records(source_name: str):
 def ingest_hf_source(source_name: str, state: SourceState, english_only: bool) -> None:
     if state.should_stop():
         state.save()
-        print(f"  {source_name}: already at target, skipping download")
+        log(f"  {source_name}: already at target, skipping download")
         return
     rows_seen = int(state.progress.get("hf_rows_seen", 0))
     record_iter = iter_hf_records(source_name)
@@ -673,13 +692,12 @@ def ingest_hf_source(source_name: str, state: SourceState, english_only: bool) -
             break
         state.accept(record, english_only=english_only)
         state.maybe_save()
-        state.maybe_report()
 
 
 def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
     if state.should_stop():
         state.save()
-        print("  gutenberg: already at target, skipping download")
+        log("  gutenberg: already at target, skipping download")
         return
     next_url = GUTENDEX_API
     while next_url and not state.should_stop():
@@ -695,7 +713,7 @@ def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
             try:
                 raw_text = api_get(text_url, timeout=120).text
             except Exception as exc:
-                print(f"  Skip Gutenberg #{book['id']}: {exc}")
+                log(f"  Skip Gutenberg #{book['id']}: {exc}")
                 continue
             text = strip_gutenberg_boilerplate(raw_text)
             authors = ", ".join(author["name"] for author in book.get("authors", [])) or "Unknown"
@@ -713,7 +731,6 @@ def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
                 },
             }, english_only=english_only)
             state.maybe_save()
-            state.maybe_report()
             time.sleep(0.5)
         next_url = payload.get("next")
 
@@ -721,7 +738,7 @@ def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
 def ingest_arxiv(state: SourceState, english_only: bool) -> None:
     if state.should_stop():
         state.save()
-        print("  arxiv: already at target, skipping download")
+        log("  arxiv: already at target, skipping download")
         return
     offsets = state.progress.setdefault("arxiv_offsets", {})
     while not state.should_stop():
@@ -759,7 +776,6 @@ def ingest_arxiv(state: SourceState, english_only: bool) -> None:
                     "meta": {"source": "arxiv", "license": "arXiv metadata / abstract"},
                 }, english_only=english_only)
             state.maybe_save()
-            state.maybe_report()
             time.sleep(0.5)
         if not made_progress:
             break
@@ -768,7 +784,7 @@ def ingest_arxiv(state: SourceState, english_only: bool) -> None:
 def ingest_stackexchange(state: SourceState, english_only: bool) -> None:
     if state.should_stop():
         state.save()
-        print("  stackexchange: already at target, skipping download")
+        log("  stackexchange: already at target, skipping download")
         return
     site_pages = state.progress.setdefault("site_pages", {})
     for site in STACKEXCHANGE_SITES:
@@ -787,7 +803,7 @@ def ingest_stackexchange(state: SourceState, english_only: bool) -> None:
                     },
                 ).json()
             except Exception as exc:
-                print(f"  Skip Stack Exchange site '{site}': {exc}")
+                log(f"  Skip Stack Exchange site '{site}': {exc}")
                 break
             questions = payload.get("items", [])
             if not questions:
@@ -822,7 +838,6 @@ def ingest_stackexchange(state: SourceState, english_only: bool) -> None:
             page += 1
             site_pages[site] = page
             state.maybe_save()
-            state.maybe_report()
             if not payload.get("has_more"):
                 break
             time.sleep(0.5)
@@ -850,16 +865,21 @@ def parse_sources(raw: str, config: SpakieConfig) -> list[str]:
     return unique_sources
 
 
-def run_source(source_name: str, budget: SourceBudget, config: SpakieConfig, english_only: bool, resume: bool) -> None:
+def run_source(
+    source_name: str,
+    budget: SourceBudget,
+    config: SpakieConfig,
+    english_only: bool,
+    resume: bool,
+    progress_bar: tqdm,
+    progress_lock: threading.Lock,
+) -> None:
     """Download a single source end to end. Runs in its own worker thread."""
     source_dir = Path(config.large_corpus_dir) / source_name
     source_dir.mkdir(parents=True, exist_ok=True)
-    state = SourceState(source_dir, budget, resume=resume, config=config)
-    print(
-        f"[{source_name}] kind={budget.kind} "
-        f"target_chars={budget.target_chars:,} "
-        f"target_docs={budget.target_docs:,} "
-        f"target_tokens_est={budget.target_tokens_estimate:,}"
+    state = SourceState(
+        source_dir, budget, resume=resume, config=config,
+        progress_bar=progress_bar, progress_lock=progress_lock,
     )
     try:
         if source_name in HF_DATASETS:
@@ -868,7 +888,7 @@ def run_source(source_name: str, budget: SourceBudget, config: SpakieConfig, eng
             SOURCE_HANDLERS[source_name](state, english_only)
     finally:
         state.close()
-    print(f"  completed [{source_name}] {state.progress_summary()}")
+    log(f"  completed [{source_name}]: {state.progress_summary()}")
 
 
 def main() -> None:
@@ -913,31 +933,52 @@ def main() -> None:
 
     workers = args.workers if args.workers > 0 else len(sources)
     workers = max(1, min(workers, len(sources)))
-    print(f"Downloading {len(sources)} source(s) with {workers} concurrent worker(s)")
+    log(f"Downloading {len(sources)} source(s) with {workers} concurrent worker(s)")
+
+    total_target_tokens = sum(b.target_tokens_estimate for b in budgets.values())
+    already_done = sum(
+        int(json.loads((root / name / "progress.json").read_text()).get("estimated_tokens", 0))
+        for name in sources
+        if args.resume and (root / name / "progress.json").exists()
+    )
+    progress_bar = tqdm(
+        total=total_target_tokens or None,
+        initial=already_done,
+        desc="Downloading corpus",
+        unit="tok",
+        unit_scale=True,
+    )
+    progress_lock = threading.Lock()
 
     failures: list[tuple[str, str]] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(run_source, name, budgets[name], config, args.english_only, args.resume): name
-            for name in sources
-        }
-        try:
-            for future in as_completed(futures):
-                source_name = futures[future]
-                exc = future.exception()
-                if exc is not None:
-                    failures.append((source_name, str(exc)))
-                    print(f"  source failed: {source_name} -> {exc}")
-        except KeyboardInterrupt:
-            print("\nInterrupted; signalling workers to flush progress and stop...")
-            STOP_EVENT.set()
-            # Exiting the `with` block waits for workers to reach should_stop()
-            # and close() their shard writers, so progress stays resumable.
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    run_source, name, budgets[name], config, args.english_only, args.resume,
+                    progress_bar, progress_lock,
+                ): name
+                for name in sources
+            }
+            try:
+                for future in as_completed(futures):
+                    source_name = futures[future]
+                    exc = future.exception()
+                    if exc is not None:
+                        failures.append((source_name, str(exc)))
+                        log(f"  source failed: {source_name} -> {exc}")
+            except KeyboardInterrupt:
+                log("\nInterrupted; signalling workers to flush progress and stop...")
+                STOP_EVENT.set()
+                # Exiting the `with` block waits for workers to reach should_stop()
+                # and close() their shard writers, so progress stays resumable.
+    finally:
+        progress_bar.close()
 
     if failures:
-        print("\nCompleted with source failures:")
+        log("\nCompleted with source failures:")
         for source_name, message in failures:
-            print(f"  - {source_name}: {message}")
+            log(f"  - {source_name}: {message}")
 
 
 if __name__ == "__main__":
