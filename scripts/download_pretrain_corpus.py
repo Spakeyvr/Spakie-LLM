@@ -754,6 +754,7 @@ def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
         state.save()
         log("  gutenberg: already at target, skipping download")
         return
+    consecutive_failures = 0
     next_url = GUTENDEX_API
     while next_url and not state.should_stop():
         payload = api_get(next_url).json()
@@ -766,10 +767,24 @@ def ingest_gutenberg(state: SourceState, english_only: bool) -> None:
             if not text_url:
                 continue
             try:
-                raw_text = api_get(text_url, timeout=120).text
+                # gutenberg.org throttles bulk fetchers by stalling connections,
+                # so a generous timeout/retry budget here turns a blocked IP into
+                # ~10 minutes of dead waiting per book. Keep the per-book cost low.
+                raw_text = api_get(text_url, timeout=30, max_retries=2).text
             except Exception as exc:
+                consecutive_failures += 1
                 log(f"  Skip Gutenberg #{book['id']}: {exc}")
+                if consecutive_failures >= 5:
+                    # Like the Stack Exchange quota case: repeated timeouts mean
+                    # the host is throttling this IP, and every remaining book
+                    # would fail the same slow way. Stop and resume later.
+                    log(
+                        "  gutenberg: 5 consecutive fetch failures — gutenberg.org "
+                        "is likely throttling this IP, stopping source early"
+                    )
+                    return
                 continue
+            consecutive_failures = 0
             text = strip_gutenberg_boilerplate(raw_text)
             authors = ", ".join(author["name"] for author in book.get("authors", [])) or "Unknown"
             state.accept({

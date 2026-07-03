@@ -768,6 +768,9 @@ class SpakieGPTMLX(nn.Module):
         chunk = self.config.loss_chunk_size or N
         if chunk <= 0 or chunk >= N:
             if self.config.loss_layout == "custom" and ignore_index is None:
+                if getattr(self.config, "fused_cross_entropy", False):
+                    from model.fused_ce_mlx import fused_linear_cross_entropy_mean
+                    return fused_linear_cross_entropy_mean(flat_x, W, flat_targets)
                 return _linear_cross_entropy_mean(flat_x, W, flat_targets)
             if self.config.loss_layout == "flat":
                 flat_logits = flat_x @ W.T

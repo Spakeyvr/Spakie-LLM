@@ -39,12 +39,14 @@ CASES = (
 )
 
 
-def _max_rel(a: np.ndarray, b: np.ndarray) -> float:
+def _max_rel(a: np.ndarray, b: np.ndarray, *, floor: float) -> float:
     denom = np.maximum(np.abs(a), np.abs(b))
     # Elementwise relative error is not meaningful for entries whose true
-    # value is close to zero. Use a fixed floor so max_rel catches scale-level
-    # drift without letting tiny entries dominate the parity gate.
-    denom = np.maximum(denom, 1e-1)
+    # value is close to zero. Floor the denominator at max_abs/max_rel so
+    # entries below the floor are governed solely by the absolute gate;
+    # a smaller floor would make the relative gate silently stricter than
+    # the absolute gate for small entries.
+    denom = np.maximum(denom, floor)
     return float(np.max(np.abs(a - b) / denom))
 
 
@@ -136,12 +138,20 @@ np.save(output_path, np.asarray(result.astype(mx.float32)))
         return np.load(output_path)
 
 
+def _default_ns_steps() -> int:
+    from configs.default import SpakieConfig
+
+    return int(SpakieConfig().muon_ns_steps)
+
+
 def run_muon_parity_check(
     *,
     include_bf16: bool = True,
-    ns_steps: int = 5,
+    ns_steps: int | None = None,
     torch_reference_device: str = "auto",
 ) -> dict[str, dict[str, float]]:
+    if ns_steps is None:
+        ns_steps = _default_ns_steps()
     results: dict[str, dict[str, float]] = {}
     torch_device = _resolve_torch_reference_device(torch_reference_device)
     dtypes = ("fp32", "bf16") if include_bf16 else ("fp32",)
@@ -157,7 +167,7 @@ def run_muon_parity_check(
             if not np.isfinite(torch_out).all() or not np.isfinite(mlx_out).all():
                 raise AssertionError(f"{dtype}:{case.name} produced non-finite output")
             max_abs = float(np.max(np.abs(torch_out - mlx_out)))
-            max_rel = _max_rel(torch_out, mlx_out)
+            max_rel = _max_rel(torch_out, mlx_out, floor=max_abs_threshold / max_rel_threshold)
             results[f"{dtype}:{case.name}"] = {
                 "max_abs": max_abs,
                 "max_rel": max_rel,
@@ -165,7 +175,7 @@ def run_muon_parity_check(
             }
             if max_abs > max_abs_threshold or max_rel > max_rel_threshold:
                 raise AssertionError(
-                    f"{dtype}:{case.name} failed Muon parity: "
+                    f"{dtype}:{case.name} failed Muon parity (ns_steps={ns_steps}): "
                     f"max_abs={max_abs:.6g} (limit {max_abs_threshold:.6g}), "
                     f"max_rel={max_rel:.6g} (limit {max_rel_threshold:.6g})"
                 )
@@ -175,7 +185,12 @@ def run_muon_parity_check(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verify Muon Newton-Schulz parity on MLX/Metal")
     parser.add_argument("--no-bf16", action="store_true", help="Only run fp32 parity")
-    parser.add_argument("--ns-steps", type=int, default=5, help="Newton-Schulz iteration count")
+    parser.add_argument(
+        "--ns-steps",
+        type=int,
+        default=None,
+        help="Newton-Schulz iteration count (default: muon_ns_steps from configs/default.yaml)",
+    )
     parser.add_argument(
         "--torch-reference-device",
         choices=("auto", "mps", "cpu"),

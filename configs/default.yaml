@@ -182,9 +182,9 @@ presets:
     n_kv_heads: 4
     d_ff: 9088
     activation_checkpointing: false
-    pretrain_batch_size: 128
-    pretrain_grad_accum_steps: 2
-    pretrain_vmap_accum_step: false
+    pretrain_batch_size: 64
+    pretrain_grad_accum_steps: 3
+    pretrain_vmap_accum_step: true
     pretrain_vmap_sync_warmup_steps: 10
     pretrain_lr: 6.0e-4
     pretrain_grad_clip: 0.0

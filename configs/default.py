@@ -78,6 +78,7 @@ class SpakieConfig:
     addmm_residual_projections: bool = _D.get("addmm_residual_projections", False)
     mlp_addmm_linears: bool = _D.get("mlp_addmm_linears", False)
     fused_residual_rmsnorm: bool = _D.get("fused_residual_rmsnorm", False)
+    fused_cross_entropy: bool = _D.get("fused_cross_entropy", False)
     grouped_muon: bool = _D.get("grouped_muon", False)
     compile_muon_ns: bool = _D.get("compile_muon_ns", False)
     muon_route: str = _D.get("muon_route", "all")
@@ -105,6 +106,17 @@ class SpakieConfig:
     pretrain_trapezoid_decay_frac: float = _D.get("pretrain_trapezoid_decay_frac", 0.2)
     pretrain_vmap_accum_step: bool = _D.get("pretrain_vmap_accum_step", False)
     pretrain_vmap_sync_warmup_steps: int = _D.get("pretrain_vmap_sync_warmup_steps", 0)
+    # Number of microbatches vmapped together per group. vmap keeps every lane's
+    # forward activations resident for the backward, so peak memory scales with
+    # the group size; a full-G vmap of the 300m preset (B64/G3 ~= 107 GB) exceeds
+    # a 128 GB machine and panics the macOS kernel. 0 = auto: at runtime the
+    # loop probes per-lane memory and picks the largest group that fits a safe
+    # fraction of physical RAM. A positive value forces that group size.
+    pretrain_vmap_group_size: int = _D.get("pretrain_vmap_group_size", 0)
+    # Fraction of physical RAM the auto group-size probe is allowed to budget for
+    # the vmap forward/backward peak. Conservative because macOS panics (not
+    # OOM-errors) when wired GPU memory exhausts unified memory.
+    pretrain_vmap_mem_budget_frac: float = _D.get("pretrain_vmap_mem_budget_frac", 0.70)
 
     # SFT
     sft_batch_size: int = _D["sft_batch_size"]
