@@ -661,6 +661,7 @@ class SpakieGPTMLX(nn.Module):
         cache_offset: int = 0,
         return_cache: bool = False,
         ignore_index: int | None = -100,
+        allow_fused_ce: bool = True,
         segment_ids: mx.array | None = None,
         position_ids: mx.array | None = None,
         loss_indices: mx.array | None = None,
@@ -740,6 +741,7 @@ class SpakieGPTMLX(nn.Module):
             x,
             targets,
             ignore_index=ignore_index,
+            allow_fused_ce=allow_fused_ce,
             loss_indices=loss_indices,
             loss_targets=loss_targets,
             loss_mask=loss_mask,
@@ -751,6 +753,7 @@ class SpakieGPTMLX(nn.Module):
         targets: mx.array,
         *,
         ignore_index: int | None,
+        allow_fused_ce: bool = True,
         loss_indices: mx.array | None = None,
         loss_targets: mx.array | None = None,
         loss_mask: mx.array | None = None,
@@ -768,7 +771,13 @@ class SpakieGPTMLX(nn.Module):
         chunk = self.config.loss_chunk_size or N
         if chunk <= 0 or chunk >= N:
             if self.config.loss_layout == "custom" and ignore_index is None:
-                if getattr(self.config, "fused_cross_entropy", False):
+                # The fused CE launches a Metal CustomKernel, which MLX cannot
+                # vmap (`[Primitive::vmap] Not implemented for CustomKernel`).
+                # Callers that run this loss under `mx.vmap` (e.g. the vmap
+                # gradient-accumulation path) pass allow_fused_ce=False to fall
+                # back to the pure-MLX custom path, which is vmap-safe and
+                # numerically identical.
+                if allow_fused_ce and getattr(self.config, "fused_cross_entropy", False):
                     from model.fused_ce_mlx import fused_linear_cross_entropy_mean
                     return fused_linear_cross_entropy_mean(flat_x, W, flat_targets)
                 return _linear_cross_entropy_mean(flat_x, W, flat_targets)

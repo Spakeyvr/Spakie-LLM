@@ -274,6 +274,9 @@ def _build_vmap_accum_step(
                 y,
                 return_cache=False,
                 ignore_index=ignore_index,
+                # This runs under mx.vmap; the fused CE Metal kernel has no vmap
+                # rule, so force the vmap-safe MLX custom loss instead.
+                allow_fused_ce=False,
             )
             return loss
 
