@@ -1,5 +1,6 @@
 """SFT fine-tuning loop."""
 
+import atexit
 import math
 import os
 import time
@@ -14,6 +15,12 @@ from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings, autocast_context, dataloader_kwargs
 from training.dataset import ChatSFTDataset, train_val_split
+from training.monitor import (
+    TrainingStatusWriter,
+    format_monitor_start_message,
+    start_background_monitor,
+    stop_background_monitor,
+)
 from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers import configure_torch_optimizer, set_optimizer_lr
 
@@ -120,6 +127,17 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
     patience_counter = 0
     global_step = 0
     interrupted = False
+    status_writer = TrainingStatusWriter(
+        config.checkpoint_dir,
+        stage="sft",
+        backend="torch",
+        preset=config.preset_name,
+        total_steps=total_steps,
+    )
+    status_writer.update(force=True, status="running")
+    monitor_info = start_background_monitor(status_writer.path, config.checkpoint_dir)
+    print(format_monitor_start_message(monitor_info))
+    atexit.register(stop_background_monitor, monitor_info)
 
     try:
         for epoch in range(config.sft_epochs):
@@ -159,6 +177,14 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                         pending_grads = False
                         pending_microbatches = 0
                         global_step += 1
+                        status_writer.update(
+                            status="running",
+                            epoch=epoch + 1,
+                            epochs=config.sft_epochs,
+                            step=global_step,
+                            total_steps=total_steps,
+                            train_loss=epoch_loss / max(n_batches, 1),
+                        )
 
                     pbar.set_postfix(loss=f"{epoch_loss / n_batches:.4f}")
             finally:
@@ -177,6 +203,14 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                 )
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                status_writer.update(
+                    status="running",
+                    epoch=epoch + 1,
+                    epochs=config.sft_epochs,
+                    step=global_step,
+                    total_steps=total_steps,
+                    train_loss=epoch_loss / max(n_batches, 1),
+                )
 
             # Validation
             model.eval()
@@ -192,6 +226,17 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
 
             val_loss = val_loss / max(val_count, 1)
             print(f"Epoch {epoch + 1} | train_loss {epoch_loss / n_batches:.4f} | val_loss {val_loss:.4f}")
+            status_writer.update(
+                force=True,
+                status="running",
+                epoch=epoch + 1,
+                epochs=config.sft_epochs,
+                step=global_step,
+                total_steps=total_steps,
+                train_loss=epoch_loss / max(n_batches, 1),
+                val_loss=val_loss,
+                best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+            )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -208,11 +253,26 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     "muon_verified": config.muon_verified,
                     "config": config,
                 }, ckpt_path)
+                status_writer.update(
+                    force=True,
+                    best_val_loss=best_val_loss,
+                    best_checkpoint=ckpt_path,
+                )
                 print(f"  -> saved best SFT checkpoint (val_loss={val_loss:.4f})")
             else:
                 patience_counter += 1
                 if patience_counter >= config.sft_patience:
                     print(f"Early stopping at epoch {epoch + 1}")
+                    status_writer.finish(
+                        "stopped",
+                        message=f"Early stopping at epoch {epoch + 1}",
+                        epoch=epoch + 1,
+                        epochs=config.sft_epochs,
+                        step=global_step,
+                        total_steps=total_steps,
+                        val_loss=val_loss,
+                        best_val_loss=best_val_loss,
+                    )
                     break
     except KeyboardInterrupt:
         interrupted = True
@@ -229,10 +289,27 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             "best_val_loss": best_val_loss,
             "config": config,
         }, interrupt_path)
+        status_writer.finish(
+            "interrupted",
+            message=f"Saved checkpoint to {interrupt_path}",
+            step=global_step,
+            total_steps=total_steps,
+            best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+        )
         print(f"\nInterrupted during fine-tuning. Saved checkpoint to {interrupt_path}")
 
     if interrupted:
         print(f"SFT stopped early. Best val loss so far: {best_val_loss:.4f}")
     else:
+        if status_writer.payload.get("status") != "stopped":
+            status_writer.finish(
+                "complete",
+                message="SFT complete",
+                step=global_step,
+                total_steps=total_steps,
+                best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+            )
         print(f"SFT complete. Best val loss: {best_val_loss:.4f}")
+    if stop_background_monitor(monitor_info):
+        print("Monitor stopped.")
     return best_val_loss

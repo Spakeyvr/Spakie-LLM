@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import math
 import os
 import sys
@@ -34,6 +35,12 @@ from training.dataset_mlx import (
     trim_right_padding_bucket,
 )
 from training.mlx_profile import MLXProfile, now
+from training.monitor import (
+    TrainingStatusWriter,
+    format_monitor_start_message,
+    start_background_monitor,
+    stop_background_monitor,
+)
 from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.pretrain_mlx import _accum_grads, _build_microbatch_step
@@ -277,6 +284,18 @@ def finetune_mlx(
     accum_scale = 1.0 / config.sft_grad_accum_steps
     microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
     varlen_value_and_grad_cache = {}
+    monitor_total_steps = min(total_steps, max_steps) if max_steps > 0 else total_steps
+    status_writer = TrainingStatusWriter(
+        config.checkpoint_dir,
+        stage="sft",
+        backend="mlx",
+        preset=config.preset_name,
+        total_steps=monitor_total_steps,
+    )
+    status_writer.update(force=True, status="running")
+    monitor_info = start_background_monitor(status_writer.path, config.checkpoint_dir)
+    print(format_monitor_start_message(monitor_info))
+    atexit.register(stop_background_monitor, monitor_info)
 
     def varlen_microbatch_step(batch_mx, cu_key: tuple[int, ...] | None = None):
         x_arg, y_arg, seg_arg, pos_arg, idx_arg, cu_arg = batch_mx[:6]
@@ -364,6 +383,13 @@ def finetune_mlx(
             loss_log.flush()
         if max_steps > 0 and global_step >= max_steps:
             reached_max_steps = True
+        status_writer.update(
+            status="running",
+            step=global_step,
+            total_steps=monitor_total_steps,
+            train_loss=step_mean_loss,
+            lr=lr,
+        )
         return None, mx.array(0.0, dtype=mx.float32), 0, step_mean_loss, lr
 
     profiler = MLXProfile(enabled=profile)
@@ -543,6 +569,17 @@ def finetune_mlx(
                 f"Epoch {epoch + 1} | train_loss {epoch_loss / max(n_micro, 1):.4f} | "
                 f"val_loss {val_loss:.4f}"
             )
+            status_writer.update(
+                force=True,
+                status="running",
+                epoch=epoch + 1,
+                epochs=config.sft_epochs,
+                step=global_step,
+                total_steps=monitor_total_steps,
+                train_loss=epoch_loss / max(n_micro, 1),
+                val_loss=val_loss,
+                best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+            )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -580,11 +617,26 @@ def finetune_mlx(
                             "muon_verified": config.muon_verified,
                         },
                     )
+                status_writer.update(
+                    force=True,
+                    best_val_loss=best_val_loss,
+                    best_checkpoint=ckpt_path,
+                )
                 print(f"  -> saved best SFT checkpoint (val_loss={val_loss:.4f})")
             else:
                 patience_counter += 1
                 if patience_counter >= config.sft_patience:
                     print(f"Early stopping at epoch {epoch + 1}")
+                    status_writer.finish(
+                        "stopped",
+                        message=f"Early stopping at epoch {epoch + 1}",
+                        epoch=epoch + 1,
+                        epochs=config.sft_epochs,
+                        step=global_step,
+                        total_steps=monitor_total_steps,
+                        val_loss=val_loss,
+                        best_val_loss=best_val_loss,
+                    )
                     if profiler.enabled:
                         print(profiler.format_report(window_label=f"epoch {epoch + 1}"))
                         profiler.reset()
@@ -629,14 +681,38 @@ def finetune_mlx(
                 },
                 optimizer=optimizer,
             )
+        status_writer.finish(
+            "interrupted",
+            message=f"Saved checkpoint to {interrupt_path}",
+            step=global_step,
+            total_steps=monitor_total_steps,
+            best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+        )
         print(f"\nInterrupted during fine-tuning. Saved checkpoint to {interrupt_path}")
 
     if interrupted:
         print(f"SFT stopped early. Best val loss so far: {best_val_loss:.4f}")
     elif reached_max_steps:
+        status_writer.finish(
+            "stopped",
+            message=f"Reached max SFT optimizer steps: {global_step}",
+            step=global_step,
+            total_steps=monitor_total_steps,
+            best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+        )
         print(f"SFT stopped at max_steps={global_step}. Best val loss so far: {best_val_loss:.4f}")
     else:
+        if status_writer.payload.get("status") != "stopped":
+            status_writer.finish(
+                "complete",
+                message="SFT complete",
+                step=global_step,
+                total_steps=monitor_total_steps,
+                best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+            )
         print(f"SFT complete. Best val loss: {best_val_loss:.4f}")
     if loss_log is not None:
         loss_log.close()
+    if stop_background_monitor(monitor_info):
+        print("Monitor stopped.")
     return best_val_loss

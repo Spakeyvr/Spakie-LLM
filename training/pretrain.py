@@ -1,5 +1,6 @@
 """Pretraining loop with cosine LR, gradient accumulation, and token budgets."""
 
+import atexit
 import math
 import os
 import random
@@ -17,6 +18,12 @@ from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from model.utils import count_parameters
 from runtime import RuntimeSettings, autocast_context
+from training.monitor import (
+    TrainingStatusWriter,
+    format_monitor_start_message,
+    start_background_monitor,
+    stop_background_monitor,
+)
 from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers import configure_torch_optimizer, set_optimizer_lr
 
@@ -232,6 +239,26 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
         restore_rng_state(resume_state.get("rng_state"))
 
     start_time = time.time() - elapsed_before_resume
+    status_writer = TrainingStatusWriter(
+        config.checkpoint_dir,
+        stage="pretrain",
+        backend="torch",
+        preset=config.preset_name,
+        total_steps=config.pretrain_max_steps,
+        target_tokens=target_tokens,
+        elapsed_offset=elapsed_before_resume,
+    )
+    status_writer.update(
+        force=True,
+        status="running",
+        step=global_step,
+        tokens_processed=tokens_processed,
+        best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+        val_loss=last_val_loss,
+    )
+    monitor_info = start_background_monitor(status_writer.path, config.checkpoint_dir)
+    print(format_monitor_start_message(monitor_info))
+    atexit.register(stop_background_monitor, monitor_info)
     train_iter = iter(train_loader)
     pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain", initial=global_step)
 
@@ -307,6 +334,19 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     raise
             global_step += 1
             pbar.update(1)
+            elapsed = time.time() - start_time
+            status_writer.update(
+                status="running",
+                step=global_step,
+                total_steps=config.pretrain_max_steps,
+                train_loss=accum_loss,
+                val_loss=last_val_loss,
+                best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+                lr=lr,
+                tokens_processed=tokens_processed,
+                target_tokens=target_tokens,
+                tok_per_sec=tokens_processed / elapsed if elapsed > 0 else 0.0,
+            )
 
             if stop_requested:
                 interrupted = True
@@ -322,6 +362,14 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     val_loss=last_val_loss,
                     elapsed_time=time.time() - start_time,
                     train_sampler=train_sampler,
+                )
+                status_writer.finish(
+                    "interrupted",
+                    message=f"Saved checkpoint to {interrupt_path}",
+                    step=global_step,
+                    tokens_processed=tokens_processed,
+                    val_loss=last_val_loss,
+                    best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
                 )
                 pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
                 break
@@ -340,6 +388,18 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     f"step {global_step} | train_loss {accum_loss:.4f} | val_loss {val_loss:.4f} | "
                     f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}{token_progress}"
                 )
+                status_writer.update(
+                    force=True,
+                    status="running",
+                    step=global_step,
+                    train_loss=accum_loss,
+                    val_loss=val_loss,
+                    best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+                    lr=lr,
+                    tokens_processed=tokens_processed,
+                    target_tokens=target_tokens,
+                    tok_per_sec=tok_per_sec,
+                )
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -357,11 +417,25 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                         elapsed_time=elapsed,
                         train_sampler=train_sampler,
                     )
+                    status_writer.update(
+                        force=True,
+                        best_val_loss=best_val_loss,
+                        best_checkpoint=ckpt_path,
+                    )
                     pbar.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
                 elif config.should_use_pretrain_early_stopping():
                     patience_counter += 1
                     if patience_counter >= config.pretrain_patience:
                         pbar.write(f"Early stopping at step {global_step}")
+                        status_writer.finish(
+                            "stopped",
+                            message=f"Early stopping at step {global_step}",
+                            step=global_step,
+                            train_loss=accum_loss,
+                            val_loss=last_val_loss,
+                            best_val_loss=best_val_loss,
+                            tokens_processed=tokens_processed,
+                        )
                         break
     except KeyboardInterrupt:
         interrupted = True
@@ -378,6 +452,14 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             elapsed_time=time.time() - start_time,
             train_sampler=train_sampler,
         )
+        status_writer.finish(
+            "interrupted",
+            message=f"Saved checkpoint to {interrupt_path}",
+            step=global_step,
+            tokens_processed=tokens_processed,
+            val_loss=last_val_loss,
+            best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+        )
         pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
@@ -386,5 +468,16 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     if interrupted:
         print(f"Pretraining stopped early at {tokens_processed:,} tokens. Best val loss so far: {best_val_loss:.4f}")
     else:
+        if status_writer.payload.get("status") != "stopped":
+            status_writer.finish(
+                "complete",
+                message="Pretraining complete",
+                step=global_step,
+                tokens_processed=tokens_processed,
+                val_loss=last_val_loss,
+                best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+            )
         print(f"Pretraining complete at {tokens_processed:,} tokens. Best val loss: {best_val_loss:.4f}")
+    if stop_background_monitor(monitor_info):
+        print("Monitor stopped.")
     return best_val_loss

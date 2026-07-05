@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import math
 import operator
 import os
@@ -35,6 +36,12 @@ from training.dataset_mlx import (
     stack_batch,
 )
 from training.mlx_profile import MLXProfile, now
+from training.monitor import (
+    TrainingStatusWriter,
+    format_monitor_start_message,
+    start_background_monitor,
+    stop_background_monitor,
+)
 from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.prefetch_mlx import BatchPrefetcher
@@ -766,6 +773,26 @@ def pretrain_mlx(
     window_steps = 0
 
     start_time = time.time() - elapsed_before_resume
+    status_writer = TrainingStatusWriter(
+        config.checkpoint_dir,
+        stage="pretrain",
+        backend="mlx",
+        preset=config.preset_name,
+        total_steps=config.pretrain_max_steps,
+        target_tokens=target_tokens,
+        elapsed_offset=elapsed_before_resume,
+    )
+    status_writer.update(
+        force=True,
+        status="running",
+        step=global_step,
+        tokens_processed=tokens_processed,
+        best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+        val_loss=last_val_loss,
+    )
+    monitor_info = start_background_monitor(status_writer.path, config.checkpoint_dir)
+    print(format_monitor_start_message(monitor_info))
+    atexit.register(stop_background_monitor, monitor_info)
     pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain[mlx]", initial=global_step)
 
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -944,6 +971,21 @@ def pretrain_mlx(
             global_step += 1
             window_steps += 1
             pbar.update(1)
+            if status_writer.due():
+                accum_loss_val = float(accum_loss.item())
+                elapsed = time.time() - start_time
+                status_writer.update(
+                    status="running",
+                    step=global_step,
+                    total_steps=config.pretrain_max_steps,
+                    train_loss=accum_loss_val,
+                    val_loss=last_val_loss,
+                    best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+                    lr=lr,
+                    tokens_processed=tokens_processed,
+                    target_tokens=target_tokens,
+                    tok_per_sec=tokens_processed / elapsed if elapsed > 0 else 0.0,
+                )
 
             if stop_requested:
                 interrupted = True
@@ -980,6 +1022,14 @@ def pretrain_mlx(
                         writer=ckpt_writer,
                         sync=True,
                     )
+                status_writer.finish(
+                    "interrupted",
+                    message=f"Saved checkpoint to {interrupt_path}",
+                    step=global_step,
+                    tokens_processed=tokens_processed,
+                    val_loss=last_val_loss,
+                    best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+                )
                 pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
                 break
 
@@ -1018,6 +1068,15 @@ def pretrain_mlx(
                         writer=ckpt_writer,
                         sync=True,
                     )
+                status_writer.update(
+                    force=True,
+                    status="running",
+                    step=global_step,
+                    tokens_processed=tokens_processed,
+                    val_loss=last_val_loss,
+                    best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+                    last_checkpoint=rolling_path,
+                )
                 pbar.write(f"  -> saved rolling checkpoint at step {global_step}")
 
             if global_step % config.pretrain_eval_interval == 0:
@@ -1046,6 +1105,21 @@ def pretrain_mlx(
                     f"step {global_step} | train_loss {accum_loss_val:.4f} | val_loss {val_loss:.4f} | "
                     f"lr {lr:.2e} | tok/s {tok_per_sec:.0f}{token_progress} | "
                     f"mem active {active_gb:.1f}GB cache {cache_gb:.1f}GB peak {peak_gb:.1f}GB"
+                )
+                status_writer.update(
+                    force=True,
+                    status="running",
+                    step=global_step,
+                    train_loss=accum_loss_val,
+                    val_loss=val_loss,
+                    best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+                    lr=lr,
+                    tokens_processed=tokens_processed,
+                    target_tokens=target_tokens,
+                    tok_per_sec=tok_per_sec,
+                    mlx_active_gb=active_gb,
+                    mlx_cache_gb=cache_gb,
+                    mlx_peak_gb=peak_gb,
                 )
 
                 if val_loss < best_val_loss:
@@ -1082,11 +1156,25 @@ def pretrain_mlx(
                             train_sampler=train_sampler,
                             writer=ckpt_writer,
                         )
+                    status_writer.update(
+                        force=True,
+                        best_val_loss=best_val_loss,
+                        best_checkpoint=ckpt_path,
+                    )
                     pbar.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
                 elif config.should_use_pretrain_early_stopping():
                     patience_counter += 1
                     if patience_counter >= config.pretrain_patience:
                         pbar.write(f"Early stopping at step {global_step}")
+                        status_writer.finish(
+                            "stopped",
+                            message=f"Early stopping at step {global_step}",
+                            step=global_step,
+                            train_loss=accum_loss_val,
+                            val_loss=last_val_loss,
+                            best_val_loss=best_val_loss,
+                            tokens_processed=tokens_processed,
+                        )
                         should_stop = True
                 if profiler.enabled:
                     pbar.write(
@@ -1134,6 +1222,14 @@ def pretrain_mlx(
                 writer=ckpt_writer,
                 sync=True,
             )
+        status_writer.finish(
+            "interrupted",
+            message=f"Saved checkpoint to {interrupt_path}",
+            step=global_step,
+            tokens_processed=tokens_processed,
+            val_loss=last_val_loss,
+            best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+        )
         pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
@@ -1153,7 +1249,18 @@ def pretrain_mlx(
             f"Best val loss so far: {best_val_loss:.4f}"
         )
     else:
+        if status_writer.payload.get("status") != "stopped":
+            status_writer.finish(
+                "complete",
+                message="Pretraining complete",
+                step=global_step,
+                tokens_processed=tokens_processed,
+                val_loss=last_val_loss,
+                best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
+            )
         print(
             f"Pretraining complete at {tokens_processed:,} tokens. Best val loss: {best_val_loss:.4f}"
         )
+    if stop_background_monitor(monitor_info):
+        print("Monitor stopped.")
     return best_val_loss

@@ -142,6 +142,54 @@ Useful training options:
 --checkpoint-interval <steps>
 ```
 
+Training writes a live status file to `checkpoints/<preset>/training_status.json`
+and automatically starts a background LAN monitor on port `8765`. Open the
+printed `http://<your-mac-ip>:8765` URL on your phone while it is on the same
+Wi-Fi. The page shows step/token progress, loss, throughput, ETA, checkpoint
+paths, MLX memory when available, and a prompt box for querying the best
+available checkpoint. Pretrain checkpoints use raw continuation mode; SFT
+checkpoints use the same chat template path as `scripts/chat.py`. A monitor
+process started by training is stopped automatically when that training process
+exits.
+
+For a public IPv6 address, wrap the address in square brackets:
+
+```text
+http://[2001:db8::1234]:8765
+```
+
+Public access still requires the network path to allow inbound port `8765`
+(router/firewall/ISP), and password protection does not encrypt plain HTTP.
+
+You can also start the monitor manually:
+
+```bash
+python3 scripts/monitor_training.py
+```
+
+Use `--status-file <path>` to pin the monitor to a specific run, or
+`--checkpoint-dir <dir>` to scan a different checkpoint tree. Set
+`SPAKIE_MONITOR=0` to disable training autostart, or `SPAKIE_MONITOR_PORT=9000`
+to use a different port. Set `SPAKIE_MONITOR_PROMPT_TIMEOUT=300` if prompt
+generation needs more than the default 180 seconds.
+
+For password protection, set the password before starting training:
+
+```bash
+MONITOR_PASSWORD="choose-a-long-password" python3 scripts/train.py --backend mlx
+```
+
+Manual monitor starts also accept a flag:
+
+```bash
+python3 scripts/monitor_training.py --password "choose-a-long-password"
+```
+
+When password protection is enabled, the monitor serves only the login page or a
+401 response until the password is accepted. If you expose this through a public
+IP, put HTTPS/VPN in front of it; plain HTTP still sends the password over the
+network unencrypted.
+
 Pipeline runner:
 
 ```bash
