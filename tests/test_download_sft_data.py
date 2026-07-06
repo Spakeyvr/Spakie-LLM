@@ -172,8 +172,7 @@ class DownloadSFTDataTests(unittest.TestCase):
             examples = download_sft_data.load_smoltalk(limit=2, seed=7)
 
         load_dataset.assert_called_once_with(
-            "HuggingFaceTB/smoltalk",
-            "all",
+            "HuggingFaceTB/smol-smoltalk",
             split="train",
             streaming=True,
         )

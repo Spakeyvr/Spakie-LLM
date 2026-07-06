@@ -213,10 +213,10 @@ sft_source_limits:
     limit: 0
   nemotron_instruction_following_chat_v3:
     enabled: true
-    limit: 50000
+    limit: 5000
   nemotron_math_v4:
     enabled: true
-    limit: 25000
+    limit: 20000
   alpaca:
     enabled: false
     limit: 12000
@@ -225,7 +225,7 @@ sft_source_limits:
     limit: 8000
   smoltalk:
     enabled: true
-    limit: 8000
+    limit: 25000
   squad:
     enabled: false
     limit: 5000

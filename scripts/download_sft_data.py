@@ -149,7 +149,7 @@ def load_no_robots(limit: int, seed: int) -> list[dict]:
 
 def load_smoltalk(limit: int, seed: int) -> list[dict]:
     print("Loading SmolTalk...")
-    dataset = load_dataset("HuggingFaceTB/smoltalk", "all", split="train", streaming=True)
+    dataset = load_dataset("HuggingFaceTB/smol-smoltalk", split="train", streaming=True)
     if limit > 0:
         rows = dataset.shuffle(seed=seed, buffer_size=10_000).take(limit)
     else:
