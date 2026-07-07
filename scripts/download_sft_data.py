@@ -15,6 +15,24 @@ import sys
 
 from datasets import load_dataset
 
+# `datasets` pulls in the `multiprocess` package, whose ResourceTracker.__del__
+# calls self._lock._recursion_count() on interpreter exit. On Python 3.12,
+# threading.RLock() returns the C-implemented _thread.RLock, which has no such
+# method, so this always raises (harmlessly, after teardown) and prints a
+# scary traceback. Silence just that one AttributeError.
+try:
+    from multiprocess import resource_tracker as _mp_resource_tracker
+
+    def _safe_stop_locked(self, *args, _orig=_mp_resource_tracker.ResourceTracker._stop_locked, **kwargs):
+        try:
+            _orig(self, *args, **kwargs)
+        except AttributeError:
+            pass
+
+    _mp_resource_tracker.ResourceTracker._stop_locked = _safe_stop_locked
+except ImportError:
+    pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 

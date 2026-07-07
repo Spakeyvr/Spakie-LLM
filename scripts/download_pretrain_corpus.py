@@ -37,6 +37,38 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
 
 
+def _silence_resource_tracker_shutdown_race() -> None:
+    """Suppress the cosmetic traceback from ``multiprocess``'s resource tracker.
+
+    HuggingFace ``datasets`` uses the ``multiprocess`` package, whose
+    ``ResourceTracker.__del__`` runs during interpreter shutdown and touches an
+    ``RLock`` whose C internals may already be torn down, raising
+    ``AttributeError: '_thread.RLock' object has no attribute '_recursion_count'``.
+    The tracker's own server process still cleans up via pipe EOF, so the error
+    is harmless — we just stop it from spamming the console on every exit.
+    """
+    try:
+        from multiprocess import resource_tracker as _rt
+    except Exception:
+        return
+
+    original_del = getattr(_rt.ResourceTracker, "__del__", None)
+    if original_del is None:
+        return
+
+    def _safe_del(self, _orig=original_del):
+        try:
+            _orig(self)
+        except Exception:
+            # Interpreter shutdown races; the OS reaps the tracker regardless.
+            pass
+
+    _rt.ResourceTracker.__del__ = _safe_del
+
+
+_silence_resource_tracker_shutdown_race()
+
+
 def log(message: str) -> None:
     """Print without corrupting any active tqdm progress bars."""
     tqdm.write(message)

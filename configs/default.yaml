@@ -225,7 +225,7 @@ sft_source_limits:
     limit: 8000
   smoltalk:
     enabled: true
-    limit: 25000
+    limit: 75000
   squad:
     enabled: false
     limit: 5000
@@ -246,10 +246,17 @@ sft_source_limits:
     limit: 3000
 
 corpus_source_plan:
+  # Weights below are relative; scaled_corpus_source_plan() normalizes them to
+  # target_processed_tokens (~8B) at runtime, and the same numbers drive the
+  # download budget (download_pretrain_corpus.py). Mix is fact-density weighted:
+  # synthetic-education + Wikipedia carry the QA-extractable knowledge a small
+  # model can actually recall, so they dominate over diffuse raw web.
+  # Resulting mix ~= cosmopedia 38% / fineweb-edu 25% / Wikipedia 20% /
+  # other web (c4+refinedweb+fineweb_sample) 11% / books+technical 6%.
   fineweb-edu:
     kind: web
-    target_tokens: 1503702216
-    target_raw_chars: 6014808864
+    target_tokens: 2000000000
+    target_raw_chars: 8000000000
     enabled: true
   dolma:
     kind: web
@@ -258,46 +265,46 @@ corpus_source_plan:
     enabled: false
   refinedweb:
     kind: web
-    target_tokens: 400000000
-    target_raw_chars: 1600000000
-    enabled: true
-  fineweb_sample:
-    kind: web
     target_tokens: 300000000
     target_raw_chars: 1200000000
     enabled: true
+  fineweb_sample:
+    kind: web
+    target_tokens: 200000000
+    target_raw_chars: 800000000
+    enabled: true
   c4_en:
     kind: web
-    target_tokens: 433526316
-    target_raw_chars: 1734105264
+    target_tokens: 400000000
+    target_raw_chars: 1600000000
     enabled: true
   gutenberg:
     kind: books
-    target_tokens: 149990528
-    target_raw_chars: 599962112
+    target_tokens: 250000000
+    target_raw_chars: 1000000000
     enabled: true
   wikipedia_snapshot:
     kind: reference
-    target_tokens: 177054094
-    target_raw_chars: 708216376
+    target_tokens: 1600000000
+    target_raw_chars: 6400000000
     enabled: true
   stackexchange:
     kind: technical
-    target_tokens: 1834586
-    target_raw_chars: 7338344
+    target_tokens: 3000000
+    target_raw_chars: 12000000
     enabled: true
   openwebmath:
     kind: technical
-    target_tokens: 197913572
-    target_raw_chars: 791654288
+    target_tokens: 200000000
+    target_raw_chars: 800000000
     enabled: true
   arxiv:
     kind: technical
-    target_tokens: 1505004
-    target_raw_chars: 6020016
+    target_tokens: 3000000
+    target_raw_chars: 12000000
     enabled: true
   cosmopedia_v2:
     kind: synthetic_education
-    target_tokens: 1045000000
-    target_raw_chars: 4180000000
+    target_tokens: 3000000000
+    target_raw_chars: 12000000000
     enabled: true
