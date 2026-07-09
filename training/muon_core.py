@@ -23,6 +23,12 @@ MUON_BF16_MAX_ABS = 2e-2
 MUON_BF16_MAX_REL = 5e-2
 
 
+class MuonPrecomputeError(RuntimeError):
+    """A Muon transform failed before any parameter or optimizer mutation."""
+
+    safe_to_fallback = True
+
+
 @dataclass(frozen=True)
 class MuonSettings:
     momentum: float = 0.95
@@ -116,6 +122,9 @@ def optimizer_kind(optimizer, config, *, stage: str) -> str:
 
 
 def should_adamw_fallback(exc: BaseException, optimizer, config, *, stage: str, allow: bool) -> bool:
-    return allow and optimizer_kind(optimizer, config, stage=stage) == "muon" and not isinstance(
-        exc, KeyboardInterrupt
+    return (
+        allow
+        and optimizer_kind(optimizer, config, stage=stage) == "muon"
+        and bool(getattr(exc, "safe_to_fallback", False))
+        and not isinstance(exc, KeyboardInterrupt)
     )

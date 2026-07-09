@@ -31,6 +31,10 @@ PyTorch is the main dependency for the torch backend. On Apple Silicon, MLX is i
 python3 tokenizer/train_tokenizer.py
 ```
 
+Tokenizer samples are streamed in deterministic round-robin order across
+discovered corpus sources, so the five-million-example cap cannot exclude
+later source directories merely because of lexical path order.
+
 2. Download or add pretraining data:
 
 ```bash
@@ -143,9 +147,10 @@ Useful training options:
 ```
 
 Training writes a live status file to `checkpoints/<preset>/training_status.json`
-and automatically starts a background LAN monitor on port `8765`. Open the
-printed `http://<your-mac-ip>:8765` URL on your phone while it is on the same
-Wi-Fi. The page shows step/token progress, loss, throughput, ETA, checkpoint
+and automatically starts a background monitor on port `8765`. Without a
+password it binds only to `127.0.0.1`. To open it from another device on your
+LAN, set `MONITOR_PASSWORD` before training; the authenticated monitor then
+binds to the LAN address printed at startup. The page shows step/token progress, loss, throughput, ETA, checkpoint
 paths, MLX memory when available, and a prompt box for querying the best
 available checkpoint. Pretrain checkpoints use raw continuation mode; SFT
 checkpoints use the same chat template path as `scripts/chat.py`. A monitor
@@ -182,7 +187,7 @@ MONITOR_PASSWORD="choose-a-long-password" python3 scripts/train.py --backend mlx
 Manual monitor starts also accept a flag:
 
 ```bash
-python3 scripts/monitor_training.py --password "choose-a-long-password"
+python3 scripts/monitor_training.py --host :: --password "choose-a-long-password"
 ```
 
 When password protection is enabled, the monitor serves only the login page or a
@@ -224,9 +229,10 @@ python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
 The default SFT download uses the enabled sources in `configs/default.yaml`.
-The current downloadable defaults are NVIDIA Nemotron instruction-following chat
-v3 and Nemotron math v4, each capped at 50,000 examples. To download only
-selected sources:
+The current downloadable defaults are SmolTalk (75,000 usable rows), Nemotron
+instruction-following chat v3 (5,000), Nemotron math v4 (20,000), and TriviaQA
+(3,000), plus uncapped local `DeepSeek-distilled` and `custom` files. Limits are
+applied to usable converted examples rather than raw rows. To download only selected sources:
 
 ```bash
 python3 scripts/download_sft_data.py --sources nemotron_math_v4
@@ -278,14 +284,14 @@ Muon options include `--muon-adjust-lr-fn {match_rms_adamw,original,none}`, `--m
 
 ## Checkpoints and Chat
 
-Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. New Torch and MLX checkpoints store a complete versioned configuration, and every model load validates all tensor keys and shapes. Torch uses PyTorch's restricted loader by default; `--trust-checkpoint` is required for a legacy pickle that contains custom Python objects. MLX files created before full config metadata are refused by default; `--allow-legacy-config` is an explicit inexact compatibility opt-in. `pretrain_interrupt.pt` is the rolling Torch checkpoint used by `scripts/train.py --resume`.
+Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. New Torch and MLX checkpoints store a complete versioned configuration, and every model load validates all tensor keys and shapes. Torch uses PyTorch's restricted loader by default; `--trust-checkpoint` is required for a legacy pickle that contains custom Python objects. MLX files created before full config metadata are refused by default; `--allow-legacy-config` is an explicit inexact compatibility opt-in. `pretrain_interrupt.*` is the rolling resume checkpoint; every successful run also atomically publishes `pretrain_final.*`, even when it ends before an evaluation boundary.
 
 Useful commands:
 
 ```bash
 python3 scripts/chat.py --list-models --device auto --precision auto
 python3 scripts/chat.py --model 1 --backend mlx --no-model-prompt
-python3 scripts/chat.py --checkpoint checkpoints/300m/pretrain_best.safetensors --backend mlx
+python3 scripts/chat.py --checkpoint checkpoints/300m/pretrain_final.safetensors --backend mlx
 python3 scripts/chat.py --json_mode --system "Answer as JSON."
 python3 scripts/finetune.py --list-models --backend mlx
 python3 scripts/train.py --resume
@@ -322,9 +328,9 @@ The repo currently supports these presets:
 
 | Preset | Layers | `d_model` | Q heads | KV heads | MLP | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
-| `92m` | 12 | 768 | 12 | 12 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
-| `180m` | 16 | 896 | 14 | 2 | SwiGLU hidden 2048 | 96 | 2 | 32 | 4 | Mid-size MLX-optimized preset |
-| `300m` | 10 | 1280 | 20 | 20 | GELU `d_ff=9088` | 128 | 2 | 16 | 2 | Config and pipeline default preset; MLX SFT uses sortish length buckets with padding trim |
+| `92m` | 12 | 768 | 12 | 4 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
+| `180m` | 16 | 896 | 14 | 2 | SwiGLU hidden 2048 | 96 | 2 | 64 | 4 | Mid-size MLX-optimized preset |
+| `300m` | 10 | 1280 | 20 | 4 | GELU `d_ff=9088` | 64 | 3 | 16 | 2 | Config and pipeline default preset; MLX SFT uses sortish length buckets with padding trim |
 
 Shared model defaults:
 

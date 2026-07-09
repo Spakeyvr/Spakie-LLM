@@ -250,6 +250,24 @@ class ResumableBatchSamplerMLX:
             self.position = next_position
             yield batch
 
+    def iter_fixed(self, max_batches: int | None = None):
+        """Iterate a stable prefix of the current permutation without mutating state.
+
+        Validation uses this path so every evaluation measures the same examples
+        and does not advance or reshuffle a persistent sampler behind the scenes.
+        """
+        yielded = 0
+        for start in range(0, len(self.indices), self.batch_size):
+            if max_batches is not None and yielded >= max_batches:
+                break
+            batch = self.indices[start : start + self.batch_size]
+            if len(batch) < self.batch_size and self.drop_last:
+                break
+            if len(batch) == 0:
+                break
+            yield batch
+            yielded += 1
+
     def state_dict(self, *, copy_indices: bool = True) -> dict:
         return {
             "rng_state": self.rng.bit_generator.state,
@@ -291,7 +309,13 @@ def sequence_lengths(dataset, *, pad_id: int = 0, ignore_index: int = -100) -> n
 
 
 class LengthBucketBatchSamplerMLX:
-    """Infinite sortish sampler that batches examples with similar lengths."""
+    """Infinite sortish sampler with one finite, lossless logical epoch.
+
+    Buckets are batch-aligned so ``drop_last`` discards at most the single
+    dataset-wide remainder. Earlier code discarded a remainder in every
+    bucket, then the training loop consumed ``len(dataset) // batch_size``
+    batches anyway and spilled into the next permutation.
+    """
 
     def __init__(
         self,
@@ -304,9 +328,19 @@ class LengthBucketBatchSamplerMLX:
     ):
         self.lengths = np.asarray(lengths, dtype=np.int32)
         self.batch_size = batch_size
-        self.bucket_size = max(batch_size, bucket_size)
+        requested_bucket_size = max(batch_size, bucket_size)
+        self.bucket_size = max(
+            batch_size,
+            (requested_bucket_size // batch_size) * batch_size,
+        )
         self.drop_last = drop_last
         self.rng = np.random.default_rng(seed)
+
+    def __len__(self) -> int:
+        n = len(self.lengths)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
 
     def __iter__(self):
         n = len(self.lengths)

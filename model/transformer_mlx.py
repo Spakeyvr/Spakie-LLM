@@ -70,6 +70,46 @@ def _gelu_fast(x: mx.array) -> mx.array:
     return x * mx.sigmoid(1.702 * x)
 
 
+def _lower_right_causal_mask(query_length: int, key_length: int) -> mx.array:
+    """Boolean causal mask aligned to the lower-right of a rectangular score matrix."""
+    offset = key_length - query_length
+    return mx.arange(key_length)[None, :] <= (mx.arange(query_length)[:, None] + offset)
+
+
+def _attention_with_dropout(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    *,
+    scale: float,
+    mask: mx.array | None,
+    dropout: nn.Dropout,
+) -> mx.array:
+    """Reference SDPA path used when attention-weight dropout is active."""
+    if q.shape[1] != k.shape[1]:
+        repeat = q.shape[1] // k.shape[1]
+        k = mx.repeat(k, repeat, axis=1)
+        v = mx.repeat(v, repeat, axis=1)
+    scores = (q * scale) @ k.swapaxes(-1, -2)
+    if mask is None:
+        mask = _lower_right_causal_mask(q.shape[-2], k.shape[-2])
+    if mask.dtype == mx.bool_:
+        valid_rows = mx.any(mask, axis=-1, keepdims=True)
+        scores = mx.where(
+            mask,
+            scores,
+            mx.array(mx.finfo(scores.dtype).min, dtype=scores.dtype),
+        )
+    else:
+        scores = scores + mask
+    weights = dropout(mx.softmax(scores, axis=-1))
+    if mask.dtype == mx.bool_:
+        # Packed batches contain padded queries with no valid keys. SDPA emits
+        # zero for those rows; make the reference dropout path equally finite.
+        weights = mx.where(valid_rows, weights, mx.zeros_like(weights))
+    return weights @ v
+
+
 @mx.custom_function
 def _linear_cross_entropy_mean(flat_x: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
     logits = flat_x @ weight.T
@@ -116,6 +156,7 @@ class CausalSelfAttentionMLX(nn.Module):
             )
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
         self.attn_dropout_p = config.dropout
+        self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.attention_backend = config.attention_backend
         if config.qk_norm:
@@ -169,6 +210,7 @@ class CausalSelfAttentionMLX(nn.Module):
                 and cache is None
                 and varlen_indices is not None
                 and varlen_cu_seqlens is not None
+                and (not self.training or self.attn_dropout_p == 0.0)
             ):
                 qkv_packed = _pack_varlen_flat(qkv, varlen_indices)[None, :, :]
                 y_packed = _mfa_flash_attention_varlen_qkv_packed()(
@@ -228,12 +270,28 @@ class CausalSelfAttentionMLX(nn.Module):
                 k = mx.concatenate([k_prev, k], axis=2)
                 v = mx.concatenate([v_prev, v], axis=2)
                 new_cache = (k, v) if return_cache else None
-                # When using cache the incremental q has length T (usually 1). Attending
-                # to the full cached k/v is inherently causal for decoding, so no mask.
-                y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+                # MLX's causal mask is lower-right aligned, so it handles both
+                # the usual one-token decode and cached chunks with T > 1. The
+                # latter must not let an early query see later keys in its chunk.
+                y = mx.fast.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=self.scale,
+                    mask="causal",
+                )
             else:
                 new_cache = (k, v) if return_cache else None
-                if self.attention_backend == "mfa":
+                if self.training and self.attn_dropout_p > 0.0:
+                    y = _attention_with_dropout(
+                        q,
+                        k,
+                        v,
+                        scale=self.scale,
+                        mask=attention_mask,
+                        dropout=self.attn_dropout,
+                    )
+                elif self.attention_backend == "mfa":
                     y = _mfa_flash_attention()(
                         q,
                         k,

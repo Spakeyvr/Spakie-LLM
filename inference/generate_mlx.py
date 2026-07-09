@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections import Counter
 
 import numpy as np
 import mlx.core as mx
@@ -13,6 +12,11 @@ import mlx.core as mx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model.transformer_mlx import SpakieGPTMLX
 from tokenizer.train_tokenizer import SpakieTokenizer
+from inference.generation_utils import (
+    apply_repetition_penalty,
+    mask_out_of_tokenizer_vocab,
+    prepare_generation_prompt,
+)
 
 
 def _apply_top_k_top_p_np(logits: np.ndarray, temperature: float, top_k: int, top_p: float) -> np.ndarray:
@@ -65,9 +69,11 @@ def generate(
     stop_on_special_tokens: bool = True,
     ban_special_tokens: bool = True,
 ) -> list[int]:
+    if max_new_tokens <= 0:
+        return []
     model.eval()
     generated: list[int] = []
-    token_counts: Counter[int] = Counter()
+    generated_seen: set[int] = set()
     stop_tokens = {
         tokenizer.eos_id,
         tokenizer.user_id,
@@ -82,8 +88,15 @@ def generate(
         tokenizer.pad_id,
     )
 
-    # Warm the KV cache with the prompt (truncated to max_seq_len).
-    truncated = prompt_ids[-model.config.max_seq_len :]
+    # Reserve the requested output budget before cache warmup. For responses
+    # longer than one context window, the cache is rebuilt from a sliding
+    # window below, matching the Torch backend's overflow semantics.
+    truncated = prepare_generation_prompt(
+        prompt_ids,
+        max_seq_len=model.config.max_seq_len,
+        max_new_tokens=max_new_tokens,
+    )
+    context_tokens = list(truncated)
     idx = mx.array([truncated], dtype=mx.int32)
     logits, _, cache = model(idx, cache=None, cache_offset=0, return_cache=True)
     mx.eval(logits)
@@ -92,12 +105,12 @@ def generate(
     for _ in range(max_new_tokens):
         # Pull just the last-step logits to host.
         last = np.asarray(logits[0, -1, :].astype(mx.float32))
+        mask_out_of_tokenizer_vocab(
+            last,
+            int(getattr(tokenizer, "vocab_size", last.shape[-1])),
+        )
 
-        if repetition_penalty != 1.0:
-            for tok, count in token_counts.items():
-                penalty = repetition_penalty ** count
-                v = last[tok]
-                last[tok] = v / penalty if v > 0 else v * penalty
+        apply_repetition_penalty(last, generated_seen, repetition_penalty)
 
         if ban_special_tokens:
             for tok in banned:
@@ -108,14 +121,28 @@ def generate(
         if stop_on_special_tokens and token in stop_tokens:
             break
         generated.append(token)
-        token_counts[token] += 1
-
-        if cache_offset + 1 > model.config.max_seq_len:
+        generated_seen.add(token)
+        context_tokens.append(token)
+        if len(generated) >= max_new_tokens:
             break
 
-        idx = mx.array([[token]], dtype=mx.int32)
-        logits, _, cache = model(idx, cache=cache, cache_offset=cache_offset, return_cache=True)
-        cache_offset += 1
+        if cache_offset + 1 <= model.config.max_seq_len:
+            idx = mx.array([[token]], dtype=mx.int32)
+            logits, _, cache = model(
+                idx,
+                cache=cache,
+                cache_offset=cache_offset,
+                return_cache=True,
+            )
+            cache_offset += 1
+        else:
+            # A KV cache cannot discard its oldest positions in place. Rebuild
+            # it from the same right-aligned window Torch recomputes on its next
+            # step, so generation continues rather than silently ending early.
+            window = context_tokens[-model.config.max_seq_len :]
+            idx = mx.array([window], dtype=mx.int32)
+            logits, _, cache = model(idx, cache=None, cache_offset=0, return_cache=True)
+            cache_offset = len(window)
 
     return generated
 

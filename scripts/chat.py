@@ -15,6 +15,7 @@ from configs.default import (
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 from runtime.checkpoint_io import (
     config_from_checkpoint_payload,
+    discard_training_state,
     load_mlx_checkpoint_config,
     load_mlx_model_weights_strict,
     load_torch_checkpoint,
@@ -183,6 +184,7 @@ def run_torch_chat(args, config, ckpt_path):
         raise ValueError(
             "Checkpoint has no full config. Pass --allow-legacy-config only for a verified legacy file."
         )
+    discard_training_state(ckpt)
     model = SpakieGPT(config)
     model.load_state_dict(ckpt["model"])
     model.to(device)
@@ -243,6 +245,7 @@ def run_mlx_chat(args, config, ckpt_path):
 
     model = SpakieGPTMLX(config)
     load_mlx_model_weights_strict(model, flat, path=ckpt_path)
+    del flat, model_flat
     if runtime.dtype is not None:
         model.set_dtype(runtime.dtype)
     model.eval()

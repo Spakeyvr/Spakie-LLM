@@ -55,9 +55,17 @@ def make_example(user_text: str, assistant_text: str) -> dict | None:
 
 
 def take_rows(dataset, limit: int, seed: int):
-    if limit <= 0 or len(dataset) <= limit:
+    if limit <= 0:
         return dataset
-    return dataset.shuffle(seed=seed).select(range(limit))
+    # Do not cap raw rows here: malformed rows must not consume the source's
+    # usable-example budget. Builders stop after collecting ``limit`` outputs.
+    return dataset.shuffle(seed=seed)
+
+
+def append_usable(examples: list[dict], example: dict | None, limit: int) -> bool:
+    if example is not None:
+        examples.append(example)
+    return limit > 0 and len(examples) >= limit
 
 
 def clean_chat_messages(messages: object, *, fold_system_into_user: bool = False) -> list[dict]:
@@ -160,8 +168,8 @@ def download_alpaca(limit: int, seed: int) -> list[dict]:
             continue
         user_text = f"{instruction}\n\nContext: {inp}" if inp else instruction
         example = make_example(user_text, output)
-        if example is not None:
-            examples.append(example)
+        if append_usable(examples, example, limit):
+            break
     return examples
 
 
@@ -172,24 +180,21 @@ def load_no_robots(limit: int, seed: int) -> list[dict]:
     examples = []
     for row in rows:
         cleaned = clean_chat_messages(row.get("messages"))
-        if cleaned:
-            examples.append({"messages": cleaned})
+        if append_usable(examples, {"messages": cleaned} if cleaned else None, limit):
+            break
     return examples
 
 
 def load_smoltalk(limit: int, seed: int) -> list[dict]:
     print("Loading SmolTalk...")
     dataset = load_dataset("HuggingFaceTB/smol-smoltalk", split="train", streaming=True)
-    if limit > 0:
-        rows = dataset.shuffle(seed=seed, buffer_size=10_000).take(limit)
-    else:
-        rows = dataset
+    rows = dataset.shuffle(seed=seed, buffer_size=10_000) if limit > 0 else dataset
 
     examples = []
     for row in rows:
         cleaned = clean_chat_messages(row.get("messages"), fold_system_into_user=True)
-        if cleaned:
-            examples.append({"messages": cleaned})
+        if append_usable(examples, {"messages": cleaned} if cleaned else None, limit):
+            break
     return examples
 
 
@@ -206,8 +211,8 @@ def load_squad(limit: int, seed: int) -> list[dict]:
         answer = trim(answer_texts[0]) if answer_texts else ""
         user_text = f"Question: {question}\n\nContext: {context}\n\nAnswer using the context."
         example = make_example(user_text, answer)
-        if example is not None:
-            examples.append(example)
+        if append_usable(examples, example, limit):
+            break
     return examples
 
 
@@ -224,8 +229,8 @@ def load_sciq(limit: int, seed: int) -> list[dict]:
         # context and bloats the prompt. The questions are self-contained, so we
         # keep this as clean factual Q -> A.
         example = make_example(question, answer)
-        if example is not None:
-            examples.append(example)
+        if append_usable(examples, example, limit):
+            break
     return examples
 
 
@@ -241,8 +246,8 @@ def load_triviaqa(limit: int, seed: int) -> list[dict]:
         if not question or not answer:
             continue
         example = make_example(question, answer)
-        if example is not None:
-            examples.append(example)
+        if append_usable(examples, example, limit):
+            break
     return examples
 
 
@@ -257,8 +262,8 @@ def load_boolq(limit: int, seed: int) -> list[dict]:
         answer = "Yes." if bool(row.get("answer")) else "No."
         user_text = f"Question: {question}\n\nContext: {passage}\n\nAnswer yes or no using the context."
         example = make_example(user_text, answer)
-        if example is not None:
-            examples.append(example)
+        if append_usable(examples, example, limit):
+            break
     return examples
 
 
@@ -298,8 +303,8 @@ def load_arc(name: str, limit: int, seed: int, label: str) -> list[dict]:
         assistant = f"{answer_key}. {answer_text}" if answer_text else answer_key
         user_text = f"Question: {question}\n\nChoices:\n{choices_text}\n\nSelect the correct answer."
         example = make_example(user_text, assistant)
-        if example is not None:
-            examples.append(example)
+        if append_usable(examples, example, limit):
+            break
     return examples
 
 
@@ -325,8 +330,8 @@ def load_openbookqa(limit: int, seed: int) -> list[dict]:
         assistant = f"{answer_key}. {answer_text}" if answer_text else answer_key
         user_text = f"Question: {question}\n\nChoices:\n{choices_text}\n\nSelect the correct answer."
         example = make_example(user_text, assistant)
-        if example is not None:
-            examples.append(example)
+        if append_usable(examples, example, limit):
+            break
     return examples
 
 
@@ -365,7 +370,7 @@ def parse_sources(raw_sources: str, config: SpakieConfig, available_sources: set
     return [source.strip() for source in raw_sources.split(",") if source.strip()]
 
 
-def main() -> None:
+def main() -> int:
     config = SpakieConfig()
     parser = argparse.ArgumentParser(description="Download SFT sources to data/chat_raw/")
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed for per-source caps")
@@ -402,8 +407,9 @@ def main() -> None:
     unknown_sources = sorted(set(requested_sources) - set(source_builders))
     if unknown_sources:
         print(f"Unknown sources: {', '.join(unknown_sources)}")
-        sys.exit(2)
+        return 2
 
+    failures: list[tuple[str, str]] = []
     for source_name in requested_sources:
         builder = source_builders[source_name]
         if not config.sft_source_enabled(source_name):
@@ -416,19 +422,27 @@ def main() -> None:
         try:
             examples = builder(limit)
         except Exception as exc:
-            print(f"  skipping {source_name}: {exc}")
+            failures.append((source_name, str(exc)))
+            print(f"  failed {source_name}: {exc}")
             continue
         out_path = os.path.join(args.output_dir, f"{source_name}.jsonl")
         write_jsonl(out_path, examples)
         print(f"  {source_name}: {len(examples):,} examples -> {out_path}")
 
+    if failures:
+        print("\nSFT download completed with source failures:")
+        for source_name, message in failures:
+            print(f"  - {source_name}: {message}")
+        return 1
+
     print(f"\nRaw SFT files written to {args.output_dir}/.")
     print("Next: run `python3 scripts/prepare_sft.py` to merge into data/chat/train.jsonl.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
         print("\nInterrupted while downloading SFT data.")
         sys.exit(130)

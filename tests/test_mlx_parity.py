@@ -8,8 +8,12 @@ catch algebra/index/mask bugs when porting — not to regress on bitwise identit
 from __future__ import annotations
 
 import sys
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -24,14 +28,27 @@ from model.transformer import SpakieGPT
 
 def _skip_if_no_mlx():
     try:
-        import mlx.core  # noqa: F401
-
-        return False
-    except ImportError:
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import mlx.core as mx; "
+                    "assert mx.metal.is_available(); "
+                    "x = mx.array([1.0]); mx.eval(x)"
+                ),
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        return probe.returncode != 0
+    except (OSError, subprocess.TimeoutExpired):
         return True
 
 
-@unittest.skipIf(_skip_if_no_mlx(), "mlx not installed")
+@unittest.skipIf(_skip_if_no_mlx(), "MLX/Metal unavailable")
 class TorchMLXForwardParityTests(unittest.TestCase):
     @staticmethod
     def _tiny_config() -> SpakieConfig:
@@ -310,6 +327,107 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         full_np = np.asarray(full_logits[:, -1, :].astype(mx.float32))
         self.assertLess(float(np.max(np.abs(cached_np - full_np))), 1e-3)
 
+    def test_cached_multi_token_chunk_remains_causal(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        mlx_model = SpakieGPTMLX(config)
+        mlx_model.eval()
+
+        prompt = np.array([[3, 7, 11]], dtype=np.int32)
+        chunk = np.array([[5, 9]], dtype=np.int32)
+        combined = np.concatenate([prompt, chunk], axis=1)
+        full_logits, _, _ = mlx_model(mx.array(combined))
+        _, _, cache = mlx_model(mx.array(prompt), return_cache=True)
+        chunk_logits, _, next_cache = mlx_model(
+            mx.array(chunk),
+            cache=cache,
+            cache_offset=prompt.shape[1],
+            return_cache=True,
+        )
+        mx.eval(
+            full_logits,
+            chunk_logits,
+            *[tensor for pair in next_cache for tensor in pair],
+        )
+
+        cached_np = np.asarray(chunk_logits.astype(mx.float32))
+        full_np = np.asarray(full_logits[:, -chunk.shape[1] :, :].astype(mx.float32))
+        max_abs = float(np.max(np.abs(cached_np - full_np)))
+        self.assertLess(max_abs, 1e-3, f"cached chunk leaked future keys: {max_abs}")
+
+    def test_mlx_attention_applies_dropout_to_attention_weights(self):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        from model.transformer_mlx import CausalSelfAttentionMLX
+
+        config = self._tiny_config()
+        config.dropout = 0.5
+        attention = CausalSelfAttentionMLX(config)
+        # Isolate attention-weight dropout from the existing output dropout.
+        attention.resid_dropout = nn.Dropout(0.0)
+        inputs = mx.arange(4 * config.d_model, dtype=mx.float32).reshape(
+            1, 4, config.d_model
+        ) / 100.0
+
+        attention.train()
+        first, _ = attention(inputs)
+        second, _ = attention(inputs)
+        mx.eval(first, second)
+        train_diff = float(
+            np.max(
+                np.abs(
+                    np.asarray(first.astype(mx.float32))
+                    - np.asarray(second.astype(mx.float32))
+                )
+            )
+        )
+        self.assertGreater(train_diff, 1e-6)
+
+        attention.eval()
+        third, _ = attention(inputs)
+        fourth, _ = attention(inputs)
+        mx.eval(third, fourth)
+        np.testing.assert_allclose(
+            np.asarray(third.astype(mx.float32)),
+            np.asarray(fourth.astype(mx.float32)),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_mlx_generation_does_not_stop_early_at_context_boundary(self):
+        from inference.generate_mlx import generate as generate_mlx
+        from model.transformer_mlx import SpakieGPTMLX
+
+        class Tokenizer:
+            eos_id = 120
+            user_id = 121
+            assistant_id = 122
+            system_id = 123
+            json_id = 124
+            pad_id = 125
+
+        config = self._tiny_config()
+        config.max_seq_len = 8
+        mlx_model = SpakieGPTMLX(config)
+        generated = generate_mlx(
+            mlx_model,
+            Tokenizer(),
+            prompt_ids=[1, 2, 3, 4, 5, 6, 7],
+            max_new_tokens=12,
+            temperature=1.0,
+            top_k=1,
+            top_p=1.0,
+            repetition_penalty=1.0,
+            stop_on_special_tokens=False,
+            ban_special_tokens=False,
+        )
+
+        self.assertEqual(len(generated), 12)
+
     def test_packed_segments_match_separate_mlx_logits(self):
         import mlx.core as mx
 
@@ -339,6 +457,88 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         packed_np = np.asarray(packed_logits.astype(mx.float32))
         self.assertLess(np.max(np.abs(first_np[0] - packed_np[0, :4])), 1e-5)
         self.assertLess(np.max(np.abs(second_np[0] - packed_np[0, 4:7])), 1e-5)
+
+    def test_mlx_muon_failure_does_not_partially_update_parameters(self):
+        import mlx.core as mx
+        from mlx.utils import tree_flatten, tree_map
+
+        from model.transformer_mlx import SpakieGPTMLX
+        from training.muon_core import MuonPrecomputeError
+        from training.optimizers_mlx import configure_mlx_optimizer
+
+        config = self._tiny_config()
+        model = SpakieGPTMLX(config)
+        mx.eval(model.parameters())
+        optimizer = configure_mlx_optimizer(
+            model,
+            config,
+            kind="muon",
+            learning_rate=1e-3,
+            weight_decay=0.1,
+        )
+        before = {name: np.array(value) for name, value in tree_flatten(model.parameters())}
+        grads = tree_map(mx.ones_like, model.trainable_parameters())
+
+        with mock.patch.object(
+            optimizer,
+            "_newton_schulz",
+            side_effect=RuntimeError("forced Newton-Schulz failure"),
+        ):
+            with self.assertRaisesRegex(MuonPrecomputeError, "forced Newton-Schulz failure"):
+                optimizer.update(model, grads)
+
+        mx.eval(model.parameters())
+        for name, value in tree_flatten(model.parameters()):
+            np.testing.assert_array_equal(np.array(value), before[name], err_msg=name)
+
+    def test_mlx_atomic_checkpoint_failure_preserves_previous_generation(self):
+        import os
+        import mlx.core as mx
+
+        from runtime.mlx_backend import (
+            load_safetensors,
+            load_safetensors_checkpoint_meta,
+            save_safetensors_checkpoint,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "model.safetensors")
+            save_safetensors_checkpoint(path, {"value": mx.array([1])}, {"step": 1})
+            real_replace = os.replace
+
+            def fail_at_commit(source, destination):
+                if destination == path:
+                    raise OSError("forced commit failure")
+                return real_replace(source, destination)
+
+            with mock.patch("runtime.mlx_backend.os.replace", side_effect=fail_at_commit):
+                with self.assertRaisesRegex(OSError, "forced commit failure"):
+                    save_safetensors_checkpoint(
+                        path, {"value": mx.array([2])}, {"step": 2}
+                    )
+
+            arrays = load_safetensors(path)
+            mx.eval(arrays["value"])
+            self.assertEqual(np.asarray(arrays["value"]).tolist(), [1])
+            self.assertEqual(load_safetensors_checkpoint_meta(path)["step"], 1)
+
+    def test_real_data_benchmark_never_silently_uses_synthetic(self):
+        import scripts.benchmark_mlx_training as benchmark
+
+        args = SimpleNamespace(
+            train_seq_len=8,
+            grad_accum=1,
+            synthetic=False,
+            real_data=True,
+            pretokenize_sft=False,
+        )
+        with mock.patch.object(
+            benchmark,
+            "_load_real_dataset",
+            return_value=(None, "missing fixture"),
+        ):
+            with self.assertRaisesRegex(FileNotFoundError, "--real-data requested"):
+                benchmark._resolve_dataset("pretrain", self._tiny_config(), 2, args)
 
 
 if __name__ == "__main__":

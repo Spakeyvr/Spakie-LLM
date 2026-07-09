@@ -25,10 +25,9 @@ class BatchPrefetcher:
     """Pulls batches from `sampler` on a worker thread into a bounded queue.
 
     The main loop calls `__next__` (or iterates) to get numpy `(x, y)` tuples.
-    Checkpoint resume still works: the underlying sampler's state is updated
-    as the worker consumes batches, and `state_dict()` on the sampler at
-    checkpoint time captures a valid — possibly slightly-ahead-of-consumed —
-    resume point. The maxsize=2 bound keeps that gap tiny.
+    The producer sampler can run ahead of consumption, so training loops must
+    checkpoint a separate committed cursor that advances only after optimizer
+    steps. The queue bound limits memory use; it is not a resume guarantee.
     """
 
     def __init__(

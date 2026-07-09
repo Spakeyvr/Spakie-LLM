@@ -12,6 +12,7 @@ from runtime import RuntimeSettings
 from tokenizer.train_tokenizer import SpakieTokenizer
 from inference.continuation import decode_prefilled_continuation
 from inference.generate import generate, generate_json
+from inference.generation_utils import prompt_token_budget
 
 
 def build_prompt_ids(tokenizer: SpakieTokenizer, history: list[dict], system_msg: str) -> list[int]:
@@ -52,14 +53,16 @@ def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig
         history.append({"role": "user", "content": user_input})
         prompt_ids = build_prompt_ids(tokenizer, history, system_msg)
 
-        # Truncate history if too long
-        while len(prompt_ids) > config.max_seq_len - 64 and len(history) > 1:
+        # Reserve the actual requested response budget, not a hard-coded guess.
+        prompt_budget = prompt_token_budget(config.max_seq_len, max_new_tokens)
+        while len(prompt_ids) > prompt_budget and len(history) > 1:
             history.pop(0)
             prompt_ids = build_prompt_ids(tokenizer, history, system_msg)
 
         if json_mode:
             response_text = generate_json(
                 model, tokenizer, prompt_ids,
+                max_new_tokens=max_new_tokens,
                 temperature=temperature, top_k=top_k, top_p=top_p, runtime=runtime,
             )
             if response_text is None:

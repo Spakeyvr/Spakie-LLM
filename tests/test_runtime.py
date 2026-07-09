@@ -16,6 +16,7 @@ from model.transformer import SpakieGPT
 from runtime.backends import (
     RuntimeSettings,
     autocast_context,
+    create_grad_scaler,
     dataloader_kwargs,
     resolve_precision,
     resolve_runtime_settings,
@@ -61,6 +62,16 @@ class RuntimeResolutionTests(unittest.TestCase):
 
         autocast_mock.assert_called_once_with(device_type="mps", dtype=torch.float16)
         self.assertIs(context, autocast_mock.return_value)
+
+    def test_grad_scaler_is_enabled_only_for_fp16_autocast(self):
+        fp16 = RuntimeSettings(device=torch.device("cpu"), precision="fp16")
+        bf16 = RuntimeSettings(device=torch.device("cpu"), precision="bf16")
+        with patch(
+            "runtime.backends.torch.amp.autocast_mode.is_autocast_available",
+            return_value=True,
+        ):
+            self.assertTrue(create_grad_scaler(fp16).is_enabled())
+            self.assertFalse(create_grad_scaler(bf16).is_enabled())
 
 
 class RuntimeSmokeTests(unittest.TestCase):

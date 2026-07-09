@@ -20,7 +20,7 @@ from model.transformer_mlx import SpakieGPTMLX
 from runtime.mlx_backend import (
     MLXRuntimeSettings,
     clip_grads,
-    save_meta_json,
+    save_safetensors_checkpoint,
 )
 from training.dataset_mlx import (
     append_packed_varlen_attention_metadata,
@@ -65,11 +65,10 @@ def _save_sft_checkpoint(
                     flat[f"optimizer.{section_name}.{key}"] = value
     if flat:
         mx.eval(*flat.values())
-    mx.save_safetensors(base_path, flat, metadata={})
     meta = dict(meta)
     meta["config_schema_version"] = CHECKPOINT_CONFIG_SCHEMA_VERSION
     meta["config"] = config_to_dict(config)
-    save_meta_json(base_path + ".meta.json", meta)
+    save_safetensors_checkpoint(base_path, flat, meta)
 
 
 def _prepare_sft_batch_np(
@@ -276,7 +275,11 @@ def finetune_mlx(
             drop_last=True,
             seed=0,
         )
-    microbatches_per_epoch = len(train_dataset) // config.sft_batch_size
+    microbatches_per_epoch = (
+        len(train_sampler)
+        if isinstance(train_sampler, LengthBucketBatchSamplerMLX)
+        else len(train_dataset) // config.sft_batch_size
+    )
     steps_per_epoch = math.ceil(microbatches_per_epoch / config.sft_grad_accum_steps)
     total_steps = max(1, steps_per_epoch * config.sft_epochs)
 
@@ -697,6 +700,28 @@ def finetune_mlx(
             best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
         )
         print(f"\nInterrupted during fine-tuning. Saved checkpoint to {interrupt_path}")
+
+    if not interrupted:
+        if best_checkpoint_name.endswith("_best.safetensors"):
+            final_checkpoint_name = best_checkpoint_name.replace(
+                "_best.safetensors", "_final.safetensors"
+            )
+        else:
+            final_checkpoint_name = "sft_final.safetensors"
+        final_path = os.path.join(config.checkpoint_dir, final_checkpoint_name)
+        _save_sft_checkpoint(
+            final_path,
+            model,
+            meta={
+                "step": global_step,
+                "best_val_loss": best_val_loss,
+                "preset_name": config.preset_name,
+                "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+                "muon_verified": config.muon_verified,
+            },
+            config=config,
+        )
+        print(f"Final SFT checkpoint: {final_path}")
 
     if interrupted:
         print(f"SFT stopped early. Best val loss so far: {best_val_loss:.4f}")

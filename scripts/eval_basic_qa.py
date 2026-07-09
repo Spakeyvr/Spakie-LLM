@@ -21,6 +21,7 @@ from configs.default import (
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES, resolve_runtime_settings
 from runtime.checkpoint_io import (
     config_from_checkpoint_payload,
+    discard_training_state,
     load_mlx_checkpoint_config,
     load_mlx_model_weights_strict,
     load_torch_checkpoint,
@@ -200,6 +201,7 @@ def main() -> None:
             )
         elif not args.allow_legacy_config:
             raise ValueError("checkpoint has no full config; use --allow-legacy-config only for a verified legacy file")
+        discard_training_state(ckpt)
         model = SpakieGPT(config)
         model.load_state_dict(ckpt["model"])
         model.to(device)
@@ -224,6 +226,7 @@ def main() -> None:
             config = inherit_mlp_shape_from_tensors(config, model_flat)
         model = SpakieGPTMLX(config)
         load_mlx_model_weights_strict(model, flat, path=checkpoint_path)
+        del flat, model_flat
         model.eval()
         tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
         answer_question = lambda prompt: answer_question_mlx(model, tokenizer, config, prompt, args.system)

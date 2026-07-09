@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -15,7 +16,9 @@ from runtime.backends import RuntimeSettings
 from training.muon_core import (
     MUON_BF16_MAX_ABS,
     MUON_BF16_MAX_REL,
+    MuonPrecomputeError,
     is_muon_parameter_name,
+    should_adamw_fallback,
 )
 from training.optimizers import MuonAdamW, configure_torch_optimizer, muon_newton_schulz_torch
 
@@ -40,6 +43,24 @@ class MuonCoreTests(unittest.TestCase):
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.fc1.weight", 2))
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.gate_up.weight", 2))
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.down.weight", 2))
+
+    def test_runtime_fallback_is_only_allowed_before_mutation(self):
+        optimizer = type("Optimizer", (), {"optimizer_kind": "muon"})()
+        config = SpakieConfig(pretrain_optimizer="muon")
+        self.assertTrue(
+            should_adamw_fallback(
+                MuonPrecomputeError("safe"), optimizer, config, stage="pretrain", allow=True
+            )
+        )
+        self.assertFalse(
+            should_adamw_fallback(
+                RuntimeError("unknown mutation state"),
+                optimizer,
+                config,
+                stage="pretrain",
+                allow=True,
+            )
+        )
 
 
 class TorchMuonOptimizerTests(unittest.TestCase):
@@ -124,6 +145,36 @@ class TorchMuonOptimizerTests(unittest.TestCase):
         fresh.load_state_dict(state)
         self.assertEqual(fresh.optimizer_kind, "muon")
         self.assertTrue(fresh.state)
+
+    def test_newton_schulz_failure_does_not_partially_update_parameters(self):
+        torch.manual_seed(0)
+        config = self._config()
+        model = SpakieGPT(config)
+        runtime = RuntimeSettings(device=torch.device("cpu"), precision="fp32")
+        optimizer = configure_torch_optimizer(
+            model,
+            config,
+            runtime,
+            kind="muon",
+            lr=1e-3,
+            weight_decay=0.1,
+        )
+        idx = torch.randint(0, config.vocab_size, (2, 8))
+        targets = torch.randint(0, config.vocab_size, (2, 8))
+        _, loss = model(idx, targets)
+        loss.backward()
+        before = {name: param.detach().clone() for name, param in model.named_parameters()}
+
+        with patch(
+            "training.optimizers.muon_newton_schulz_torch",
+            side_effect=RuntimeError("forced Newton-Schulz failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forced Newton-Schulz failure"):
+                optimizer.step()
+
+        for name, param in model.named_parameters():
+            self.assertTrue(torch.equal(param, before[name]), name)
+        self.assertFalse(optimizer.state)
 
 
 if __name__ == "__main__":

@@ -26,9 +26,9 @@ from model.transformer_mlx import SpakieGPTMLX
 from runtime.mlx_backend import (
     MLXRuntimeSettings,
     clip_grads,
-    load_meta_json,
     load_safetensors,
-    save_meta_json,
+    load_safetensors_checkpoint_meta,
+    save_safetensors_checkpoint,
 )
 from training.dataset_mlx import (
     PretrainDatasetMLX,
@@ -434,8 +434,7 @@ class AsyncCheckpointWriter:
 
         def _work() -> None:
             try:
-                mx.save_safetensors(path, flat, metadata={})
-                save_meta_json(meta_path, meta)
+                save_safetensors_checkpoint(path, flat, meta)
             except BaseException as exc:  # noqa: BLE001
                 self._error = exc
 
@@ -447,8 +446,7 @@ class AsyncCheckpointWriter:
         self.join()
         if flat:
             mx.eval(*flat.values())
-        mx.save_safetensors(path, flat, metadata={})
-        save_meta_json(meta_path, meta)
+        save_safetensors_checkpoint(path, flat, meta)
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
@@ -585,8 +583,7 @@ def save_training_checkpoint_mlx(
 
     if flat:
         mx.eval(*flat.values())
-    mx.save_safetensors(base_path, flat, metadata={})
-    save_meta_json(meta_path, meta)
+    save_safetensors_checkpoint(base_path, flat, meta)
 
 
 def _json_safe(obj):
@@ -618,7 +615,9 @@ def _json_restore(obj):
 
 def load_training_checkpoint_mlx(base_path: str) -> dict:
     flat = load_safetensors(base_path)
-    meta = load_meta_json(base_path + ".meta.json")
+    meta = load_safetensors_checkpoint_meta(base_path)
+    if meta is None:
+        raise ValueError(f"Missing metadata for MLX training checkpoint '{base_path}'")
 
     model_flat: dict[str, mx.array] = {}
     optimizer_sections: dict[str, dict[str, mx.array]] = {}
@@ -658,12 +657,7 @@ def evaluate(
     try:
         total = 0.0
         count = 0
-        it = iter(val_sampler)
-        while count < config.pretrain_eval_batches:
-            try:
-                batch_indices = next(it)
-            except StopIteration:
-                break
+        for batch_indices in val_sampler.iter_fixed(config.pretrain_eval_batches):
             x_np, y_np = stack_batch(val_dataset, batch_indices)
             x = mx.array(x_np)
             y = mx.array(y_np)
@@ -810,6 +804,10 @@ def pretrain_mlx(
 
     prefetcher: BatchPrefetcher | None = None
     train_iter = None
+    committed_sampler = ResumableBatchSamplerMLX.from_state_dict(
+        train_sampler.state_dict(copy_indices=False)
+    )
+    committed_iter = iter(committed_sampler)
     if use_prefetch:
         prefetcher = BatchPrefetcher(train_dataset, train_sampler)
     else:
@@ -841,6 +839,8 @@ def pretrain_mlx(
                 ckpt_writer.join()
             accum_grads = None
             accum_loss = mx.array(0.0, dtype=mx.float32)
+            consumed_microbatches = 0
+            step_tokens = 0
 
             if vmap_accum_step is not None:
                 xs = []
@@ -855,7 +855,8 @@ def pretrain_mlx(
                     x, y = _arrays_to_mx(x_np, y_np, profiler)
                     xs.append(x)
                     ys.append(y)
-                    tokens_processed += x.size
+                    step_tokens += x.size
+                    consumed_microbatches += 1
 
                 step_start = now() if profiler.enabled else None
                 grad_accum = config.pretrain_grad_accum_steps
@@ -926,7 +927,8 @@ def pretrain_mlx(
                             else accum_grads
                         )
                         mx.async_eval(eval_target)
-                    tokens_processed += x.size
+                    step_tokens += x.size
+                    consumed_microbatches += 1
 
             if profiler.enabled:
                 opt_start = now()
@@ -971,6 +973,9 @@ def pretrain_mlx(
                 profiler.add("opt_step", now() - opt_start)
 
             global_step += 1
+            tokens_processed += step_tokens
+            for _ in range(consumed_microbatches):
+                next(committed_iter)
             window_steps += 1
             pbar.update(1)
             if status_writer.due():
@@ -1004,7 +1009,7 @@ def pretrain_mlx(
                         best_val_loss=best_val_loss,
                         val_loss=last_val_loss,
                         elapsed_time=time.time() - start_time,
-                        train_sampler=train_sampler,
+                        train_sampler=committed_sampler,
                         writer=ckpt_writer,
                         sync=True,
                     )
@@ -1020,7 +1025,7 @@ def pretrain_mlx(
                         best_val_loss=best_val_loss,
                         val_loss=last_val_loss,
                         elapsed_time=time.time() - start_time,
-                        train_sampler=train_sampler,
+                        train_sampler=committed_sampler,
                         writer=ckpt_writer,
                         sync=True,
                     )
@@ -1050,7 +1055,7 @@ def pretrain_mlx(
                         best_val_loss=best_val_loss,
                         val_loss=last_val_loss,
                         elapsed_time=time.time() - start_time,
-                        train_sampler=train_sampler,
+                        train_sampler=committed_sampler,
                         writer=ckpt_writer,
                         sync=True,
                     )
@@ -1066,7 +1071,7 @@ def pretrain_mlx(
                         best_val_loss=best_val_loss,
                         val_loss=last_val_loss,
                         elapsed_time=time.time() - start_time,
-                        train_sampler=train_sampler,
+                        train_sampler=committed_sampler,
                         writer=ckpt_writer,
                         sync=True,
                     )
@@ -1140,7 +1145,7 @@ def pretrain_mlx(
                             best_val_loss=best_val_loss,
                             val_loss=val_loss,
                             elapsed_time=elapsed,
-                            train_sampler=train_sampler,
+                            train_sampler=committed_sampler,
                             writer=ckpt_writer,
                         )
                         profiler.add("checkpoint", now() - checkpoint_start)
@@ -1155,7 +1160,7 @@ def pretrain_mlx(
                             best_val_loss=best_val_loss,
                             val_loss=val_loss,
                             elapsed_time=elapsed,
-                            train_sampler=train_sampler,
+                            train_sampler=committed_sampler,
                             writer=ckpt_writer,
                         )
                     status_writer.update(
@@ -1204,7 +1209,7 @@ def pretrain_mlx(
                 best_val_loss=best_val_loss,
                 val_loss=last_val_loss,
                 elapsed_time=time.time() - start_time,
-                train_sampler=train_sampler,
+                train_sampler=committed_sampler,
                 writer=ckpt_writer,
                 sync=True,
             )
@@ -1220,7 +1225,7 @@ def pretrain_mlx(
                 best_val_loss=best_val_loss,
                 val_loss=last_val_loss,
                 elapsed_time=time.time() - start_time,
-                train_sampler=train_sampler,
+                train_sampler=committed_sampler,
                 writer=ckpt_writer,
                 sync=True,
             )
@@ -1251,6 +1256,21 @@ def pretrain_mlx(
             f"Best val loss so far: {best_val_loss:.4f}"
         )
     else:
+        final_path = os.path.join(config.checkpoint_dir, "pretrain_final.safetensors")
+        save_training_checkpoint_mlx(
+            final_path,
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            global_step=global_step,
+            tokens_processed=tokens_processed,
+            best_val_loss=best_val_loss,
+            val_loss=last_val_loss,
+            elapsed_time=time.time() - start_time,
+            train_sampler=committed_sampler,
+            writer=ckpt_writer,
+            sync=True,
+        )
         if status_writer.payload.get("status") != "stopped":
             status_writer.finish(
                 "complete",
@@ -1263,6 +1283,7 @@ def pretrain_mlx(
         print(
             f"Pretraining complete at {tokens_processed:,} tokens. Best val loss: {best_val_loss:.4f}"
         )
+        print(f"Final checkpoint: {final_path}")
     if stop_background_monitor(monitor_info):
         print("Monitor stopped.")
     return best_val_loss

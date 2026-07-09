@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings, autocast_context, dataloader_kwargs
+from runtime.checkpoint_io import atomic_torch_save
+from runtime.backends import create_grad_scaler
 from training.dataset import ChatSFTDataset, train_val_split
 from training.monitor import (
     TrainingStatusWriter,
@@ -44,6 +46,24 @@ def _scale_partial_sft_grads(model: SpakieGPT, config: SpakieConfig, microbatche
             param.grad.mul_(scale)
 
 
+@torch.no_grad()
+def _evaluate_sft_loss(model, val_loader, runtime: RuntimeSettings) -> float:
+    """Return mean cross-entropy per supervised token, matching the MLX path."""
+    model.eval()
+    total_loss = 0.0
+    supervised_tokens = 0
+    for x, y in val_loader:
+        x, y = x.to(runtime.device), y.to(runtime.device)
+        token_count = int((y != -100).sum().item())
+        if token_count == 0:
+            continue
+        with autocast_context(runtime):
+            _, loss = model(x, y)
+        total_loss += loss.item() * token_count
+        supervised_tokens += token_count
+    return total_loss / max(supervised_tokens, 1)
+
+
 def _sft_optimizer_step(
     model: SpakieGPT,
     optimizer,
@@ -54,7 +74,9 @@ def _sft_optimizer_step(
     total_steps: int,
     microbatches_in_step: int,
     allow_adamw_fallback: bool,
+    scaler: torch.amp.GradScaler,
 ) -> object:
+    scaler.unscale_(optimizer)
     _scale_partial_sft_grads(model, config, microbatches_in_step)
     if config.sft_grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.sft_grad_clip)
@@ -65,7 +87,7 @@ def _sft_optimizer_step(
     _ensure_contiguous_mps_grads(model, runtime)
 
     try:
-        optimizer.step()
+        scaler.step(optimizer)
     except Exception as exc:
         if should_adamw_fallback(exc, optimizer, config, stage="sft", allow=allow_adamw_fallback):
             print(f"USING ADAMW FALLBACK after Muon failure: {exc}")
@@ -84,6 +106,7 @@ def _sft_optimizer_step(
             optimizer.step()
         else:
             raise
+    scaler.update()
     return optimizer
 
 
@@ -119,6 +142,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
         lr=config.sft_lr,
         weight_decay=config.sft_weight_decay,
     )
+    scaler = create_grad_scaler(runtime)
 
     steps_per_epoch = math.ceil(len(train_loader) / config.sft_grad_accum_steps)
     total_steps = steps_per_epoch * config.sft_epochs
@@ -156,7 +180,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                         _, loss = model(x, y)
                         loss = loss / config.sft_grad_accum_steps
 
-                    loss.backward()
+                    scaler.scale(loss).backward()
                     pending_grads = True
                     pending_microbatches += 1
                     epoch_loss += loss.item() * config.sft_grad_accum_steps
@@ -172,6 +196,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                             total_steps=total_steps,
                             microbatches_in_step=pending_microbatches,
                             allow_adamw_fallback=allow_adamw_fallback,
+                            scaler=scaler,
                         )
                         optimizer.zero_grad(set_to_none=True)
                         pending_grads = False
@@ -200,6 +225,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     total_steps=total_steps,
                     microbatches_in_step=pending_microbatches,
                     allow_adamw_fallback=allow_adamw_fallback,
+                    scaler=scaler,
                 )
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
@@ -213,18 +239,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                 )
 
             # Validation
-            model.eval()
-            val_loss = 0.0
-            val_count = 0
-            with torch.no_grad():
-                for x, y in val_loader:
-                    x, y = x.to(runtime.device), y.to(runtime.device)
-                    with autocast_context(runtime):
-                        _, loss = model(x, y)
-                    val_loss += loss.item()
-                    val_count += 1
-
-            val_loss = val_loss / max(val_count, 1)
+            val_loss = _evaluate_sft_loss(model, val_loader, runtime)
             print(f"Epoch {epoch + 1} | train_loss {epoch_loss / n_batches:.4f} | val_loss {val_loss:.4f}")
             status_writer.update(
                 force=True,
@@ -242,7 +257,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                 best_val_loss = val_loss
                 patience_counter = 0
                 ckpt_path = os.path.join(config.checkpoint_dir, best_checkpoint_name)
-                torch.save({
+                atomic_torch_save({
                     "model": model.state_dict(),
                     "epoch": epoch + 1,
                     "val_loss": val_loss,
@@ -278,7 +293,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
     except KeyboardInterrupt:
         interrupted = True
         interrupt_path = os.path.join(config.checkpoint_dir, interrupt_checkpoint_name)
-        torch.save({
+        atomic_torch_save({
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),

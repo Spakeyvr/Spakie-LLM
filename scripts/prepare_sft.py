@@ -366,6 +366,9 @@ def load_source(
             except json.JSONDecodeError:
                 malformed += 1
                 continue
+            if not isinstance(raw, dict):
+                malformed += 1
+                continue
             if contains_disallowed_sft_marker(raw.get("messages")):
                 filtered += 1
                 continue

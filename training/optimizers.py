@@ -10,6 +10,7 @@ from configs.default import SpakieConfig
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings, optimizer_kwargs
 from training.muon_core import (
+    MuonPrecomputeError,
     MuonSettings,
     adjusted_muon_lr,
     is_muon_parameter_name,
@@ -104,29 +105,46 @@ class MuonAdamW:
             group["lr"] = lr
 
     def step(self) -> None:
+        # Build every Muon update before mutating either the model or optimizer
+        # state.  In particular, Newton-Schulz can fail (or produce a shape
+        # error) and the caller may explicitly fall back to AdamW.  Updating
+        # auxiliary parameters first would make that fallback apply the same
+        # gradients twice to those parameters.
+        try:
+            prepared: list[tuple[torch.nn.Parameter, torch.Tensor, list[tuple[int, torch.Tensor, float]]]] = []
+            for name, param in zip(self.muon_names, self.muon_params, strict=True):
+                grad = param.grad
+                if grad is None:
+                    continue
+                state = self.state.get(param, {})
+                momentum_buffer = state.get("momentum_buffer")
+                if momentum_buffer is None:
+                    momentum_buffer = torch.zeros_like(param, memory_format=torch.preserve_format)
+                next_momentum = momentum_buffer.mul(self.settings.momentum).add(grad)
+                update = grad.add(next_momentum, alpha=self.settings.momentum) if self.settings.nesterov else next_momentum
+                chunks: list[tuple[int, torch.Tensor, float]] = []
+                for start, chunk in self._update_chunks(name, update):
+                    orthogonal = muon_newton_schulz_torch(
+                        chunk,
+                        ns_steps=self.settings.ns_steps,
+                        ns_coefficients=self.settings.ns_coefficients,
+                        eps=self.settings.eps,
+                    )
+                    chunk_lr = adjusted_muon_lr(self.lr, tuple(chunk.shape), self.settings.adjust_lr_fn)
+                    chunks.append((start, orthogonal, chunk_lr))
+                prepared.append((param, next_momentum, chunks))
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            raise MuonPrecomputeError(f"Muon update preparation failed: {exc}") from exc
+
         self.adamw.step()
-        for name, param in zip(self.muon_names, self.muon_params, strict=True):
-            grad = param.grad
-            if grad is None:
-                continue
-            state = self.state.setdefault(param, {})
-            momentum_buffer = state.get("momentum_buffer")
-            if momentum_buffer is None:
-                momentum_buffer = torch.zeros_like(param, memory_format=torch.preserve_format)
-            momentum_buffer.mul_(self.settings.momentum).add_(grad)
-            state["momentum_buffer"] = momentum_buffer
-            update = grad.add(momentum_buffer, alpha=self.settings.momentum) if self.settings.nesterov else momentum_buffer
+        for param, next_momentum, chunks in prepared:
             if self.weight_decay:
                 param.data.mul_(1.0 - self.lr * self.weight_decay)
-            for start, chunk in self._update_chunks(name, update):
-                orthogonal = muon_newton_schulz_torch(
-                    chunk,
-                    ns_steps=self.settings.ns_steps,
-                    ns_coefficients=self.settings.ns_coefficients,
-                    eps=self.settings.eps,
-                )
-                chunk_lr = adjusted_muon_lr(self.lr, tuple(chunk.shape), self.settings.adjust_lr_fn)
-                param.data.narrow(0, start, chunk.shape[0]).add_(orthogonal, alpha=-chunk_lr)
+            for start, orthogonal, chunk_lr in chunks:
+                param.data.narrow(0, start, orthogonal.shape[0]).add_(orthogonal, alpha=-chunk_lr)
+            self.state.setdefault(param, {})["momentum_buffer"] = next_momentum
 
     def _update_chunks(self, name: str, update: torch.Tensor):
         if self.settings.qkv_split and is_qkv_parameter_name(name) and update.shape[0] % 3 == 0:

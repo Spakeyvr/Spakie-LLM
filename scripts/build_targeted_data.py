@@ -848,15 +848,34 @@ def build_sft(facts: list[dict], seed: int) -> list[dict]:
     return rows
 
 
-def build_basic_eval(facts: list[dict]) -> list[dict]:
+def training_user_prompts(rows: list[dict]) -> set[str]:
+    return {
+        message["content"].strip()
+        for row in rows
+        for message in row.get("messages", [])
+        if message.get("role") == "user" and isinstance(message.get("content"), str)
+    }
+
+
+def build_basic_eval(
+    facts: list[dict],
+    *,
+    excluded_prompts: set[str] | None = None,
+) -> list[dict]:
     rows = []
+    excluded_prompts = excluded_prompts or set()
+
+    def append_if_held_out(row: dict) -> None:
+        if row["question"].strip() not in excluded_prompts:
+            rows.append(row)
+
     capital_names = [capital.lower() for _, capital in CAPITAL_ROWS]
     country_names = [country.lower() for country, _ in CAPITAL_ROWS]
     for fact in facts:
-        rows.append({"question": fact["question"], "accept_any": fact["accept_any"], "reject_any": COMMON_QA_REJECT_TOKENS, "reference_answer": fact["short_answer"]})
-        rows.append({"question": fact["paraphrase"], "accept_any": fact["accept_any"], "reject_any": COMMON_QA_REJECT_TOKENS, "reference_answer": fact["short_answer"]})
+        append_if_held_out({"question": fact["question"], "accept_any": fact["accept_any"], "reject_any": COMMON_QA_REJECT_TOKENS, "reference_answer": fact["short_answer"]})
+        append_if_held_out({"question": fact["paraphrase"], "accept_any": fact["accept_any"], "reject_any": COMMON_QA_REJECT_TOKENS, "reference_answer": fact["short_answer"]})
         for template in HELDOUT_FACT_TEMPLATES:
-            rows.append({"question": template.format(**fact), "accept_any": fact["accept_any"], "reject_any": COMMON_QA_REJECT_TOKENS, "reference_answer": fact["short_answer"]})
+            append_if_held_out({"question": template.format(**fact), "accept_any": fact["accept_any"], "reject_any": COMMON_QA_REJECT_TOKENS, "reference_answer": fact["short_answer"]})
     for country, capital in CAPITAL_ROWS:
         capital_rejects = [
             token
@@ -864,7 +883,7 @@ def build_basic_eval(facts: list[dict]) -> list[dict]:
             if token not in {capital.lower(), country.lower()}
         ]
         for template in HELDOUT_CAPITAL_TEMPLATES:
-            rows.append({
+            append_if_held_out({
                 "question": template.format(country=country),
                 "accept_any": [capital.lower()],
                 "reject_any": capital_rejects,
@@ -882,7 +901,10 @@ def main() -> None:
     facts = fact_rows()
 
     sft_rows = build_sft(facts, seed=42)
-    basic_eval_rows = build_basic_eval(facts)
+    basic_eval_rows = build_basic_eval(
+        facts,
+        excluded_prompts=training_user_prompts(sft_rows),
+    )
     refusal_eval_rows = build_refusal_eval()
 
     write_jsonl(os.path.join(config.chat_data_dir, "train.jsonl"), sft_rows)

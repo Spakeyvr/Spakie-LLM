@@ -205,10 +205,10 @@ def scrape(max_articles: int = 0, reset: bool = False):
         for title in remaining:
             text = fetch_article(title)
             if text is None:
-                print(f"  SKIP  {title} (not found)")
-                progress["done"].append(title)
-                done.add(title)
-                save_json(PROGRESS_FILE, progress)
+                # A timeout/rate-limit exhaustion and a missing extract both
+                # arrive as None. Do not mark either as completed: leaving the
+                # title out of `done` makes the next invocation retry it.
+                print(f"  RETRY  {title} (not fetched)")
                 continue
 
             filepath = os.path.join(OUTPUT_DIR, title_to_filename(title))

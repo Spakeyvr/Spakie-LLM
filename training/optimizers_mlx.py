@@ -8,6 +8,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from configs.default import SpakieConfig
 from training.muon_core import (
+    MuonPrecomputeError,
     MuonSettings,
     adjusted_muon_lr,
     is_muon_parameter_name,
@@ -199,16 +200,36 @@ class MuonAdamWMLX:
     def update(self, model, grads) -> None:
         grad_flat = _flatten_arrays(grads)
         param_flat = _flatten_arrays(model.parameters())
+        try:
+            if self.grouped_muon:
+                updates, next_muon_state = self._prepare_muon_grouped(grad_flat, param_flat)
+            else:
+                updates, next_muon_state = self._prepare_muon(grad_flat, param_flat)
+
+            # Materialize all potentially-failing Muon math before AdamW or
+            # model state is mutated.
+            mx.eval(
+                tree_unflatten(list(updates.items())),
+                tree_unflatten(list(next_muon_state.items())),
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            raise MuonPrecomputeError(f"Muon update preparation failed: {exc}") from exc
         if self.aux_decay_names:
             decay_grads = _subset_tree_by_names(grads, set(self.aux_decay_names))
             self.aux_decay.update(model, decay_grads)
         if self.aux_nodecay_names:
             nodecay_grads = _subset_tree_by_names(grads, set(self.aux_nodecay_names))
             self.aux_nodecay.update(model, nodecay_grads)
+        if updates:
+            model.update(tree_unflatten(list(updates.items())))
+        self.muon_state = next_muon_state
 
-        if self.grouped_muon:
-            self._update_muon_grouped(model, grad_flat, param_flat)
-            return
+    def _prepare_muon(
+        self, grad_flat: dict[str, mx.array], param_flat: dict[str, mx.array]
+    ) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
+        next_muon_state = dict(self.muon_state)
 
         updates: dict[str, mx.array] = {}
         for name in self.muon_names:
@@ -220,18 +241,20 @@ class MuonAdamWMLX:
             if momentum is None:
                 momentum = mx.zeros_like(param)
             momentum = momentum * self.settings.momentum + grad
-            self.muon_state[name] = momentum
+            next_muon_state[name] = momentum
             update = grad + momentum * self.settings.momentum if self.settings.nesterov else momentum
             next_param = param
             if self.weight_decay:
                 next_param = next_param * (1.0 - self.learning_rate * self.weight_decay)
             next_param = next_param - self._orthogonal_update(name, update, param.dtype)
             updates[name] = next_param
-        if updates:
-            model.update(tree_unflatten(list(updates.items())))
+        return updates, next_muon_state
 
-    def _update_muon_grouped(self, model, grad_flat: dict[str, mx.array], param_flat: dict[str, mx.array]) -> None:
+    def _prepare_muon_grouped(
+        self, grad_flat: dict[str, mx.array], param_flat: dict[str, mx.array]
+    ) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
         bases: dict[str, mx.array] = {}
+        next_muon_state = dict(self.muon_state)
         grouped: dict[tuple[tuple[int, int], str, float], list[tuple[str, int | None, mx.array, object]]] = {}
         for name in self.muon_names:
             grad = grad_flat.get(name)
@@ -242,7 +265,7 @@ class MuonAdamWMLX:
             if momentum is None:
                 momentum = mx.zeros_like(param)
             momentum = momentum * self.settings.momentum + grad
-            self.muon_state[name] = momentum
+            next_muon_state[name] = momentum
             update = grad + momentum * self.settings.momentum if self.settings.nesterov else momentum
             next_param = param
             if self.weight_decay:
@@ -281,8 +304,7 @@ class MuonAdamWMLX:
                 raise RuntimeError(f"incomplete grouped qkv update for {name}")
             updates[name] = bases[name] - mx.concatenate(pieces, axis=0)
 
-        if updates:
-            model.update(tree_unflatten(list(updates.items())))
+        return updates, next_muon_state
 
     def _orthogonal_update(self, name: str, update: mx.array, dtype) -> mx.array:
         if self.settings.qkv_split and is_qkv_parameter_name(name) and update.shape[0] % 3 == 0:

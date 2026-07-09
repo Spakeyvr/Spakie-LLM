@@ -12,6 +12,7 @@ from secrets import token_hex
 import socket
 import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -640,6 +641,10 @@ def _uses_ipv6_host(host: str) -> bool:
     return ":" in host
 
 
+def _is_loopback_host(host: str) -> bool:
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
 def create_server(host: str, port: int, handler) -> ThreadingHTTPServer:
     server_cls = DualStackThreadingHTTPServer if _uses_ipv6_host(host) else ThreadingHTTPServer
     return server_cls((host, port), handler)
@@ -657,6 +662,7 @@ def make_handler(status_file: Path | None, search_root: Path, *, verbose: bool, 
     password = _password_value(password)
     session_secret = token_hex(32)
     expected_token = _auth_token(password, session_secret) if password else ""
+    prompt_lock = threading.Lock()
 
     class MonitorHandler(BaseHTTPRequestHandler):
         server_version = "SpakieTrainingMonitor/1.0"
@@ -727,6 +733,18 @@ def make_handler(status_file: Path | None, search_root: Path, *, verbose: bool, 
             self._send_login(error=True)
 
         def _handle_prompt(self) -> None:
+            if not prompt_lock.acquire(blocking=False):
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "message": "another prompt is already running"},
+                )
+                return
+            try:
+                self._handle_prompt_exclusive()
+            finally:
+                prompt_lock.release()
+
+        def _handle_prompt_exclusive(self) -> None:
             length = int(self.headers.get("Content-Length") or "0")
             if length <= 0 or length > 65536:
                 self._send_json(
@@ -810,7 +828,7 @@ def make_handler(status_file: Path | None, search_root: Path, *, verbose: bool, 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve Spakie training status for phone monitoring")
-    parser.add_argument("--host", default="::", help="Bind host; :: listens on IPv6 and IPv4 when the OS allows it")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host; non-loopback hosts require --password")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port")
     parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory tree to scan for training_status.json")
     parser.add_argument("--status-file", default="", help="Exact training_status.json path to serve")
@@ -821,6 +839,9 @@ def main() -> int:
     )
     parser.add_argument("--verbose", action="store_true", help="Log HTTP requests")
     args = parser.parse_args()
+
+    if not _is_loopback_host(args.host) and not _password_value(args.password):
+        parser.error("a non-loopback monitor bind requires --password or MONITOR_PASSWORD")
 
     status_file = Path(args.status_file).expanduser() if args.status_file else None
     search_root = Path(args.checkpoint_dir).expanduser()

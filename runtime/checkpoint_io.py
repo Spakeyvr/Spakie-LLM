@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from typing import Any
 
 from configs.default import (
@@ -15,6 +16,29 @@ from configs.default import (
 
 class UnsafeCheckpointError(RuntimeError):
     """Raised when a checkpoint cannot be read by PyTorch's restricted loader."""
+
+
+def atomic_torch_save(payload: dict, path: str) -> None:
+    """Durably replace a Torch checkpoint without exposing partial bytes."""
+    import torch
+
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        torch.save(payload, temp_path)
+        with open(temp_path, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def load_torch_checkpoint(
@@ -51,15 +75,21 @@ def load_torch_checkpoint(
     return checkpoint
 
 
+def discard_training_state(checkpoint: dict) -> None:
+    """Release state that inference and fresh SFT runs never consume."""
+    for key in ("optimizer", "train_sampler", "rng_state", "scaler"):
+        checkpoint.pop(key, None)
+
+
 def load_mlx_checkpoint_meta(path: str) -> dict | None:
-    """Load the sibling MLX metadata file, returning None for legacy weights."""
-    meta_path = path + ".meta.json"
-    if not os.path.exists(meta_path):
+    """Load authoritative embedded MLX metadata, with sidecar fallback."""
+    from runtime.mlx_backend import load_safetensors_checkpoint_meta
+
+    payload = load_safetensors_checkpoint_meta(path)
+    if payload is None:
         return None
-    with open(meta_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
     if not isinstance(payload, dict):
-        raise ValueError(f"MLX checkpoint metadata '{meta_path}' must be an object")
+        raise ValueError(f"MLX checkpoint metadata for '{path}' must be an object")
     return payload
 
 

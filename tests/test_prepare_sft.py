@@ -90,6 +90,7 @@ class PrepareSFTTests(unittest.TestCase):
 
     def test_load_source_filters_tool_and_reasoning_artifact_examples(self):
         rows = [
+            [],
             {
                 "messages": [
                     {"role": "user", "content": "What is 2 + 2?"},
@@ -141,7 +142,7 @@ class PrepareSFTTests(unittest.TestCase):
         )
         log = output.getvalue()
         self.assertIn("filtered 3 tool/template artifact examples", log)
-        self.assertIn("skipped 1 malformed lines", log)
+        self.assertIn("skipped 2 malformed lines", log)
 
     def test_fits_context_drops_overlong_and_overly_verbose(self):
         # Fake tokenizer: one token per whitespace-delimited word.

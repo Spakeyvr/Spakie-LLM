@@ -90,6 +90,18 @@ def autocast_context(runtime: RuntimeSettings):
     return torch.autocast(device_type=runtime.device.type, dtype=runtime.autocast_dtype)
 
 
+def create_grad_scaler(runtime: RuntimeSettings) -> torch.amp.GradScaler:
+    """Create the loss scaler required for FP16 training.
+
+    BF16 has enough exponent range that gradient scaling is unnecessary.  A
+    disabled scaler keeps the training loops identical for FP32/BF16.
+    """
+    return torch.amp.GradScaler(
+        runtime.device.type,
+        enabled=runtime.precision == "fp16" and runtime.autocast_enabled,
+    )
+
+
 def dataloader_kwargs(runtime: RuntimeSettings, num_workers: int) -> dict[str, object]:
     if num_workers < 0:
         raise ValueError("num_workers must be >= 0")

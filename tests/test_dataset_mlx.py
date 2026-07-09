@@ -36,6 +36,24 @@ class FakeTokenizer:
 
 
 class MLXDatasetUtilityTests(unittest.TestCase):
+    def test_fixed_sampler_iteration_is_repeatable_and_does_not_advance_state(self):
+        sampler = ResumableBatchSamplerMLX(
+            dataset_size=11,
+            batch_size=3,
+            drop_last=False,
+            seed=123,
+        )
+        before = sampler.state_dict()
+
+        first = [batch.tolist() for batch in sampler.iter_fixed(max_batches=2)]
+        second = [batch.tolist() for batch in sampler.iter_fixed(max_batches=2)]
+        after = sampler.state_dict()
+
+        self.assertEqual(first, second)
+        self.assertEqual(before["position"], after["position"])
+        np.testing.assert_array_equal(before["indices"], after["indices"])
+        self.assertEqual(before["rng_state"], after["rng_state"])
+
     def test_pretokenized_chat_sft_dataset_matches_lazy_dataset(self):
         class Dataset(ChatSFTDatasetMLX):
             def __init__(self):
@@ -141,6 +159,27 @@ class MLXDatasetUtilityTests(unittest.TestCase):
         for batch in batches:
             spread = int(lengths[batch].max() - lengths[batch].min())
             self.assertLessEqual(spread, 2)
+
+    def test_length_bucket_sampler_epoch_drops_only_global_tail(self):
+        lengths = np.arange(23, dtype=np.int32)
+        sampler = LengthBucketBatchSamplerMLX(
+            lengths,
+            batch_size=4,
+            bucket_size=10,  # deliberately not batch-aligned
+            drop_last=True,
+            seed=7,
+        )
+        iterator = iter(sampler)
+
+        first_epoch = [next(iterator) for _ in range(len(sampler))]
+        first_indices = np.concatenate(first_epoch)
+
+        self.assertEqual(len(sampler), 5)
+        self.assertEqual(len(first_indices), 20)
+        self.assertEqual(len(set(first_indices.tolist())), 20)
+        # The very next batch belongs to the next permutation; an epoch-sized
+        # consumer never has to spill into it to make up per-bucket tails.
+        self.assertEqual(len(next(iterator)), 4)
 
     def test_step_sorted_sampler_preserves_optimizer_step_window(self):
         lengths = np.asarray([9, 1, 8, 2, 7, 3, 6, 4, 5, 10, 11, 12], dtype=np.int32)

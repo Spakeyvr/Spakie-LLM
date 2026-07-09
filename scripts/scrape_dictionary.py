@@ -161,7 +161,8 @@ def scrape(max_words: int = 0, reset: bool = False):
         queue = fetch_top_words(months=12)
         save_json(QUEUE_FILE, queue)
 
-    progress = load_json(PROGRESS_FILE, {"scraped": [], "index": 0})
+    progress = load_json(PROGRESS_FILE, {"scraped": [], "index": 0, "retry": []})
+    progress.setdefault("retry", [])
     scraped_set = set(progress["scraped"])
     start_index = progress["index"]
 
@@ -171,16 +172,25 @@ def scrape(max_words: int = 0, reset: bool = False):
 
     count = 0
     try:
-        for i in range(start_index, len(queue)):
-            title = queue[i]
+        retry_titles = [title for title in progress["retry"] if title not in scraped_set]
+        work = [(title, None) for title in retry_titles]
+        work.extend((queue[i], i) for i in range(start_index, len(queue)))
+        for title, queue_index in work:
 
             if title in scraped_set:
-                progress["index"] = i + 1
+                if queue_index is not None:
+                    progress["index"] = queue_index + 1
                 continue
 
             text = fetch_definition(title)
             if text is None:
-                progress["index"] = i + 1
+                # Advance the queue cursor so one bad entry does not block the
+                # corpus, but retain an explicit retry queue. Only successful
+                # writes enter `scraped`.
+                if title not in progress["retry"]:
+                    progress["retry"].append(title)
+                if queue_index is not None:
+                    progress["index"] = queue_index + 1
                 save_json(PROGRESS_FILE, progress)
                 continue
 
@@ -192,7 +202,10 @@ def scrape(max_words: int = 0, reset: bool = False):
 
             scraped_set.add(title)
             progress["scraped"].append(title)
-            progress["index"] = i + 1
+            if title in progress["retry"]:
+                progress["retry"].remove(title)
+            if queue_index is not None:
+                progress["index"] = queue_index + 1
             count += 1
 
             display = title.replace("_", " ")

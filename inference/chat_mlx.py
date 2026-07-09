@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 from inference.continuation import decode_prefilled_continuation
 from inference.generate_mlx import generate, generate_json
+from inference.generation_utils import prompt_token_budget
 from model.transformer_mlx import SpakieGPTMLX
 from tokenizer.train_tokenizer import SpakieTokenizer
 
@@ -56,13 +57,15 @@ def chat_loop(
 
         history.append({"role": "user", "content": user_input})
         prompt_ids = _build_prompt_ids(tokenizer, history, system_msg)
-        while len(prompt_ids) > config.max_seq_len - 64 and len(history) > 1:
+        prompt_budget = prompt_token_budget(config.max_seq_len, max_new_tokens)
+        while len(prompt_ids) > prompt_budget and len(history) > 1:
             history.pop(0)
             prompt_ids = _build_prompt_ids(tokenizer, history, system_msg)
 
         if json_mode:
             response_text = generate_json(
                 model, tokenizer, prompt_ids,
+                max_new_tokens=max_new_tokens,
                 temperature=temperature, top_k=top_k, top_p=top_p,
             )
             if response_text is None:

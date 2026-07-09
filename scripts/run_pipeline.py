@@ -137,7 +137,7 @@ def default_pretrain_checkpoint(args: argparse.Namespace) -> str:
     checkpoint_dir = Path(config.checkpoint_dir)
     if args.smoke:
         checkpoint_dir = checkpoint_dir / "smoke_pretrain"
-    return str(checkpoint_dir / f"pretrain_best{ext}")
+    return str(checkpoint_dir / f"pretrain_final{ext}")
 
 
 def sft_command(args: argparse.Namespace) -> list[str]:

@@ -3,7 +3,9 @@
 import json
 import os
 import tempfile
+from collections import deque
 from pathlib import Path
+from typing import Iterator
 
 import sentencepiece as spm
 
@@ -26,13 +28,9 @@ def _extract_jsonl_text(payload: dict) -> str:
     return ""
 
 
-def iter_training_texts(raw_root: str):
-    """Yield text strings from .md, .txt, and .jsonl files under raw_root."""
-    root = Path(raw_root)
-    for path in sorted(root.rglob("*")):
+def _iter_path_texts(paths: list[Path]) -> Iterator[str]:
+    for path in paths:
         suffix = path.suffix.lower()
-        if suffix not in SUPPORTED_EXTENSIONS:
-            continue
         try:
             if suffix == ".jsonl":
                 with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -53,6 +51,38 @@ def iter_training_texts(raw_root: str):
                     yield text
         except OSError:
             continue
+
+
+def _source_name(root: Path, path: Path) -> str:
+    parts = path.relative_to(root).parts
+    if len(parts) >= 3 and parts[0] == "large_corpus":
+        return parts[1]
+    return parts[0] if len(parts) > 1 else "__root__"
+
+
+def iter_training_texts(raw_root: str):
+    """Yield a deterministic round-robin sample across corpus sources.
+
+    The tokenizer cap must not mean "the first five million records in lexical
+    path order": on the real corpus that excluded every later source. Keep one
+    streaming iterator per source and interleave them, which bounds open files
+    and memory by source count while giving every discovered source coverage.
+    """
+    root = Path(raw_root)
+    grouped: dict[str, list[Path]] = {}
+    for path in sorted(root.rglob("*")):
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS or not path.is_file():
+            continue
+        grouped.setdefault(_source_name(root, path), []).append(path)
+
+    active = deque(_iter_path_texts(grouped[source]) for source in sorted(grouped))
+    while active:
+        iterator = active.popleft()
+        try:
+            yield next(iterator)
+        except StopIteration:
+            continue
+        active.append(iterator)
 
 
 def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_000_000):

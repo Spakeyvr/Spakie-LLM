@@ -18,6 +18,8 @@ from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, conf
 from model.transformer import SpakieGPT
 from model.utils import count_parameters
 from runtime import RuntimeSettings, autocast_context
+from runtime.backends import create_grad_scaler
+from runtime.checkpoint_io import atomic_torch_save
 from training.monitor import (
     TrainingStatusWriter,
     format_monitor_start_message,
@@ -150,8 +152,9 @@ def save_training_checkpoint(
     val_loss: float | None,
     elapsed_time: float,
     train_sampler: ResumableBatchSampler,
+    scaler=None,
 ) -> None:
-    torch.save({
+    payload = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "optimizer_kind": getattr(optimizer, "optimizer_kind", config.pretrain_optimizer),
@@ -177,7 +180,10 @@ def save_training_checkpoint(
         "rng_state": capture_rng_state(),
         "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
         "config": config_to_dict(config),
-    }, path)
+    }
+    if scaler is not None:
+        payload["scaler"] = scaler.state_dict()
+    atomic_torch_save(payload, path)
 
 
 def get_lr(step: int, config: SpakieConfig) -> float:
@@ -233,11 +239,17 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
         lr=config.pretrain_lr,
         weight_decay=config.pretrain_weight_decay,
     )
+    scaler = create_grad_scaler(runtime)
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     train_sampler = getattr(train_loader, "batch_sampler", None)
     if not isinstance(train_sampler, ResumableBatchSampler):
         raise TypeError("Pretraining requires a ResumableBatchSampler for exact resume support.")
+    # DataLoader workers can request batches ahead of the training loop. This
+    # independent cursor advances only after an optimizer step commits, so a
+    # checkpoint never skips prefetched-but-untrained examples.
+    committed_sampler = ResumableBatchSampler.from_state_dict(train_sampler.state_dict())
+    committed_iter = iter(committed_sampler)
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -259,6 +271,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
         elapsed_before_resume = float(resume_state.get("elapsed_time", 0.0))
         last_val_loss = resume_state.get("val_loss")
         restore_rng_state(resume_state.get("rng_state"))
+        if "scaler" in resume_state:
+            scaler.load_state_dict(resume_state["scaler"])
 
     start_time = time.time() - elapsed_before_resume
     status_writer = TrainingStatusWriter(
@@ -299,6 +313,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
         while global_step < config.pretrain_max_steps and (target_tokens <= 0 or tokens_processed < target_tokens):
             optimizer.zero_grad(set_to_none=True)
             accum_loss_tensor = None
+            consumed_microbatches = 0
+            step_tokens = 0
 
             for micro_step in range(config.pretrain_grad_accum_steps):
                 try:
@@ -312,13 +328,15 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     _, loss = model(x, y)
                     loss = loss / config.pretrain_grad_accum_steps
 
-                loss.backward()
+                scaler.scale(loss).backward()
                 detached = loss.detach()
                 accum_loss_tensor = detached if accum_loss_tensor is None else accum_loss_tensor + detached
-                tokens_processed += x.numel()
+                step_tokens += x.numel()
+                consumed_microbatches += 1
 
             accum_loss = accum_loss_tensor.item()  # single GPU→CPU sync per optimizer step
 
+            scaler.unscale_(optimizer)
             if config.pretrain_grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.pretrain_grad_clip)
 
@@ -334,7 +352,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                         p.grad = p.grad.contiguous()
 
             try:
-                optimizer.step()
+                scaler.step(optimizer)
             except Exception as exc:
                 if should_adamw_fallback(
                     exc, optimizer, config, stage="pretrain", allow=allow_adamw_fallback
@@ -351,10 +369,17 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                         weight_decay=config.pretrain_weight_decay,
                     )
                     set_optimizer_lr(optimizer, lr)
+                    # Gradients were already unscaled against the failed Muon
+                    # optimizer, so stepping the replacement directly avoids
+                    # applying the inverse scale twice.
                     optimizer.step()
                 else:
                     raise
+            scaler.update()
             global_step += 1
+            tokens_processed += step_tokens
+            for _ in range(consumed_microbatches):
+                next(committed_iter)
             pbar.update(1)
             elapsed = time.time() - start_time
             status_writer.update(
@@ -383,7 +408,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     best_val_loss=best_val_loss,
                     val_loss=last_val_loss,
                     elapsed_time=time.time() - start_time,
-                    train_sampler=train_sampler,
+                    train_sampler=committed_sampler,
+                    scaler=scaler,
                 )
                 status_writer.finish(
                     "interrupted",
@@ -395,6 +421,25 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                 )
                 pbar.write(f"\nInterrupted at step {global_step}. Saved checkpoint to {interrupt_path}")
                 break
+
+            checkpoint_interval = int(getattr(config, "pretrain_checkpoint_interval", 0) or 0)
+            if checkpoint_interval > 0 and global_step % checkpoint_interval == 0:
+                rolling_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.pt")
+                save_training_checkpoint(
+                    rolling_path,
+                    model=model,
+                    optimizer=optimizer,
+                    config=config,
+                    global_step=global_step,
+                    tokens_processed=tokens_processed,
+                    best_val_loss=best_val_loss,
+                    val_loss=last_val_loss,
+                    elapsed_time=time.time() - start_time,
+                    train_sampler=committed_sampler,
+                    scaler=scaler,
+                )
+                status_writer.update(force=True, last_checkpoint=rolling_path)
+                pbar.write(f"  -> saved rolling checkpoint at step {global_step}")
 
             # Eval
             if global_step % config.pretrain_eval_interval == 0:
@@ -437,7 +482,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                         best_val_loss=best_val_loss,
                         val_loss=val_loss,
                         elapsed_time=elapsed,
-                        train_sampler=train_sampler,
+                        train_sampler=committed_sampler,
+                        scaler=scaler,
                     )
                     status_writer.update(
                         force=True,
@@ -472,7 +518,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             best_val_loss=best_val_loss,
             val_loss=last_val_loss,
             elapsed_time=time.time() - start_time,
-            train_sampler=train_sampler,
+            train_sampler=committed_sampler,
+            scaler=scaler,
         )
         status_writer.finish(
             "interrupted",
@@ -490,6 +537,20 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     if interrupted:
         print(f"Pretraining stopped early at {tokens_processed:,} tokens. Best val loss so far: {best_val_loss:.4f}")
     else:
+        final_path = os.path.join(config.checkpoint_dir, "pretrain_final.pt")
+        save_training_checkpoint(
+            final_path,
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            global_step=global_step,
+            tokens_processed=tokens_processed,
+            best_val_loss=best_val_loss,
+            val_loss=last_val_loss,
+            elapsed_time=time.time() - start_time,
+            train_sampler=committed_sampler,
+            scaler=scaler,
+        )
         if status_writer.payload.get("status") != "stopped":
             status_writer.finish(
                 "complete",
@@ -500,6 +561,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                 best_val_loss=None if best_val_loss == float("inf") else best_val_loss,
             )
         print(f"Pretraining complete at {tokens_processed:,} tokens. Best val loss: {best_val_loss:.4f}")
+        print(f"Final checkpoint: {final_path}")
     if stop_background_monitor(monitor_info):
         print("Monitor stopped.")
     return best_val_loss

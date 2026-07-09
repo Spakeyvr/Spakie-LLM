@@ -155,8 +155,7 @@ def _resolve_dataset(task: str, config, batch_size: int, args):
     if args.real_data:
         if real_dataset is not None:
             return real_dataset, source
-        print(f"Real data unavailable ({source}); falling back to synthetic.")
-        return synthetic, "synthetic"
+        raise FileNotFoundError(f"--real-data requested but real data is unavailable: {source}")
 
     if real_dataset is not None:
         if task == "sft" and args.pretokenize_sft:
@@ -220,6 +219,7 @@ def _benchmark_steps(
     defer_final_microbatch_eval: bool,
     prewarm_sft_shapes: bool,
     loss_log_path: str | None = None,
+    should_stop=None,
 ) -> tuple[float, int, float, MLXProfile, list[float], dict[str, int]]:
     profiler = MLXProfile(enabled=True)
     warmup_profiler = MLXProfile(enabled=False)
@@ -924,12 +924,16 @@ def _benchmark_steps(
         loss_log.write("step,loss\n")
     try:
         for step_idx in range(warmup_steps):
+            if should_stop is not None and should_stop():
+                break
             last_loss, _ = run_one_step(step_idx, warmup_profiler)
 
         reset_token_accounting()
         profiler.reset()
         start = time.perf_counter()
         for step_idx in range(steps):
+            if should_stop is not None and should_stop():
+                break
             step_start = time.perf_counter()
             last_loss, actual_step_tokens = run_one_step(step_idx, profiler)
             step_tokens = (
@@ -1565,6 +1569,7 @@ def main() -> None:
             defer_final_microbatch_eval=args.defer_final_microbatch_eval,
             prewarm_sft_shapes=args.task == "sft" and args.prewarm_sft_shapes,
             loss_log_path=args.loss_log or None,
+            should_stop=lambda: stop_requested,
         )
     except KeyboardInterrupt:
         print("Benchmark interrupted before results were available.")
@@ -1572,7 +1577,8 @@ def main() -> None:
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
 
-    step_ms = (elapsed / max(args.steps, 1)) * 1000.0
+    completed_steps = len(step_tok_per_sec)
+    step_ms = (elapsed / max(completed_steps, 1)) * 1000.0
     tok_per_sec = tokens_processed / elapsed if elapsed > 0 else 0.0
     mean_step_tok_per_sec = float(np.mean(step_tok_per_sec)) if step_tok_per_sec else 0.0
     std_step_tok_per_sec = float(np.std(step_tok_per_sec, ddof=1)) if len(step_tok_per_sec) > 1 else 0.0
@@ -1582,6 +1588,8 @@ def main() -> None:
     print(f"Throughput: {tok_per_sec:.0f} tok/s")
     print(f"Step throughput mean: {mean_step_tok_per_sec:.0f} tok/s")
     print(f"Step throughput stddev: {std_step_tok_per_sec:.0f} tok/s")
+    if stop_requested:
+        print(f"Benchmark stopped after {completed_steps} completed timed steps.")
     if elapsed > 0:
         print(
             "Token accounting: "
@@ -1612,7 +1620,7 @@ def main() -> None:
         print(f"Cold 300-step throughput stddev: {float(np.std(cold, ddof=1)):.0f} tok/s")
         print(f"Sustained last-300 throughput mean: {float(np.mean(sustained)):.0f} tok/s")
         print(f"Sustained last-300 throughput stddev: {float(np.std(sustained, ddof=1)):.0f} tok/s")
-    print(profiler.format_report(window_label=f"{args.steps} benchmark steps"))
+    print(profiler.format_report(window_label=f"{completed_steps} benchmark steps"))
 
 
 if __name__ == "__main__":

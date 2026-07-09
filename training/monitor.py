@@ -89,13 +89,15 @@ def _monitor_port() -> int:
 
 
 def start_background_monitor(status_file: str, checkpoint_dir: str) -> dict[str, Any] | None:
-    """Start the LAN monitor in a detached subprocess unless it is disabled/running."""
+    """Start a detached monitor, exposing it to the LAN only when authenticated."""
     if _is_disabled(os.environ.get("SPAKIE_MONITOR")):
         return None
 
     port = _monitor_port()
-    url = f"http://{lan_ip()}:{port}"
     password_configured = bool(os.environ.get("MONITOR_PASSWORD", "").strip())
+    host = "::" if password_configured else "127.0.0.1"
+    display_host = lan_ip() if password_configured else "127.0.0.1"
+    url = f"http://{display_host}:{port}"
     if _port_is_listening(port):
         return {
             "started": False,
@@ -122,7 +124,7 @@ def start_background_monitor(status_file: str, checkpoint_dir: str) -> dict[str,
         sys.executable or "python3",
         str(script_path),
         "--host",
-        "::",
+        host,
         "--port",
         str(port),
         "--checkpoint-dir",

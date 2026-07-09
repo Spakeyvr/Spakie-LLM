@@ -197,6 +197,62 @@ class DownloadSFTDataTests(unittest.TestCase):
             ],
         )
 
+    def test_source_limit_counts_usable_examples_not_raw_rows(self):
+        rows = FakeDataset(
+            [
+                {"messages": "malformed"},
+                {
+                    "messages": [
+                        {"role": "user", "content": "First usable."},
+                        {"role": "assistant", "content": "One."},
+                    ]
+                },
+                {"messages": [{"role": "user", "content": "incomplete"}]},
+                {
+                    "messages": [
+                        {"role": "user", "content": "Second usable."},
+                        {"role": "assistant", "content": "Two."},
+                    ]
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": "Must not be consumed."},
+                        {"role": "assistant", "content": "Three."},
+                    ]
+                },
+            ]
+        )
+
+        with patch.object(download_sft_data, "load_dataset", return_value=rows):
+            examples = download_sft_data.load_no_robots(limit=2, seed=42)
+
+        self.assertEqual(len(examples), 2)
+        self.assertEqual(
+            [example["messages"][0]["content"] for example in examples],
+            ["First usable.", "Second usable."],
+        )
+
+    def test_main_returns_failure_when_any_source_fails(self):
+        controlled = SpakieConfig()
+        controlled.sft_source_limits = {"squad": 2, "triviaqa": 2}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            argv = [
+                "download_sft_data.py",
+                "--sources",
+                "squad,triviaqa",
+                "--output-dir",
+                tmpdir,
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(download_sft_data, "SpakieConfig", return_value=controlled),
+                patch.object(download_sft_data, "load_squad", side_effect=RuntimeError("offline")),
+                patch.object(download_sft_data, "load_triviaqa", return_value=[]),
+            ):
+                result = download_sft_data.main()
+
+        self.assertEqual(result, 1)
+
     def test_only_nemotron_chat_v3_marks_final_assistant_as_training_target(self):
         rows = FakeDataset([
             {

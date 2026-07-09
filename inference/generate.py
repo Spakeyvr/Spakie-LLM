@@ -10,6 +10,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings, autocast_context
 from tokenizer.train_tokenizer import SpakieTokenizer
+from inference.generation_utils import (
+    apply_repetition_penalty,
+    mask_out_of_tokenizer_vocab,
+    prepare_generation_prompt,
+)
 
 
 def sample_top_k_top_p(logits: torch.Tensor, temperature: float = 0.8,
@@ -45,10 +50,17 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
              stop_on_special_tokens: bool = True,
              ban_special_tokens: bool = True) -> list[int]:
     """Autoregressive generation. Returns generated token IDs (excluding prompt)."""
+    if max_new_tokens <= 0:
+        return []
     model.eval()
     if runtime is None:
         runtime_device = torch.device(device) if device is not None else next(model.parameters()).device
         runtime = RuntimeSettings(device=runtime_device, precision="fp32")
+    prompt_ids = prepare_generation_prompt(
+        prompt_ids,
+        max_seq_len=model.config.max_seq_len,
+        max_new_tokens=max_new_tokens,
+    )
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=runtime.device)
     generated = []
     generated_seen: set[int] = set()
@@ -69,16 +81,15 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
             logits, _ = model(idx_cond)
 
         next_logits = logits[:, -1, :].clone()
+        mask_out_of_tokenizer_vocab(
+            next_logits,
+            int(getattr(tokenizer, "vocab_size", next_logits.shape[-1])),
+        )
 
         # Repetition penalty: reduce probability of tokens generated in this
         # answer only. Penalizing prompt tokens makes factual answers avoid
         # repeating entities from the user's question, e.g. country names.
-        if repetition_penalty != 1.0:
-            for token_id in generated_seen:
-                if next_logits[0, token_id] > 0:
-                    next_logits[0, token_id] /= repetition_penalty
-                else:
-                    next_logits[0, token_id] *= repetition_penalty
+        apply_repetition_penalty(next_logits[0], generated_seen, repetition_penalty)
 
         if ban_special_tokens:
             next_logits[0, tokenizer.user_id] = float("-inf")

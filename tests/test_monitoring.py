@@ -10,6 +10,7 @@ from unittest import mock
 
 from scripts.monitor_training import (
     _auth_token,
+    _is_loopback_host,
     _password_value,
     _uses_ipv6_host,
     create_server,
@@ -245,6 +246,38 @@ class TrainingMonitorTests(unittest.TestCase):
         self.assertTrue(_uses_ipv6_host("2001:db8::1"))
         self.assertFalse(_uses_ipv6_host("0.0.0.0"))
         self.assertFalse(_uses_ipv6_host("127.0.0.1"))
+
+    def test_loopback_host_detection(self):
+        self.assertTrue(_is_loopback_host("127.0.0.1"))
+        self.assertTrue(_is_loopback_host("::1"))
+        self.assertFalse(_is_loopback_host("::"))
+
+    def test_background_monitor_without_password_binds_loopback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"MONITOR_PASSWORD": ""}, clear=False), mock.patch(
+                "training.monitor._port_is_listening", return_value=False
+            ), mock.patch("training.monitor.subprocess.Popen") as popen:
+                popen.return_value.pid = 123
+                result = start_background_monitor(str(Path(tmp) / STATUS_FILENAME), tmp)
+
+        self.assertTrue(result["started"])
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--host") + 1], "127.0.0.1")
+        self.assertEqual(result["url"], f"http://127.0.0.1:{result['port']}")
+
+    def test_background_monitor_with_password_can_bind_lan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"MONITOR_PASSWORD": "secret"}, clear=False), mock.patch(
+                "training.monitor._port_is_listening", return_value=False
+            ), mock.patch("training.monitor.lan_ip", return_value="192.0.2.10"), mock.patch(
+                "training.monitor.subprocess.Popen"
+            ) as popen:
+                popen.return_value.pid = 123
+                result = start_background_monitor(str(Path(tmp) / STATUS_FILENAME), tmp)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--host") + 1], "::")
+        self.assertEqual(result["url"], f"http://192.0.2.10:{result['port']}")
 
     def test_create_server_uses_ipv6_class_for_ipv6_host(self):
         class Handler:

@@ -16,6 +16,7 @@ from configs.default import (
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 from runtime.checkpoint_io import (
     config_from_checkpoint_payload,
+    discard_training_state,
     load_mlx_checkpoint_config,
     load_mlx_model_weights_strict,
     load_torch_checkpoint,
@@ -327,6 +328,7 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
         )
     elif not args.allow_legacy_config:
         raise ValueError("checkpoint has no full config; use --allow-legacy-config only for a verified legacy file")
+    discard_training_state(ckpt)
     apply_sft_cli_overrides(config, args)
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPT(config)
@@ -444,6 +446,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPTMLX(config)
     load_mlx_model_weights_strict(model, flat, path=ckpt_path)
+    del flat, model_flat
 
     tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
     if not os.path.exists(jsonl_path):

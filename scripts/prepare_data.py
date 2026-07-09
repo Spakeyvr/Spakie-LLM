@@ -31,6 +31,7 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
+from runtime.langid import is_probably_english
 from runtime.processed_data import (
     invalidate_processed_data,
     publish_processed_data_manifest,
@@ -1259,6 +1260,17 @@ def prepare_data(
             if not kept:
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"][drop_reason] += 1
+                continue
+
+            assert text is not None
+            # Language filtering belongs in canonical preparation, not only in
+            # one optional downloader path: users can add raw files directly,
+            # and old downloads may predate --english_only. Very short custom
+            # documents are left alone because lid.176 is unreliable there;
+            # production source minima are already at or above this threshold.
+            if len(text) >= 400 and not is_probably_english(text, config):
+                stats["documents_dropped"] += 1
+                stats["drop_reasons"]["non_english"] += 1
                 continue
 
             source_cap = int(source_plan.get(source, {}).get("target_tokens", 0))

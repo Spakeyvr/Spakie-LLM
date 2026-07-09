@@ -8,6 +8,7 @@ scripts/prepare_data.py.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import itertools
 import json
@@ -35,6 +36,7 @@ datasets.disable_progress_bars()
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
+from runtime.langid import is_probably_english, load_langid_model
 
 
 def _silence_resource_tracker_shutdown_race() -> None:
@@ -82,6 +84,8 @@ HEADERS = {"User-Agent": "SpakieLLM/1.0 (educational language model project)"}
 GUTENDEX_API = "https://gutendex.com/books"
 ARXIV_API = "https://export.arxiv.org/api/query"
 STACKEXCHANGE_API = "https://api.stackexchange.com/2.3"
+COMPACT_SEEN_HEX_LENGTH = 32
+LEGACY_SEEN_IDS_MAX_BYTES = 256 * 1024 * 1024
 
 HF_DATASETS: dict[str, dict] = {
     "fineweb-edu": {
@@ -288,76 +292,6 @@ def pick_first(record: dict, fields: tuple[str, ...]) -> str:
     return ""
 
 
-_LANGID_MODEL = None
-_LANGID_LOAD_ATTEMPTED = False
-_LANGID_LOCK = threading.Lock()
-
-
-def _load_langid_model(config: SpakieConfig):
-    """Lazy-load fastText lid.176 model, downloading it on first use.
-
-    Guarded by a lock so concurrent sources don't race to download or load the
-    model. Preload it once from main() before starting workers to avoid a
-    thundering herd on the very first document.
-    """
-    global _LANGID_MODEL, _LANGID_LOAD_ATTEMPTED
-    if _LANGID_LOAD_ATTEMPTED:
-        return _LANGID_MODEL
-    with _LANGID_LOCK:
-        if _LANGID_LOAD_ATTEMPTED:
-            return _LANGID_MODEL
-        _LANGID_LOAD_ATTEMPTED = True
-        try:
-            import fasttext
-        except ImportError as exc:
-            log(f"  langid disabled: install fasttext to enable ({exc})")
-            return None
-        model_path = Path(config.langid_model_path)
-        if not model_path.exists():
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            log(f"  Downloading fastText lid.176 model to {model_path}")
-            try:
-                response = api_get(config.langid_model_url, timeout=120)
-                model_path.write_bytes(response.content)
-            except Exception as exc:
-                log(f"  langid disabled: failed to download model ({exc})")
-                return None
-        try:
-            # fastText prints a deprecation warning on load; silence it.
-            fasttext.FastText.eprint = lambda *_args, **_kwargs: None
-            _LANGID_MODEL = fasttext.load_model(str(model_path))
-        except Exception as exc:
-            log(f"  langid disabled: failed to load model ({exc})")
-            return None
-        return _LANGID_MODEL
-
-
-def is_probably_english(text: str, config: SpakieConfig | None = None) -> bool:
-    sample = text[:3000]
-    if not sample:
-        return False
-    # Cheap pre-check: must look like real prose, not gibberish or markup soup.
-    letters = sum(ch.isalpha() for ch in sample)
-    spaces = sample.count(" ")
-    if letters < 100 or spaces < 20:
-        return False
-    config = config or SpakieConfig()
-    model = _load_langid_model(config)
-    if model is None:
-        # Fall back to ASCII-ratio heuristic if fastText is unavailable.
-        ascii_letters = sum(("a" <= ch.lower() <= "z") for ch in sample)
-        return ascii_letters / max(letters, 1) >= 0.75
-    # fastText langid is trained on single-line inputs; newlines crash predict.
-    flat = sample.replace("\n", " ").replace("\r", " ")
-    # Call the C++ binding directly to bypass fasttext 0.9.3's numpy 2.x bug
-    # in its Python wrapper (np.array(..., copy=False) is no longer allowed).
-    predictions = model.f.predict(flat, 1, 0.0, "strict")
-    if not predictions:
-        return False
-    score, label = predictions[0]
-    return label == "__label__en" and float(score) >= config.langid_min_confidence
-
-
 def looks_navigation_heavy(text: str) -> bool:
     lower = text.lower()
     boilerplate_hits = sum(needle in lower for needle in (
@@ -543,9 +477,9 @@ class SourceState:
         self.config = config or SpakieConfig()
         self.progress = self._load_progress()
         self.writer = JsonlShardWriter(source_dir, budget.source_name, shard_char_limit=5_000_000, progress=self.progress)
-        self.seen_ids = self._load_seen(self.seen_ids_path)
-        self.seen_urls = self._load_seen(self.seen_urls_path)
-        self.seen_titles = self._load_seen(self.seen_titles_path)
+        self.seen_ids = self._load_seen_ids()
+        self.seen_urls = self._load_seen(self.seen_urls_path, namespace="url")
+        self.seen_titles = self._load_seen(self.seen_titles_path, namespace="title")
         self.new_seen_ids: set[str] = set()
         self.new_seen_urls: set[str] = set()
         self.new_seen_titles: set[str] = set()
@@ -563,11 +497,71 @@ class SourceState:
         self.pending_bar_tokens = 0
         self.last_bar_flush_time = time.monotonic()
 
-    def _load_seen(self, path: Path) -> set[str]:
+    @staticmethod
+    def _seen_key(value: str, *, namespace: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        if (
+            len(normalized) == COMPACT_SEEN_HEX_LENGTH
+            and all(char in "0123456789abcdef" for char in normalized)
+        ):
+            return normalized
+        return hashlib.blake2b(
+            f"{namespace}\0{normalized}".encode("utf-8"),
+            digest_size=COMPACT_SEEN_HEX_LENGTH // 2,
+        ).hexdigest()
+
+    def _archive_oversized_legacy_seen_ids(self) -> bool:
+        """Quarantine the old raw-prompt Cosmopedia index without reading it.
+
+        Cosmopedia's prompt field can contain newlines, so the historical
+        ``seen_ids.txt`` is not even a reliable one-record-per-line index. HF
+        resume already has an exact row cursor; archive the legacy file and use
+        compact hashes for newly accepted rows instead of materializing several
+        gigabytes and tens of millions of fragments in a Python set.
+        """
+        path = self.seen_ids_path
+        if (
+            self.budget.source_name != "cosmopedia_v2"
+            or not path.exists()
+            or path.stat().st_size <= LEGACY_SEEN_IDS_MAX_BYTES
+        ):
+            return False
+        if self.resume and int(self.progress.get("hf_rows_seen", 0)) <= 0:
+            raise RuntimeError(
+                "Cosmopedia has an oversized legacy seen_ids.txt but no HF row cursor. "
+                "Run with --reset_source cosmopedia_v2 so resume cannot duplicate rows."
+            )
+        archive = path.with_name("seen_ids.legacy-raw.txt")
+        suffix = 1
+        while archive.exists():
+            archive = path.with_name(f"seen_ids.legacy-raw.{suffix}.txt")
+            suffix += 1
+        os.replace(path, archive)
+        log(
+            f"  cosmopedia_v2: archived legacy raw seen-ID index "
+            f"({archive.stat().st_size:,} bytes) as {archive.name}; "
+            "HF row-cursor resume remains authoritative"
+        )
+        return True
+
+    def _load_seen_ids(self) -> set[str]:
+        if self._archive_oversized_legacy_seen_ids():
+            return set()
+        return self._load_seen(self.seen_ids_path, namespace="id")
+
+    def _load_seen(self, path: Path, *, namespace: str) -> set[str]:
+        values: set[str] = set()
         if self.resume and path.exists():
+            # Stream and compact legacy values one at a time. Never build a set
+            # of raw URLs/prompts/titles whose memory footprint dwarfs the file.
             with path.open("r", encoding="utf-8") as handle:
-                return {line.strip() for line in handle if line.strip()}
-        return set()
+                for line in handle:
+                    key = self._seen_key(line, namespace=namespace)
+                    if key:
+                        values.add(key)
+        return values
 
     def _load_progress(self) -> dict:
         if self.resume and self.progress_path.exists():
@@ -659,11 +653,14 @@ class SourceState:
         doc_id = str(record.get("id", "")).strip()
         title = record.get("title", "").strip().lower()
         url = record.get("url", "").strip().lower()
-        if doc_id and doc_id in self.seen_ids:
+        doc_id_key = self._seen_key(doc_id, namespace="id")
+        title_key = self._seen_key(title, namespace="title")
+        url_key = self._seen_key(url, namespace="url")
+        if doc_id_key and doc_id_key in self.seen_ids:
             return False
-        if title and title in self.seen_titles:
+        if title_key and title_key in self.seen_titles:
             return False
-        if url and url in self.seen_urls:
+        if url_key and url_key in self.seen_urls:
             return False
 
         record["text"] = text
@@ -674,15 +671,15 @@ class SourceState:
         self.progress["estimated_tokens"] += token_delta
         self.pending_bar_tokens += token_delta
         self.maybe_flush_bar()
-        if doc_id:
-            self.seen_ids.add(doc_id)
-            self.new_seen_ids.add(doc_id)
-        if title:
-            self.seen_titles.add(title)
-            self.new_seen_titles.add(title)
-        if url:
-            self.seen_urls.add(url)
-            self.new_seen_urls.add(url)
+        if doc_id_key:
+            self.seen_ids.add(doc_id_key)
+            self.new_seen_ids.add(doc_id_key)
+        if title_key:
+            self.seen_titles.add(title_key)
+            self.new_seen_titles.add(title_key)
+        if url_key:
+            self.seen_urls.add(url_key)
+            self.new_seen_urls.add(url_key)
         return True
 
     def progress_summary(self) -> str:
@@ -1004,7 +1001,7 @@ def run_source(
     log(f"  completed [{source_name}]: {state.progress_summary()}")
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="Download a large pretraining corpus into JSONL shards")
     parser.add_argument("--sources", type=str, default="all", help="Comma-separated list of sources")
     parser.add_argument("--target_tokens_estimate", type=int, default=0, help="Estimated processed token target")
@@ -1014,6 +1011,7 @@ def main() -> None:
     parser.add_argument("--english_only", action="store_true", help="Keep only likely English documents")
     parser.add_argument("--workers", type=int, default=0, help="Concurrent source downloads (0 = one per source)")
     args = parser.parse_args()
+    STOP_EVENT.clear()
 
     config = SpakieConfig()
     root = Path(config.large_corpus_dir)
@@ -1042,7 +1040,7 @@ def main() -> None:
     # Load the langid model once up front so concurrent workers share it instead
     # of racing to download/load it on their first document.
     if args.english_only:
-        _load_langid_model(config)
+        load_langid_model(config, logger=log)
 
     workers = args.workers if args.workers > 0 else len(sources)
     workers = max(1, min(workers, len(sources)))
@@ -1068,6 +1066,7 @@ def main() -> None:
     progress_lock = threading.Lock()
 
     failures: list[tuple[str, str]] = []
+    interrupted = False
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
@@ -1085,6 +1084,7 @@ def main() -> None:
                         failures.append((source_name, str(exc)))
                         log(f"  source failed: {source_name} -> {exc}")
             except KeyboardInterrupt:
+                interrupted = True
                 log("\nInterrupted; signalling workers to flush progress and stop...")
                 STOP_EVENT.set()
                 # Exiting the `with` block waits for workers to reach should_stop()
@@ -1096,7 +1096,17 @@ def main() -> None:
         log("\nCompleted with source failures:")
         for source_name, message in failures:
             log(f"  - {source_name}: {message}")
+    if interrupted:
+        return 130
+    if failures:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        STOP_EVENT.set()
+        log("\nInterrupted while downloading pretraining data.")
+        sys.exit(130)
