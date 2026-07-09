@@ -259,8 +259,13 @@ class ScalingConfigTests(unittest.TestCase):
                 {"text": "Books are stacked on the shelf."},
                 {"text": "The wind blew across the lake."},
             ]
-            sample = raw_dir / "sample.jsonl"
-            sample.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            # Multiple files exercise the ordered parallel file stream that
+            # exact resume relies on, not just deterministic rows within one
+            # file. The varying record lengths encourage workers to finish
+            # internally out of order while consumption remains ordered.
+            for index, row in enumerate(rows):
+                sample = raw_dir / f"sample-{index:02d}.jsonl"
+                sample.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
             def make_config(name: str) -> SpakieConfig:
                 return SpakieConfig(
@@ -288,6 +293,7 @@ class ScalingConfigTests(unittest.TestCase):
                     target_tokens=1_053,
                     tokenizer_threads=1,
                     tokenize_batch_size=2,
+                    workers=2,
                 )
                 full_train = np.load(root / "full" / "processed" / "train.npy")
                 full_val = np.load(root / "full" / "processed" / "val.npy")
@@ -298,6 +304,7 @@ class ScalingConfigTests(unittest.TestCase):
                     target_tokens=40,
                     tokenizer_threads=1,
                     tokenize_batch_size=2,
+                    workers=2,
                 )
                 resumed_report = prepare_data.prepare_data(
                     config=resume_config,
@@ -305,6 +312,7 @@ class ScalingConfigTests(unittest.TestCase):
                     tokenizer_threads=1,
                     tokenize_batch_size=2,
                     resume=True,
+                    workers=2,
                 )
                 resumed_train = np.load(root / "resume" / "processed" / "train.npy")
                 resumed_val = np.load(root / "resume" / "processed" / "val.npy")

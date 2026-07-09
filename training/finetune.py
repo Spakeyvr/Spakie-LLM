@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
+from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings, autocast_context, dataloader_kwargs
 from training.dataset import ChatSFTDataset, train_val_split
@@ -251,7 +251,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
                     else "",
                     "muon_verified": config.muon_verified,
-                    "config": config,
+                    "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
+                    "config": config_to_dict(config),
                 }, ckpt_path)
                 status_writer.update(
                     force=True,
@@ -287,7 +288,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             "muon_verified": config.muon_verified,
             "step": global_step,
             "best_val_loss": best_val_loss,
-            "config": config,
+            "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
+            "config": config_to_dict(config),
         }, interrupt_path)
         status_writer.finish(
             "interrupted",

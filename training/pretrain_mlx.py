@@ -21,7 +21,7 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
+from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer_mlx import SpakieGPTMLX
 from runtime.mlx_backend import (
     MLXRuntimeSettings,
@@ -534,6 +534,8 @@ def _build_checkpoint_payload(
             "qkv_split": config.muon_qkv_split,
         },
         "muon_verified": config.muon_verified,
+        "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
+        "config": config_to_dict(config),
     }
     return flat, meta
 
@@ -718,7 +720,7 @@ def pretrain_mlx(
     interrupted = False
 
     if resume_state:
-        model.update(resume_state["model"])
+        model.load_weights(tree_flatten(resume_state["model"]), strict=True)
         if "optimizer" in resume_state:
             optimizer.load_state_trees(resume_state["optimizer"])
         meta = resume_state["meta"]

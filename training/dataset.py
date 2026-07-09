@@ -69,7 +69,7 @@ class ChatSFTDataset(Dataset):
             content_ids = self.tokenizer.encode(content)
             turn_ids = [role_token] + content_ids + [self.tokenizer.eos_id]
 
-            if role == "assistant":
+            if role == "assistant" and msg.get("train", True):
                 # Loss on assistant content + eos, but not on the role token
                 turn_labels = [-100] + content_ids + [self.tokenizer.eos_id]
             else:

@@ -12,9 +12,14 @@ from configs.default import (
     get_preset_config,
     inherit_attention_shape_from_tensors,
     inherit_mlp_shape_from_tensors,
-    inherit_model_shape,
 )
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
+from runtime.checkpoint_io import (
+    config_from_checkpoint_payload,
+    load_mlx_checkpoint_config,
+    load_mlx_model_weights_strict,
+    load_torch_checkpoint,
+)
 from training.muon_core import (
     MUON_ADJUST_LR_CHOICES,
     OPTIMIZER_CHOICES,
@@ -43,6 +48,33 @@ def apply_optimizer_args(config, args) -> None:
             setattr(config, field_name, value)
     if args.allow_adamw_fallback:
         config.allow_adamw_fallback = True
+
+
+def apply_sft_cli_overrides(config, args) -> None:
+    """Apply only values the user explicitly selected on this invocation."""
+    apply_optimizer_args(config, args)
+    if args.epochs > 0:
+        config.sft_epochs = args.epochs
+    if args.sft_batch_size > 0:
+        config.sft_batch_size = args.sft_batch_size
+    if args.sft_grad_accum > 0:
+        config.sft_grad_accum_steps = args.sft_grad_accum
+    if args.lr > 0:
+        config.sft_lr = args.lr
+    if args.smoke:
+        config.sft_epochs = 1
+    for field_name, arg_name in (
+        ("attention_backend", "attention_backend"),
+        ("mlp_checkpointing", "mlp_checkpointing"),
+        ("compact_valid_mlp", "compact_valid_mlp"),
+        ("compact_valid_projections", "compact_valid_projections"),
+        ("addmm_residual_projections", "addmm_residual_projections"),
+        ("contiguous_linear_inputs", "contiguous_linear_inputs"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            setattr(config, field_name, value)
+    config.refresh_derived_fields()
 
 
 def print_optimizer_banner(kind: str, *, stage: str) -> None:
@@ -95,7 +127,7 @@ def list_available_models(backend: str, preset_name: str | None = None) -> list[
     return available_models
 
 
-def infer_preset_from_checkpoint(checkpoint_path: str) -> str | None:
+def infer_preset_from_checkpoint(checkpoint_path: str, *, trust_checkpoint: bool = False) -> str | None:
     """Best-effort read of `preset_name` from a checkpoint's own metadata.
 
     MLX checkpoints write `<path>.meta.json`; torch `.pt` files carry a pickled
@@ -103,14 +135,18 @@ def infer_preset_from_checkpoint(checkpoint_path: str) -> str | None:
     the preset can't be determined or isn't a supported preset.
     """
     if checkpoint_path.endswith(_TORCH_EXTS):
-        import torch
-
         try:
-            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        except (OSError, RuntimeError):
+            ckpt = load_torch_checkpoint(
+                checkpoint_path, map_location="cpu", trust_checkpoint=trust_checkpoint
+            )
+        except (OSError, RuntimeError, ValueError):
             return None
         checkpoint_config = ckpt.get("config") if isinstance(ckpt, dict) else None
-        preset = getattr(checkpoint_config, "preset_name", None)
+        preset = (
+            checkpoint_config.get("preset_name")
+            if isinstance(checkpoint_config, dict)
+            else getattr(checkpoint_config, "preset_name", None)
+        )
         if preset in SUPPORTED_PRESETS:
             return preset
         return None
@@ -133,6 +169,7 @@ def resolve_source_checkpoint(
     interactive: bool,
     preset_name: str | None,
     default_name: str,
+    trust_checkpoint: bool = False,
 ) -> tuple[str | None, str]:
     candidate = requested or default_name
     if os.path.isabs(candidate) or os.path.dirname(candidate):
@@ -144,7 +181,7 @@ def resolve_source_checkpoint(
         # An explicit path that exists but lives outside the standard per-preset
         # checkpoint dirs: infer the preset from its own metadata.
         if os.path.exists(candidate):
-            inferred = infer_preset_from_checkpoint(candidate)
+            inferred = infer_preset_from_checkpoint(candidate, trust_checkpoint=trust_checkpoint)
             if inferred:
                 return inferred, candidate
         return None, candidate
@@ -280,9 +317,17 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
         sys.exit(1)
 
     print(f"Loading pretrained checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = load_torch_checkpoint(
+        ckpt_path, map_location=device, trust_checkpoint=args.trust_checkpoint
+    )
     if "config" in ckpt:
-        config = inherit_model_shape(config, ckpt["config"])
+        config = config_from_checkpoint_payload(
+            ckpt["config"], source=ckpt_path,
+            schema_version=ckpt.get("config_schema_version"),
+        )
+    elif not args.allow_legacy_config:
+        raise ValueError("checkpoint has no full config; use --allow-legacy-config only for a verified legacy file")
+    apply_sft_cli_overrides(config, args)
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPT(config)
     model.load_state_dict(ckpt["model"])
@@ -319,7 +364,6 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
 
 def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_dir):
     import mlx.core as mx
-    from mlx.utils import tree_unflatten
 
     from model.transformer_mlx import SpakieGPTMLX
     from runtime.mlx_backend import configure_metal_limits, load_safetensors, resolve_mlx_runtime
@@ -332,27 +376,6 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     )
     from training.finetune_mlx import finetune_mlx
 
-    if args.attention_backend is not None:
-        config.attention_backend = args.attention_backend
-    if args.mlp_checkpointing is not None:
-        config.mlp_checkpointing = args.mlp_checkpointing
-    if args.compact_valid_mlp is not None:
-        config.compact_valid_mlp = args.compact_valid_mlp
-    if args.compact_valid_projections is not None:
-        config.compact_valid_projections = args.compact_valid_projections
-    if args.addmm_residual_projections is not None:
-        config.addmm_residual_projections = args.addmm_residual_projections
-    if args.contiguous_linear_inputs is not None:
-        config.contiguous_linear_inputs = args.contiguous_linear_inputs
-    if (
-        args.attention_backend is not None
-        or args.mlp_checkpointing is not None
-        or args.compact_valid_mlp is not None
-        or args.compact_valid_projections is not None
-        or args.addmm_residual_projections is not None
-        or args.contiguous_linear_inputs is not None
-    ):
-        config.refresh_derived_fields()
     runtime = resolve_mlx_runtime(args.precision)
     applied_limits = configure_metal_limits(
         max_gb=args.mlx_memory_gb if args.mlx_memory_gb > 0 else None,
@@ -409,11 +432,18 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     if not model_flat:
         print(f"Error: no 'model.*' tensors found in {ckpt_path}")
         sys.exit(1)
-    config = inherit_attention_shape_from_tensors(config, model_flat)
-    config = inherit_mlp_shape_from_tensors(config, model_flat)
+    saved_config = load_mlx_checkpoint_config(
+        ckpt_path, allow_legacy_config=args.allow_legacy_config
+    )
+    if saved_config is not None:
+        config = saved_config
+    else:
+        config = inherit_attention_shape_from_tensors(config, model_flat)
+        config = inherit_mlp_shape_from_tensors(config, model_flat)
+    apply_sft_cli_overrides(config, args)
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPTMLX(config)
-    model.update(tree_unflatten(list(model_flat.items())))
+    load_mlx_model_weights_strict(model, flat, path=ckpt_path)
 
     tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
     if not os.path.exists(jsonl_path):
@@ -478,6 +508,10 @@ def main():
                         help="Training backend")
     parser.add_argument("--train-jsonl", type=str, default="", help="Path to SFT JSONL file")
     parser.add_argument("--source-checkpoint", type=str, default="", help="Checkpoint filename or path to fine-tune from")
+    parser.add_argument("--trust-checkpoint", action="store_true",
+                        help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint")
+    parser.add_argument("--allow-legacy-config", action="store_true",
+                        help="Allow shape guessing for verified legacy checkpoints without full config metadata")
     parser.add_argument("--list-models", action="store_true",
                         help="List available source checkpoints and exit")
     parser.add_argument("--no-model-prompt", action="store_true",
@@ -700,6 +734,7 @@ def main():
         interactive=not args.no_model_prompt,
         preset_name=args.preset,
         default_name=_default_source_checkpoint_name(args.backend),
+        trust_checkpoint=args.trust_checkpoint,
     )
     if selected_preset is None:
         print(f"Error: pretrained checkpoint not found at {resolved_source_checkpoint}")
@@ -707,19 +742,9 @@ def main():
         sys.exit(1)
 
     config = get_preset_config(selected_preset)
-    apply_optimizer_args(config, args)
-    if args.epochs > 0:
-        config.sft_epochs = args.epochs
-    if args.sft_batch_size > 0:
-        config.sft_batch_size = args.sft_batch_size
-    if args.sft_grad_accum > 0:
-        config.sft_grad_accum_steps = args.sft_grad_accum
-    if args.lr > 0:
-        config.sft_lr = args.lr
+    apply_sft_cli_overrides(config, args)
     args.source_checkpoint = resolved_source_checkpoint
     output_checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_sft") if args.smoke else config.checkpoint_dir
-    if args.smoke:
-        config.sft_epochs = 1
 
     default_jsonl = os.path.join(config.chat_data_dir, "train.jsonl")
     jsonl_path = args.train_jsonl or default_jsonl

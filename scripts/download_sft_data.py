@@ -119,6 +119,8 @@ def load_hf_chat_messages(
     limit: int,
     seed: int,
     label: str,
+    *,
+    supervise_final_assistant_only: bool = False,
 ) -> list[dict]:
     print(f"Loading {label}...")
     dataset = load_dataset(dataset_id, split=split, streaming=True)
@@ -129,6 +131,16 @@ def load_hf_chat_messages(
         messages = coerce_messages(row.get("messages"))
         cleaned = clean_chat_messages(messages)
         if cleaned:
+            if supervise_final_assistant_only:
+                # Nemotron Chat v3 uses earlier assistant responses only as
+                # conversational context. Its dataset card explicitly defines
+                # the final assistant response as the sole training target.
+                # Keep the full conversation, but carry that loss contract into
+                # the normalized JSONL instead of discarding useful context.
+                for message in cleaned:
+                    if message["role"] == "assistant":
+                        message["train"] = False
+                cleaned[-1]["train"] = True
             examples.append({"messages": cleaned})
         if limit > 0 and len(examples) >= limit:
             break
@@ -325,6 +337,7 @@ def load_nemotron_instruction_following_chat_v3(limit: int, seed: int) -> list[d
         limit,
         seed,
         "Nemotron SFT Instruction Following Chat v3",
+        supervise_final_assistant_only=True,
     )
 
 

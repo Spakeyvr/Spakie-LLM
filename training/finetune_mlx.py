@@ -15,7 +15,7 @@ from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
+from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer_mlx import SpakieGPTMLX
 from runtime.mlx_backend import (
     MLXRuntimeSettings,
@@ -52,6 +52,7 @@ def _save_sft_checkpoint(
     model: SpakieGPTMLX,
     meta: dict,
     *,
+    config: SpakieConfig,
     optimizer=None,
 ) -> None:
     os.makedirs(os.path.dirname(base_path) or ".", exist_ok=True)
@@ -65,6 +66,9 @@ def _save_sft_checkpoint(
     if flat:
         mx.eval(*flat.values())
     mx.save_safetensors(base_path, flat, metadata={})
+    meta = dict(meta)
+    meta["config_schema_version"] = CHECKPOINT_CONFIG_SCHEMA_VERSION
+    meta["config"] = config_to_dict(config)
     save_meta_json(base_path + ".meta.json", meta)
 
 
@@ -600,6 +604,7 @@ def finetune_mlx(
                             else "",
                             "muon_verified": config.muon_verified,
                         },
+                        config=config,
                     )
                     profiler.add("checkpoint", now() - checkpoint_start)
                 else:
@@ -616,6 +621,7 @@ def finetune_mlx(
                             else "",
                             "muon_verified": config.muon_verified,
                         },
+                        config=config,
                     )
                 status_writer.update(
                     force=True,
@@ -662,6 +668,7 @@ def finetune_mlx(
                     else "",
                     "muon_verified": config.muon_verified,
                 },
+                config=config,
                 optimizer=optimizer,
             )
             profiler.add("checkpoint", now() - checkpoint_start)
@@ -679,6 +686,7 @@ def finetune_mlx(
                     else "",
                     "muon_verified": config.muon_verified,
                 },
+                config=config,
                 optimizer=optimizer,
             )
         status_writer.finish(

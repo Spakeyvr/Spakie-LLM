@@ -15,6 +15,61 @@ import scripts.prepare_sft as prepare_sft
 
 
 class PrepareSFTTests(unittest.TestCase):
+    def test_normalize_example_preserves_explicit_per_turn_training_mask(self):
+        raw = {
+            "messages": [
+                {"role": "user", "content": "First question."},
+                {"role": "assistant", "content": "Context only.", "train": False},
+                {"role": "user", "content": "Follow-up."},
+                {"role": "assistant", "content": "Final target.", "train": True},
+            ]
+        }
+
+        normalized = prepare_sft.normalize_example(raw, "System prompt.")
+
+        self.assertEqual(
+            normalized,
+            {
+                "messages": [
+                    {"role": "system", "content": "System prompt."},
+                    {"role": "user", "content": "First question."},
+                    {"role": "assistant", "content": "Context only.", "train": False},
+                    {"role": "user", "content": "Follow-up."},
+                    {"role": "assistant", "content": "Final target.", "train": True},
+                ]
+            },
+        )
+
+    def test_legacy_nemotron_rows_receive_final_assistant_only_mask(self):
+        raw = {
+            "messages": [
+                {"role": "user", "content": "First question."},
+                {"role": "assistant", "content": "Context response."},
+                {"role": "user", "content": "Follow-up."},
+                {"role": "assistant", "content": "Final target."},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "nemotron.jsonl"
+            path.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+            examples = prepare_sft.load_source(
+                str(path),
+                system_prompt=None,
+                limit=0,
+                seed=42,
+                final_assistant_only=True,
+            )
+
+        assistant_messages = [
+            message
+            for message in examples[0]["messages"]
+            if message["role"] == "assistant"
+        ]
+        self.assertEqual(
+            [message["train"] for message in assistant_messages],
+            [False, True],
+        )
+
     def test_contains_disallowed_sft_marker_checks_message_content(self):
         for marker in prepare_sft.DISALLOWED_SFT_MARKERS:
             with self.subTest(marker=marker):

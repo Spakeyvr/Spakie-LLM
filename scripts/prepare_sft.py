@@ -211,7 +211,15 @@ def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
             content = strip_question_template(content)
         if not content:
             return None
-        cleaned.append({"role": role, "content": content})
+        cleaned_message = {"role": role, "content": content}
+        if "train" in msg:
+            # Optional per-turn supervision metadata. Absence retains the
+            # historical behavior (all assistant turns are targets), while a
+            # literal false keeps an assistant response as context only.
+            if role != "assistant" or not isinstance(msg["train"], bool):
+                return None
+            cleaned_message["train"] = msg["train"]
+        cleaned.append(cleaned_message)
 
     if not cleaned or cleaned[0]["role"] != "user" or cleaned[-1]["role"] != "assistant":
         return None
@@ -308,12 +316,30 @@ def fits_context(
 
 
 def signature(example: dict) -> tuple:
-    # Dedup on user/assistant content only — the system prompt is uniform.
+    # Dedup on user/assistant content and explicit supervision intent. The same
+    # conversation with a different loss mask is not the same training example.
     return tuple(
-        (msg["role"], msg["content"])
+        (
+            msg["role"],
+            msg["content"],
+            msg.get("train", True) if msg["role"] == "assistant" else None,
+        )
         for msg in example["messages"]
         if msg["role"] != "system"
     )
+
+
+def supervise_final_assistant_only(messages: list[dict]) -> None:
+    """Keep earlier assistant turns as context and target only the final one."""
+    assistant_indices = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "assistant"
+    ]
+    if not assistant_indices:
+        raise ValueError("final-assistant supervision requires an assistant turn")
+    for index in assistant_indices:
+        messages[index]["train"] = index == assistant_indices[-1]
 
 
 def load_source(
@@ -324,6 +350,7 @@ def load_source(
     tokenizer: SpakieTokenizer | None = None,
     max_seq_len: int = 0,
     max_assistant_tokens: int = 0,
+    final_assistant_only: bool = False,
 ) -> list[dict]:
     examples: list[dict] = []
     malformed = 0
@@ -346,6 +373,8 @@ def load_source(
             if example is None:
                 malformed += 1
                 continue
+            if final_assistant_only:
+                supervise_final_assistant_only(example["messages"])
             if tokenizer is not None and not fits_context(
                 example["messages"], tokenizer, max_seq_len, max_assistant_tokens
             ):
@@ -501,6 +530,9 @@ def main() -> None:
             tokenizer,
             args.max_seq_len,
             args.max_assistant_tokens,
+            final_assistant_only=(
+                source_name == "nemotron_instruction_following_chat_v3"
+            ),
         )
         counts[source_name] = len(examples)
         cap_note = f" (cap {limit:,})" if limit > 0 else ""

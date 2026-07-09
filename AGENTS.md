@@ -101,7 +101,7 @@ Shared infrastructure:
 
 ### Data pipeline (`scripts/prepare_data.py`)
 
-Streams documents from `data/raw/` (including `data/raw/large_corpus/<source>/`), applies per-source min-doc-chars, fastText langid (lid.176, auto-downloaded to `data/models/`), MinHash+LSH near-dedup, then SentencePiece-tokenizes into fixed-size shards under `data/processed/shards/` before merging into `data/processed/{train,val}.npy`. `corpus_source_plan` in `SpakieConfig` is *scaled* at runtime via `scaled_corpus_source_plan()` to hit `target_processed_tokens` (derived from `target_train_tokens` and `train_split_fraction`).
+Streams documents from `data/raw/` (including `data/raw/large_corpus/<source>/`), applies per-source min-doc-chars, fastText langid (lid.176, auto-downloaded to `data/models/`), MinHash+LSH near-dedup, then SentencePiece-tokenizes into fixed-size shards under `data/processed/shards/` before transactionally merging into `data/processed/{train,val}.npy`. Parallel filtering is consumed in deterministic input-file order so `--resume` can replay the exact prefix. `processed_data_manifest.json` is the commit marker published after both arrays are durable; the pipeline refuses arrays without it. `corpus_source_plan` in `SpakieConfig` is *scaled* at runtime via `scaled_corpus_source_plan()` to hit `target_processed_tokens` (derived from `target_train_tokens` and `train_split_fraction`).
 
 ### Optimizer
 
@@ -109,7 +109,7 @@ Default optimizer is **Muon** (with AdamW fallback gated by `--allow-adamw-fallb
 
 ### Checkpoints
 
-Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `smoke_sft/` subdirs for smoke runs. `checkpoint_search_dirs()` in `configs/default.py` lists fallback dirs used by `chat.py --list-models` and resume logic. `pretrain_interrupt.pt` is the rolling resume checkpoint written by the pretrain loop; `--resume` picks it up automatically. `inherit_model_shape()` re-applies model shape from a checkpoint's saved config so chat/finetune work even if the active preset differs.
+Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `smoke_sft/` subdirs for smoke runs. `checkpoint_search_dirs()` in `configs/default.py` lists fallback dirs used by `chat.py --list-models` and resume logic. New checkpoints store a versioned full `SpakieConfig`; resume restores it before explicit CLI overrides and validates sampler/Muon compatibility. Torch loads with `weights_only=True` unless `--trust-checkpoint` is explicitly supplied for a verified legacy pickle. MLX model tensors are loaded strictly; legacy MLX files without full config metadata require the explicit `--allow-legacy-config` compatibility opt-in. `pretrain_interrupt.pt` is the rolling Torch resume checkpoint written by the pretrain loop; `--resume` picks it up automatically.
 
 ### Chat template
 
@@ -122,7 +122,7 @@ Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `
 The system turn is optional. Prefer no-system SFT and no-system chat for the
 smaller presets unless a run was explicitly trained with system turns.
 
-SFT data must be chat-style JSONL with a top-level `messages` array of `{role, content}` objects.
+SFT data must be chat-style JSONL with a top-level `messages` array of `{role, content}` objects. Assistant messages may additionally use `train: false` to remain as context without contributing loss.
 
 ## Mac / MPS notes
 

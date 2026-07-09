@@ -12,6 +12,11 @@ from configs.default import (
     inherit_mlp_shape_from_tensors,
 )
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
+from runtime.checkpoint_io import (
+    config_from_checkpoint_payload,
+    load_mlx_checkpoint_config,
+    load_torch_checkpoint,
+)
 from training.muon_core import (
     MUON_ADJUST_LR_CHOICES,
     OPTIMIZER_CHOICES,
@@ -53,7 +58,38 @@ def optimizer_kind_from_resume_state(resume_state, *, backend: str) -> str:
 def check_resume_optimizer(resume_state, requested: str, *, backend: str, reset_optimizer: bool) -> None:
     saved = optimizer_kind_from_resume_state(resume_state, backend=backend)
     if not saved or saved == requested:
-        return
+        if saved != "muon":
+            return
+        meta = resume_state.get("meta", {}) if backend == "mlx" else resume_state
+        saved_hparams = meta.get("muon_hyperparameters", {})
+        # State produced by a different Muon transformation is not compatible,
+        # even though the outer optimizer name still says "muon".
+        requested_config = resume_state.get("_requested_config")
+        expected = {
+            "momentum": requested_config.muon_momentum,
+            "nesterov": requested_config.muon_nesterov,
+            "ns_steps": requested_config.muon_ns_steps,
+            "ns_coefficients": list(requested_config.muon_ns_coefficients),
+            "eps": requested_config.muon_eps,
+            "adjust_lr_fn": requested_config.muon_adjust_lr_fn,
+            "qkv_split": requested_config.muon_qkv_split,
+        } if requested_config is not None else saved_hparams
+        mismatches = [
+            key for key, value in expected.items()
+            if key in saved_hparams and saved_hparams[key] != value
+        ]
+        if not mismatches:
+            return
+        if reset_optimizer:
+            resume_state.pop("optimizer", None)
+            print("Resetting optimizer state: Muon hyperparameters changed (" + ", ".join(mismatches) + ").")
+            return
+        print(
+            "Error: checkpoint Muon hyperparameters differ from the requested run: "
+            + ", ".join(mismatches)
+            + ". Use --reset-optimizer to resume model weights with fresh optimizer state."
+        )
+        sys.exit(1)
     if reset_optimizer:
         resume_state.pop("optimizer", None)
         print(f"Resetting optimizer state: checkpoint used {saved}, requested {requested}.")
@@ -70,6 +106,23 @@ def print_optimizer_banner(kind: str, *, stage: str) -> None:
         print(adamw_fallback_warning(stage))
     else:
         print("Optimizer: Muon (required default)")
+
+
+def resume_sampler_mismatches(
+    sampler_state: dict,
+    *,
+    dataset_size: int,
+    batch_size: int,
+) -> list[str]:
+    """Describe state that makes an exact sampler resume impossible."""
+    mismatches = []
+    saved_dataset_size = int(sampler_state.get("dataset_size", 0))
+    saved_batch_size = int(sampler_state.get("batch_size", 0))
+    if saved_dataset_size != dataset_size:
+        mismatches.append(f"dataset_size {saved_dataset_size:,} -> {dataset_size:,}")
+    if saved_batch_size != batch_size:
+        mismatches.append(f"batch_size {saved_batch_size:,} -> {batch_size:,}")
+    return mismatches
 
 
 def apply_pretrain_cli_overrides(config, args) -> None:
@@ -113,12 +166,20 @@ def apply_pretrain_cli_overrides(config, args) -> None:
         if args.target_tokens <= 0:
             config.pretrain_target_tokens = config.pretrain_tokens_per_step() * args.max_steps
     if args.smoke:
-        config.checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_pretrain")
+        if os.path.basename(os.path.normpath(config.checkpoint_dir)) != "smoke_pretrain":
+            config.checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_pretrain")
         smoke_token_budget = config.pretrain_tokens_per_step() * 100
         config.pretrain_target_tokens = min(config.pretrain_target_tokens or smoke_token_budget, smoke_token_budget)
         config.pretrain_max_steps = min(config.pretrain_max_steps or 100, 100)
         config.pretrain_eval_interval = min(config.pretrain_eval_interval, 50)
         config.pretrain_eval_batches = min(config.pretrain_eval_batches, 4)
+
+
+def default_resume_path(config, args, filename: str) -> str:
+    checkpoint_dir = args.output_dir or config.checkpoint_dir
+    if args.smoke:
+        checkpoint_dir = os.path.join(checkpoint_dir, "smoke_pretrain")
+    return os.path.join(checkpoint_dir, filename)
 
 
 def verify_muon_for_full_mlx_pretrain(args, config) -> None:
@@ -154,24 +215,36 @@ def run_torch_pretrain(args, config):
 
     resume_path = args.resume_from
     if args.resume and not resume_path:
-        resume_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.pt")
+        resume_path = default_resume_path(config, args, "pretrain_interrupt.pt")
 
     resume_state = None
     if resume_path:
         if not os.path.exists(resume_path):
             print(f"Error: resume checkpoint not found at {resume_path}")
             sys.exit(1)
-        resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        resume_state = load_torch_checkpoint(
+            resume_path, map_location="cpu", trust_checkpoint=args.trust_checkpoint
+        )
         if args.reset_best_loss:
             resume_state["best_val_loss"] = float("inf")
         checkpoint_config = resume_state.get("config")
         if checkpoint_config is not None:
-            config = checkpoint_config
-        else:
+            config = config_from_checkpoint_payload(
+                checkpoint_config,
+                source=resume_path,
+                schema_version=resume_state.get("config_schema_version"),
+            )
+        elif args.allow_legacy_config:
             model_tensors = resume_state.get("model", {})
             config = inherit_attention_shape_from_tensors(config, model_tensors)
             config = inherit_mlp_shape_from_tensors(config, model_tensors)
+        else:
+            raise ValueError(
+                "Legacy checkpoint has no full configuration. Pass --allow-legacy-config "
+                "only after verifying its original training settings."
+            )
         apply_pretrain_cli_overrides(config, args)
+        resume_state["_requested_config"] = config
         check_resume_optimizer(
             resume_state,
             config.pretrain_optimizer,
@@ -188,6 +261,7 @@ def run_torch_pretrain(args, config):
                     config.pretrain_target_tokens,
                     config.pretrain_tokens_per_step() * args.max_steps,
                 )
+
         if args.additional_steps > 0:
             resume_step = int(resume_state.get("step", 0))
             config.pretrain_max_steps = resume_step + args.additional_steps
@@ -197,6 +271,9 @@ def run_torch_pretrain(args, config):
                     config.pretrain_target_tokens,
                     resume_tokens + config.pretrain_tokens_per_step() * args.additional_steps,
                 )
+
+    if not resume_state:
+        apply_pretrain_cli_overrides(config, args)
 
     runtime = resolve_runtime_settings(args.device, args.precision)
     device = runtime.device
@@ -226,7 +303,24 @@ def run_torch_pretrain(args, config):
 
     sampler_state = resume_state.get("train_sampler") if resume_state else None
     if sampler_state:
-        train_sampler = ResumableBatchSampler.from_state_dict(sampler_state)
+        sampler_mismatches = resume_sampler_mismatches(
+            sampler_state,
+            dataset_size=len(train_ds),
+            batch_size=config.pretrain_batch_size,
+        )
+        if sampler_mismatches and not args.reset_sampler:
+            raise ValueError(
+                "Checkpoint sampler is incompatible with this run ("
+                + "; ".join(sampler_mismatches)
+                + "). Use --reset-sampler to explicitly begin a new shuffle."
+            )
+        if sampler_mismatches:
+            print("Resetting sampler: " + "; ".join(sampler_mismatches))
+            train_sampler = ResumableBatchSampler(
+                len(train_ds), config.pretrain_batch_size, drop_last=True
+            )
+        else:
+            train_sampler = ResumableBatchSampler.from_state_dict(sampler_state)
     else:
         train_sampler = ResumableBatchSampler(len(train_ds), config.pretrain_batch_size, drop_last=True)
 
@@ -266,7 +360,7 @@ def run_mlx_pretrain(args, config):
 
     resume_path = args.resume_from
     if args.resume and not resume_path:
-        resume_path = os.path.join(config.checkpoint_dir, "pretrain_interrupt.safetensors")
+        resume_path = default_resume_path(config, args, "pretrain_interrupt.safetensors")
 
     resume_state = None
     if resume_path:
@@ -274,15 +368,20 @@ def run_mlx_pretrain(args, config):
             print(f"Error: resume checkpoint not found at {resume_path}")
             sys.exit(1)
         resume_state = load_training_checkpoint_mlx(resume_path)
-        from mlx.utils import tree_flatten
-        model_tensors = dict(tree_flatten(resume_state["model"]))
-        config = inherit_attention_shape_from_tensors(config, model_tensors)
-        config = inherit_mlp_shape_from_tensors(config, model_tensors)
+        saved_config = load_mlx_checkpoint_config(
+            resume_path, allow_legacy_config=args.allow_legacy_config
+        )
+        if saved_config is not None:
+            config = saved_config
+        else:
+            from mlx.utils import tree_flatten
+            model_tensors = dict(tree_flatten(resume_state["model"]))
+            config = inherit_attention_shape_from_tensors(config, model_tensors)
+            config = inherit_mlp_shape_from_tensors(config, model_tensors)
         if args.reset_best_loss:
             resume_state.setdefault("meta", {})["best_val_loss"] = float("inf")
-        # Config fields aren't serialized in the safetensors; preset hyperparameters
-        # come from get_preset_config. Honor CLI overrides for steps/tokens.
         apply_pretrain_cli_overrides(config, args)
+        resume_state["_requested_config"] = config
         check_resume_optimizer(
             resume_state,
             config.pretrain_optimizer,
@@ -299,6 +398,7 @@ def run_mlx_pretrain(args, config):
                     config.pretrain_target_tokens,
                     config.pretrain_tokens_per_step() * args.max_steps,
                 )
+
         if args.additional_steps > 0:
             resume_step = int(resume_state["meta"].get("step", 0))
             config.pretrain_max_steps = resume_step + args.additional_steps
@@ -308,6 +408,14 @@ def run_mlx_pretrain(args, config):
                     config.pretrain_target_tokens,
                     resume_tokens + config.pretrain_tokens_per_step() * args.additional_steps,
                 )
+
+
+    if not resume_state:
+        apply_pretrain_cli_overrides(config, args)
+
+    # Resume restoration can change the NS transform and other Muon settings;
+    # verify the configuration that will actually train, not the CLI preset.
+    verify_muon_for_full_mlx_pretrain(args, config)
 
     runtime = resolve_mlx_runtime(args.precision)
     applied_limits = configure_metal_limits(
@@ -356,16 +464,19 @@ def run_mlx_pretrain(args, config):
         from training.pretrain_mlx import _json_restore
         sampler_state = dict(sampler_state)
         sampler_state["rng_state"] = _json_restore(sampler_state["rng_state"])
-        saved_dataset_size = int(sampler_state.get("dataset_size", 0))
-        if saved_dataset_size != len(train_ds):
-            # Older checkpoints were taken when the dataset enumerated every
-            # token offset; the new non-overlapping layout has a different
-            # cardinality, so the saved permutation/position no longer maps.
-            print(
-                f"Sampler dataset_size changed ({saved_dataset_size:,} -> "
-                f"{len(train_ds):,}); starting a fresh sampler. Model and "
-                f"optimizer state still resume normally."
+        sampler_mismatches = resume_sampler_mismatches(
+            sampler_state,
+            dataset_size=len(train_ds),
+            batch_size=config.pretrain_batch_size,
+        )
+        if sampler_mismatches and not args.reset_sampler:
+            raise ValueError(
+                "Checkpoint sampler is incompatible with this run ("
+                + "; ".join(sampler_mismatches)
+                + "). Use --reset-sampler to explicitly begin a new shuffle."
             )
+        if sampler_mismatches:
+            print("Resetting sampler: " + "; ".join(sampler_mismatches))
             train_sampler = ResumableBatchSamplerMLX(
                 len(train_ds), config.pretrain_batch_size, drop_last=True, seed=0
             )
@@ -482,6 +593,21 @@ def main():
     )
     parser.add_argument("--resume", action="store_true", help="Resume from the latest interrupt checkpoint")
     parser.add_argument("--resume-from", type=str, default="", help="Resume from a specific checkpoint path")
+    parser.add_argument(
+        "--trust-checkpoint",
+        action="store_true",
+        help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint",
+    )
+    parser.add_argument(
+        "--allow-legacy-config",
+        action="store_true",
+        help="Allow inexact shape-only recovery from a checkpoint without full config metadata",
+    )
+    parser.add_argument(
+        "--reset-sampler",
+        action="store_true",
+        help="Explicitly discard an incompatible saved sampler and begin a new shuffle",
+    )
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes (torch backend)")
@@ -639,9 +765,6 @@ def main():
     args = parser.parse_args()
 
     config = get_preset_config(args.preset)
-    apply_pretrain_cli_overrides(config, args)
-
-    verify_muon_for_full_mlx_pretrain(args, config)
 
     if args.backend == "mlx":
         run_mlx_pretrain(args, config)

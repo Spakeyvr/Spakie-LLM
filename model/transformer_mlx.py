@@ -511,7 +511,12 @@ class TransformerBlockMLX(nn.Module):
             and not return_cache
             and not self.mlp_checkpointing
         )
-        if self.residual_type == "parallel" and cache is None and not return_cache:
+        # Parallel residual topology is part of the model architecture, not a
+        # training-only optimization. Cache warmup and incremental decode must
+        # use the same x + attention(norm(x)) + mlp(norm(x)) equation as a full
+        # forward pass; falling through here silently changed cached inference
+        # into a serial-residual model.
+        if self.residual_type == "parallel":
             if use_compact_mlp:
                 mlp_out = _scatter_compact_rows(
                     mlp(_compact_rows(h, valid_indices)),

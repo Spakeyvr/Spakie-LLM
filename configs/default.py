@@ -1,6 +1,6 @@
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import yaml
@@ -341,6 +341,45 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
     return config
 
 
+CHECKPOINT_CONFIG_SCHEMA_VERSION = 1
+
+
+def config_to_dict(config: SpakieConfig) -> dict:
+    """Return a primitive-only, versionable checkpoint representation."""
+    return asdict(config)
+
+
+def config_from_dict(payload: dict) -> SpakieConfig:
+    """Rebuild the exact saved config, rejecting unknown or missing structure.
+
+    ``SpakieConfig.__post_init__`` refreshes derived fields, so the two derived
+    values are restored from the checkpoint after validation. This preserves an
+    explicit ``--max-steps`` override instead of silently deriving a new run.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError("checkpoint config must be a dictionary")
+    known_fields = {item.name for item in fields(SpakieConfig)}
+    unknown = sorted(set(payload) - known_fields)
+    if unknown:
+        raise ValueError(f"checkpoint config contains unknown fields: {', '.join(unknown)}")
+    missing = sorted(known_fields - set(payload))
+    if missing:
+        raise ValueError(f"checkpoint config is missing fields: {', '.join(missing)}")
+
+    values = dict(payload)
+    if "muon_ns_coefficients" in values:
+        values["muon_ns_coefficients"] = tuple(values["muon_ns_coefficients"])
+    saved_derived = {
+        key: values[key]
+        for key in ("target_processed_tokens", "pretrain_max_steps")
+        if key in values
+    }
+    config = SpakieConfig(**values)
+    for key, value in saved_derived.items():
+        setattr(config, key, value)
+    return config
+
+
 def checkpoint_search_dirs(config: SpakieConfig) -> list[str]:
     dirs = [config.checkpoint_dir]
     # Smoke-run outputs live under subdirs of the main checkpoint dir. Include
@@ -359,11 +398,21 @@ def checkpoint_search_dirs(config: SpakieConfig) -> list[str]:
 
 
 def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig:
-    if not hasattr(checkpoint_config, "n_kv_heads"):
+    def has_value(name: str) -> bool:
+        if isinstance(checkpoint_config, dict):
+            return name in checkpoint_config
+        return hasattr(checkpoint_config, name)
+
+    def get_value(name: str):
+        if isinstance(checkpoint_config, dict):
+            return checkpoint_config[name]
+        return getattr(checkpoint_config, name)
+
+    if not has_value("n_kv_heads"):
         # Older checkpoints predate grouped-query attention and use the fused
         # full-MHA qkv projection. Preserve that shape when loading them.
         config.n_kv_heads = 0
-    if not hasattr(checkpoint_config, "mlp_type"):
+    if not has_value("mlp_type"):
         config.mlp_type = "gelu"
         config.swiglu_hidden = 0
     for field_name in (
@@ -385,8 +434,9 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
         "activation_checkpointing",
         "qk_norm",
     ):
-        if hasattr(checkpoint_config, field_name):
-            setattr(config, field_name, getattr(checkpoint_config, field_name))
+        if has_value(field_name):
+            setattr(config, field_name, get_value(field_name))
+    config.refresh_derived_fields()
     return config
 
 

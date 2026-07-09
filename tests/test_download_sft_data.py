@@ -197,6 +197,39 @@ class DownloadSFTDataTests(unittest.TestCase):
             ],
         )
 
+    def test_only_nemotron_chat_v3_marks_final_assistant_as_training_target(self):
+        rows = FakeDataset([
+            {
+                "messages": [
+                    {"role": "user", "content": "First question."},
+                    {"role": "assistant", "content": "Context response."},
+                    {"role": "user", "content": "Follow-up question."},
+                    {"role": "assistant", "content": "Intended target."},
+                ]
+            }
+        ])
+
+        with patch.object(download_sft_data, "load_dataset", return_value=rows):
+            chat_examples = download_sft_data.load_nemotron_instruction_following_chat_v3(
+                limit=10,
+                seed=42,
+            )
+            math_examples = download_sft_data.load_nemotron_math_v4(limit=10, seed=42)
+
+        self.assertEqual(
+            chat_examples[0]["messages"],
+            [
+                {"role": "user", "content": "First question."},
+                {"role": "assistant", "content": "Context response.", "train": False},
+                {"role": "user", "content": "Follow-up question."},
+                {"role": "assistant", "content": "Intended target.", "train": True},
+            ],
+        )
+        self.assertTrue(
+            all("train" not in message for message in math_examples[0]["messages"]),
+            "other chat-style sources must retain all-assistant supervision by default",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

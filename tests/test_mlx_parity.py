@@ -185,6 +185,31 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         self.assertIsNone(loss)
         self.assertIsNone(cache)
 
+    def test_checkpoint_loader_rejects_actual_partial_model_tree(self):
+        from mlx.utils import tree_flatten
+
+        from model.transformer_mlx import SpakieGPTMLX
+        from runtime.checkpoint_io import load_mlx_model_weights_strict
+
+        source = SpakieGPTMLX(self._tiny_config())
+        source_flat = dict(tree_flatten(source.parameters()))
+        first_key = next(iter(source_flat))
+
+        target = SpakieGPTMLX(self._tiny_config())
+        with self.assertRaisesRegex(ValueError, "does not exactly match"):
+            load_mlx_model_weights_strict(
+                target,
+                {f"model.{first_key}": source_flat[first_key]},
+                path="partial.safetensors",
+            )
+
+        # The same boundary accepts a complete, shape-compatible checkpoint.
+        load_mlx_model_weights_strict(
+            target,
+            {f"model.{key}": value for key, value in source_flat.items()},
+            path="complete.safetensors",
+        )
+
     def test_return_cache_enabled_tracks_warmup_and_decode_cache(self):
         import mlx.core as mx
 
@@ -227,6 +252,63 @@ class TorchMLXForwardParityTests(unittest.TestCase):
             self.assertEqual(tuple(k.shape), (1, n_kv_heads, prompt.shape[1] + 1, config.d_model // config.n_heads))
             self.assertEqual(tuple(v.shape), (1, n_kv_heads, prompt.shape[1] + 1, config.d_model // config.n_heads))
         mx.eval(*next_cache_tensors)
+
+    def test_parallel_residual_cache_warmup_matches_full_forward(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        config.residual_type = "parallel"
+        mlx_model = SpakieGPTMLX(config)
+        mlx_model.eval()
+
+        prompt = np.array([[3, 7, 11, 5]], dtype=np.int32)
+        full_logits, _, _ = mlx_model(mx.array(prompt))
+        cached_logits, _, cache = mlx_model(mx.array(prompt), return_cache=True)
+        mx.eval(full_logits, cached_logits, *[tensor for pair in cache for tensor in pair])
+
+        np.testing.assert_allclose(
+            np.asarray(cached_logits.astype(mx.float32)),
+            np.asarray(full_logits.astype(mx.float32)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_parallel_residual_cached_decode_matches_full_forward(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        config.residual_type = "parallel"
+        mlx_model = SpakieGPTMLX(config)
+        mlx_model.eval()
+
+        prompt = np.array([[3, 7, 11, 5]], dtype=np.int32)
+        next_token = np.array([[9]], dtype=np.int32)
+        combined = np.concatenate([prompt, next_token], axis=1)
+        full_logits, _, _ = mlx_model(mx.array(combined))
+        _, _, cache = mlx_model(mx.array(prompt), return_cache=True)
+        cached_logits, _, next_cache = mlx_model(
+            mx.array(next_token),
+            cache=cache,
+            cache_offset=prompt.shape[1],
+            return_cache=True,
+        )
+        mx.eval(
+            full_logits,
+            cached_logits,
+            *[tensor for pair in next_cache for tensor in pair],
+        )
+
+        # Full-sequence and one-token cached SDPA use different kernel shapes,
+        # so small floating-point drift is expected. The original topology bug
+        # produced multi-unit logit errors; keep a tight absolute regression
+        # bound without demanding bitwise-identical kernels.
+        cached_np = np.asarray(cached_logits[:, -1, :].astype(mx.float32))
+        full_np = np.asarray(full_logits[:, -1, :].astype(mx.float32))
+        self.assertLess(float(np.max(np.abs(cached_np - full_np))), 1e-3)
 
     def test_packed_segments_match_separate_mlx_logits(self):
         import mlx.core as mx

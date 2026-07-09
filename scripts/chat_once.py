@@ -22,10 +22,15 @@ from configs.default import (
     get_preset_config,
     inherit_attention_shape_from_tensors,
     inherit_mlp_shape_from_tensors,
-    inherit_model_shape,
 )
 from inference.continuation import decode_prefilled_continuation
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
+from runtime.checkpoint_io import (
+    config_from_checkpoint_payload,
+    load_mlx_checkpoint_config,
+    load_mlx_model_weights_strict,
+    load_torch_checkpoint,
+)
 from scripts.chat import (
     apply_mode_defaults,
     infer_checkpoint_mode,
@@ -39,8 +44,6 @@ _MLX_EXTS = (".safetensors",)
 
 
 def _generate_torch_once(args: argparse.Namespace, config, ckpt_path: str) -> str:
-    import torch
-
     from inference.chat import build_prompt_ids
     from inference.generate import generate, generate_json
     from model.transformer import SpakieGPT
@@ -48,9 +51,18 @@ def _generate_torch_once(args: argparse.Namespace, config, ckpt_path: str) -> st
     from tokenizer.train_tokenizer import SpakieTokenizer
 
     runtime = resolve_runtime_settings(args.device, args.precision)
-    ckpt = torch.load(ckpt_path, map_location=runtime.device, weights_only=False)
+    ckpt = load_torch_checkpoint(
+        ckpt_path,
+        map_location=runtime.device,
+        trust_checkpoint=getattr(args, "trust_checkpoint", False),
+    )
     if "config" in ckpt:
-        config = inherit_model_shape(config, ckpt["config"])
+        config = config_from_checkpoint_payload(
+            ckpt["config"], source=ckpt_path,
+            schema_version=ckpt.get("config_schema_version"),
+        )
+    elif not getattr(args, "allow_legacy_config", False):
+        raise ValueError("checkpoint has no full config; use --allow-legacy-config only for a verified legacy file")
 
     model = SpakieGPT(config)
     model.load_state_dict(ckpt["model"])
@@ -113,8 +125,6 @@ def _generate_torch_once(args: argparse.Namespace, config, ckpt_path: str) -> st
 
 
 def _generate_mlx_once(args: argparse.Namespace, config, ckpt_path: str) -> str:
-    from mlx.utils import tree_unflatten
-
     from inference.chat_mlx import _build_prompt_ids
     from inference.generate_mlx import generate, generate_json
     from model.transformer_mlx import SpakieGPTMLX
@@ -127,11 +137,17 @@ def _generate_mlx_once(args: argparse.Namespace, config, ckpt_path: str) -> str:
     if not model_flat:
         raise ValueError(f"no 'model.*' tensors found in {ckpt_path}")
 
-    config = inherit_attention_shape_from_tensors(config, model_flat)
-    config = inherit_mlp_shape_from_tensors(config, model_flat)
+    saved_config = load_mlx_checkpoint_config(
+        ckpt_path, allow_legacy_config=getattr(args, "allow_legacy_config", False)
+    )
+    if saved_config is not None:
+        config = saved_config
+    else:
+        config = inherit_attention_shape_from_tensors(config, model_flat)
+        config = inherit_mlp_shape_from_tensors(config, model_flat)
 
     model = SpakieGPTMLX(config)
-    model.update(tree_unflatten(list(model_flat.items())))
+    load_mlx_model_weights_strict(model, flat, path=ckpt_path)
     if runtime.dtype is not None:
         model.set_dtype(runtime.dtype)
     model.eval()
@@ -247,6 +263,10 @@ def main() -> int:
     parser.add_argument("--system", default="")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto")
+    parser.add_argument("--trust-checkpoint", action="store_true",
+                        help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint")
+    parser.add_argument("--allow-legacy-config", action="store_true",
+                        help="Allow shape guessing for verified legacy checkpoints without full config metadata")
     args = parser.parse_args()
 
     try:

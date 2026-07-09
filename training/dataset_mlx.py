@@ -70,7 +70,7 @@ class ChatSFTDatasetMLX:
 
             content_ids = self.tokenizer.encode(content)
             turn_ids = [role_token] + content_ids + [self.tokenizer.eos_id]
-            if role == "assistant":
+            if role == "assistant" and msg.get("train", True):
                 turn_labels = [-100] + content_ids + [self.tokenizer.eos_id]
             else:
                 turn_labels = [-100] * len(turn_ids)

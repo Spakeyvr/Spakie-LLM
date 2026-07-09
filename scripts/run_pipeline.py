@@ -13,10 +13,9 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SUPPORTED_PRESETS, get_preset_config
+from runtime.processed_data import validate_processed_data
 from training.muon_core import MUON_ADJUST_LR_CHOICES, OPTIMIZER_CHOICES
 
 
@@ -48,26 +47,28 @@ def format_duration(seconds: float) -> str:
 
 
 def processed_data_ready(processed_dir: Path) -> tuple[bool, str]:
-    train_path = processed_dir / "train.npy"
-    val_path = processed_dir / "val.npy"
-    missing = [str(path) for path in (train_path, val_path) if not path.exists()]
-    if missing:
-        return False, f"missing {', '.join(missing)}"
-
-    try:
-        train_tokens = int(np.load(train_path, mmap_mode="r").shape[0])
-        val_tokens = int(np.load(val_path, mmap_mode="r").shape[0])
-    except Exception as exc:
-        return False, f"could not read processed arrays: {exc}"
-
-    if train_tokens <= 0 or val_tokens <= 0:
-        return False, f"empty processed arrays (train={train_tokens}, val={val_tokens})"
-    return True, f"train={train_tokens:,} tokens, val={val_tokens:,} tokens"
+    return validate_processed_data(processed_dir)
 
 
 def append_if_value(command: list[str], flag: str, value: object) -> None:
     if value not in (None, "", 0, 0.0):
         command.extend([flag, str(value)])
+
+
+def append_if_not_none(command: list[str], flag: str, value: object) -> None:
+    if value is not None:
+        command.extend([flag, str(value)])
+
+
+def append_boolean_override(
+    command: list[str],
+    positive_flag: str,
+    negative_flag: str,
+    value: bool | None,
+) -> None:
+    if value is None:
+        return
+    command.append(positive_flag if value else negative_flag)
 
 
 def prepare_command(args: argparse.Namespace) -> list[str]:
@@ -98,12 +99,16 @@ def train_command(args: argparse.Namespace) -> list[str]:
     ]
     append_if_value(command, "--max-steps", args.max_steps)
     append_if_value(command, "--target_tokens", args.target_tokens)
-    command.extend(["--optimizer", args.optimizer])
-    command.extend(["--muon-adjust-lr-fn", args.muon_adjust_lr_fn])
-    append_if_value(command, "--muon-ns-steps", args.muon_ns_steps)
-    append_if_value(command, "--muon-momentum", args.muon_momentum)
-    command.append("--muon-nesterov" if args.muon_nesterov else "--no-muon-nesterov")
-    command.append("--muon-qkv-split" if args.muon_qkv_split else "--no-muon-qkv-split")
+    append_if_not_none(command, "--optimizer", args.optimizer)
+    append_if_not_none(command, "--muon-adjust-lr-fn", args.muon_adjust_lr_fn)
+    append_if_not_none(command, "--muon-ns-steps", args.muon_ns_steps)
+    append_if_not_none(command, "--muon-momentum", args.muon_momentum)
+    append_boolean_override(
+        command, "--muon-nesterov", "--no-muon-nesterov", args.muon_nesterov
+    )
+    append_boolean_override(
+        command, "--muon-qkv-split", "--no-muon-qkv-split", args.muon_qkv_split
+    )
     if args.allow_adamw_fallback:
         command.append("--allow-adamw-fallback")
     if args.reset_optimizer:
@@ -152,12 +157,16 @@ def sft_command(args: argparse.Namespace) -> list[str]:
     append_if_value(command, "--train-jsonl", args.train_jsonl)
     append_if_value(command, "--output-name", args.sft_output_name)
     append_if_value(command, "--max-examples", args.max_examples)
-    command.extend(["--optimizer", args.optimizer])
-    command.extend(["--muon-adjust-lr-fn", args.muon_adjust_lr_fn])
-    append_if_value(command, "--muon-ns-steps", args.muon_ns_steps)
-    append_if_value(command, "--muon-momentum", args.muon_momentum)
-    command.append("--muon-nesterov" if args.muon_nesterov else "--no-muon-nesterov")
-    command.append("--muon-qkv-split" if args.muon_qkv_split else "--no-muon-qkv-split")
+    append_if_not_none(command, "--optimizer", args.optimizer)
+    append_if_not_none(command, "--muon-adjust-lr-fn", args.muon_adjust_lr_fn)
+    append_if_not_none(command, "--muon-ns-steps", args.muon_ns_steps)
+    append_if_not_none(command, "--muon-momentum", args.muon_momentum)
+    append_boolean_override(
+        command, "--muon-nesterov", "--no-muon-nesterov", args.muon_nesterov
+    )
+    append_boolean_override(
+        command, "--muon-qkv-split", "--no-muon-qkv-split", args.muon_qkv_split
+    )
     if args.allow_adamw_fallback:
         command.append("--allow-adamw-fallback")
     if args.smoke:
@@ -310,16 +319,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--optimizer",
         choices=OPTIMIZER_CHOICES,
-        default="muon",
-        help="Optimizer to use. Muon is the required default; AdamW is fallback-only and not recommended.",
+        default=None,
+        help="Explicit optimizer override (default: preserve preset/checkpoint config)",
     )
     parser.add_argument("--allow-adamw-fallback", action="store_true", help="Allow explicit AdamW fallback")
     parser.add_argument("--reset-optimizer", action="store_true", help="Reset optimizer state on resume mismatch")
-    parser.add_argument("--muon-adjust-lr-fn", choices=MUON_ADJUST_LR_CHOICES, default="match_rms_adamw")
-    parser.add_argument("--muon-ns-steps", type=int, default=5)
-    parser.add_argument("--muon-momentum", type=float, default=0.95)
-    parser.add_argument("--muon-nesterov", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--muon-qkv-split", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--muon-adjust-lr-fn",
+        choices=MUON_ADJUST_LR_CHOICES,
+        default=None,
+        help="Explicit Muon LR adjustment override",
+    )
+    parser.add_argument("--muon-ns-steps", type=int, default=None)
+    parser.add_argument("--muon-momentum", type=float, default=None)
+    parser.add_argument(
+        "--muon-nesterov", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--muon-qkv-split", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument("--mlx-compile", action=argparse.BooleanOptionalAction, default=True, help="Use MLX compile")
     parser.add_argument("--mlx-prefetch", action=argparse.BooleanOptionalAction, default=True, help="Use MLX prefetch")
     parser.add_argument("--mlx-memory-gb", type=float, default=0.0, help="MLX Metal memory limit in GB")

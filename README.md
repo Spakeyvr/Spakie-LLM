@@ -106,7 +106,7 @@ python3 scripts/scrape_open_corpus.py
 python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
 ```
 
-`scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies quality filters, fastText language ID, and MinHash/LSH near-deduplication, tokenizes in batches, writes token shards under `data/processed/shards/`, and merges them into `data/processed/train.npy` and `data/processed/val.npy`.
+`scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies quality filters, fastText language ID, and MinHash/LSH near-deduplication, tokenizes in deterministic input order, writes token shards under `data/processed/shards/`, and transactionally merges them into `data/processed/train.npy` and `data/processed/val.npy`. A `processed_data_manifest.json` commit marker is published only after both arrays are complete and durable; the pipeline will not train from arrays without that marker.
 
 Useful prepare commands:
 
@@ -204,6 +204,10 @@ Fine-tuning expects chat-style JSONL records like:
 {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
 
+Assistant messages may set `"train": false` to remain in the conversation as
+context without contributing labels. If omitted, assistant turns are supervised
+as before. The Nemotron Chat v3 importer uses this for all but the final target.
+
 System messages are optional. The default SFT merge omits them, which is usually
 better for the smaller presets; pass `--system "..."` only when you intend to
 train and infer with that extra control turn.
@@ -274,14 +278,14 @@ Muon options include `--muon-adjust-lr-fn {match_rms_adamw,original,none}`, `--m
 
 ## Checkpoints and Chat
 
-Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. `pretrain_interrupt.pt` is the rolling checkpoint used by `scripts/train.py --resume`.
+Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. New Torch and MLX checkpoints store a complete versioned configuration, and every model load validates all tensor keys and shapes. Torch uses PyTorch's restricted loader by default; `--trust-checkpoint` is required for a legacy pickle that contains custom Python objects. MLX files created before full config metadata are refused by default; `--allow-legacy-config` is an explicit inexact compatibility opt-in. `pretrain_interrupt.pt` is the rolling Torch checkpoint used by `scripts/train.py --resume`.
 
 Useful commands:
 
 ```bash
 python3 scripts/chat.py --list-models --device auto --precision auto
 python3 scripts/chat.py --model 1 --backend mlx --no-model-prompt
-python3 scripts/chat.py --checkpoint checkpoints/300m/best.pt --backend mlx
+python3 scripts/chat.py --checkpoint checkpoints/300m/pretrain_best.safetensors --backend mlx
 python3 scripts/chat.py --json_mode --system "Answer as JSON."
 python3 scripts/finetune.py --list-models --backend mlx
 python3 scripts/train.py --resume

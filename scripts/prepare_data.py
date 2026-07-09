@@ -17,6 +17,7 @@ import os
 import queue
 import re
 import shutil
+import tempfile
 import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -30,6 +31,10 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
+from runtime.processed_data import (
+    invalidate_processed_data,
+    publish_processed_data_manifest,
+)
 from tokenizer.train_tokenizer import SpakieTokenizer
 
 
@@ -344,9 +349,9 @@ def iter_documents(raw_root: Path, files: list[Path], progress: tqdm | None = No
 # Workers run clean_text + should_keep_document in separate processes (Python
 # regex/string work is GIL-bound, so processes are required for true speedup).
 # The serial bits — dedup, source caps, tokenization, shard writes — stay in
-# the main process. NOTE: doc order is non-deterministic across runs with
-# workers > 1, so MinHash dedup may keep a different near-duplicate from a
-# cluster between runs (the total drop count is unchanged).
+# the main process. Pool results are consumed in input-file order. This is an
+# important correctness invariant: deduplication and --resume both depend on
+# replaying the exact same accepted-document prefix on every run.
 
 _WORKER_CONFIG: SpakieConfig | None = None
 _WORKER_RAW_ROOT: Path | None = None
@@ -465,7 +470,11 @@ def _doc_stream_parallel(
         initargs=(config, str(raw_root), dedup_enabled, num_perm, shingle_size),
     ) as pool:
         try:
-            for result in pool.imap_unordered(_worker_process_file, file_paths):
+            # ``imap`` still processes files concurrently but buffers completed
+            # later files until every earlier file has been yielded. Do not use
+            # imap_unordered here: --resume reconstructs its cursor by replaying
+            # this stream and subtracting the tokenized prefix.
+            for result in pool.imap(_worker_process_file, file_paths, chunksize=1):
                 if progress is not None:
                     progress.update(result["file_bytes"])
                 for entry in result["documents"]:
@@ -773,39 +782,110 @@ def merge_shards(
         else:
             split_idx = train_tokens_target
 
-    train_arr = np.lib.format.open_memmap(train_path, mode="w+", dtype=dtype, shape=(split_idx,))
-    val_arr = np.lib.format.open_memmap(val_path, mode="w+", dtype=dtype, shape=(total_tokens - split_idx,))
+    processed_dir = train_path.parent
+    if val_path.parent != processed_dir:
+        raise ValueError("train and validation arrays must share one directory")
+    processed_dir.mkdir(parents=True, exist_ok=True)
 
-    cursor = 0
-    train_cursor = 0
-    val_cursor = 0
-    with tqdm(
-        total=total_tokens,
-        desc="Merging shards",
-        unit="tok",
-        unit_scale=True,
-        disable=not show_progress,
-    ) as progress:
-        for path in shard_paths:
-            shard = np.load(path, mmap_mode="r")
-            shard_len = int(shard.shape[0])
-            shard_start = cursor
-            shard_end = cursor + shard_len
+    # The manifest is the commit marker. Remove it before creating a new
+    # generation, but leave any previously complete arrays in place until both
+    # replacements have been fully written and fsynced.
+    invalidate_processed_data(processed_dir)
 
-            train_take = max(0, min(split_idx, shard_end) - shard_start)
-            if train_take:
-                train_arr[train_cursor:train_cursor + train_take] = shard[:train_take]
-                train_cursor += train_take
-            if train_take < shard_len:
-                val_slice = shard[train_take:]
-                val_arr[val_cursor:val_cursor + len(val_slice)] = val_slice
-                val_cursor += len(val_slice)
-            cursor = shard_end
-            progress.update(shard_len)
+    temp_paths: list[Path] = []
+    train_arr = None
+    val_arr = None
+    try:
+        for final_path in (train_path, val_path):
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{final_path.name}.", suffix=".tmp", dir=processed_dir
+            )
+            os.close(fd)
+            temp_paths.append(Path(temp_name))
+        temp_train_path, temp_val_path = temp_paths
 
-    train_arr.flush()
-    val_arr.flush()
-    return split_idx, total_tokens - split_idx
+        train_arr = np.lib.format.open_memmap(
+            temp_train_path, mode="w+", dtype=dtype, shape=(split_idx,)
+        )
+        val_arr = np.lib.format.open_memmap(
+            temp_val_path,
+            mode="w+",
+            dtype=dtype,
+            shape=(total_tokens - split_idx,),
+        )
+
+        cursor = 0
+        train_cursor = 0
+        val_cursor = 0
+        with tqdm(
+            total=total_tokens,
+            desc="Merging shards",
+            unit="tok",
+            unit_scale=True,
+            disable=not show_progress,
+        ) as progress:
+            for path in shard_paths:
+                shard = np.load(path, mmap_mode="r")
+                shard_len = int(shard.shape[0])
+                shard_start = cursor
+                shard_end = cursor + shard_len
+
+                train_take = max(0, min(split_idx, shard_end) - shard_start)
+                if train_take:
+                    train_arr[train_cursor:train_cursor + train_take] = shard[:train_take]
+                    train_cursor += train_take
+                if train_take < shard_len:
+                    val_slice = shard[train_take:]
+                    val_arr[val_cursor:val_cursor + len(val_slice)] = val_slice
+                    val_cursor += len(val_slice)
+                cursor = shard_end
+                progress.update(shard_len)
+
+        expected_val_tokens = total_tokens - split_idx
+        if cursor != total_tokens or train_cursor != split_idx or val_cursor != expected_val_tokens:
+            raise RuntimeError(
+                "Shard merge cursor mismatch: "
+                f"source={cursor}/{total_tokens}, train={train_cursor}/{split_idx}, "
+                f"val={val_cursor}/{expected_val_tokens}"
+            )
+
+        train_arr.flush()
+        val_arr.flush()
+        del train_arr
+        del val_arr
+        train_arr = None
+        val_arr = None
+        for temp_path in temp_paths:
+            with temp_path.open("rb") as handle:
+                os.fsync(handle.fileno())
+
+        os.replace(temp_train_path, train_path)
+        temp_paths.remove(temp_train_path)
+        os.replace(temp_val_path, val_path)
+        temp_paths.remove(temp_val_path)
+        publish_processed_data_manifest(
+            train_path,
+            val_path,
+            train_tokens=split_idx,
+            val_tokens=expected_val_tokens,
+            dtype=dtype,
+        )
+        return split_idx, expected_val_tokens
+    except BaseException:
+        # Never leave a completion marker behind for a partially published
+        # generation, including KeyboardInterrupt/SystemExit.
+        invalidate_processed_data(processed_dir)
+        raise
+    finally:
+        if train_arr is not None:
+            del train_arr
+        if val_arr is not None:
+            del val_arr
+        for temp_path in temp_paths:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[bool, str]:
@@ -1325,10 +1405,10 @@ def prepare_data(
             with report_dest.open("w", encoding="utf-8") as handle:
                 json.dump(report, handle, ensure_ascii=False, indent=2)
         if not dry_run:
-            for stale_path in (processed_dir / "train.npy", processed_dir / "val.npy"):
-                if stale_path.exists():
-                    stale_path.unlink()
-                    print(f"Removed stale merged array: {stale_path}")
+            # Existing arrays may still be useful for diagnosis or recovery,
+            # but without a completion manifest the pipeline cannot mistake
+            # them for the result of this interrupted invocation.
+            invalidate_processed_data(processed_dir)
         print(f"Partial processed tokens: {total_tokens:,}")
         print(f"Partial report: {report_dest}")
         if shard_paths:
@@ -1412,7 +1492,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Filter worker processes for clean+filter+MinHash-stream stage "
             "(0 = auto: half of CPU cores). Set to 1 to disable parallelism. "
-            "Output is non-deterministic when workers > 1 (dedup order varies)."
+            "Results are consumed in deterministic input-file order."
         ),
     )
     return parser.parse_args()

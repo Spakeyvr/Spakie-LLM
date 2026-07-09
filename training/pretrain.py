@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
+from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer import SpakieGPT
 from model.utils import count_parameters
 from runtime import RuntimeSettings, autocast_context
@@ -96,9 +96,16 @@ class ResumableBatchSampler:
 
 
 def capture_rng_state() -> dict[str, object]:
+    numpy_state = np.random.get_state()
     return {
         "python": random.getstate(),
-        "numpy": np.random.get_state(),
+        "numpy": {
+            "bit_generator": numpy_state[0],
+            "keys": torch.from_numpy(numpy_state[1].copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
         "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
@@ -110,7 +117,21 @@ def restore_rng_state(state: dict[str, object] | None) -> None:
     if "python" in state:
         random.setstate(state["python"])
     if "numpy" in state:
-        np.random.set_state(state["numpy"])
+        numpy_state = state["numpy"]
+        if isinstance(numpy_state, dict):
+            keys = numpy_state["keys"]
+            if isinstance(keys, torch.Tensor):
+                keys = keys.cpu().numpy().astype(np.uint32, copy=False)
+            np.random.set_state((
+                numpy_state["bit_generator"],
+                keys,
+                int(numpy_state["position"]),
+                int(numpy_state["has_gauss"]),
+                float(numpy_state["cached_gaussian"]),
+            ))
+        else:
+            # Unsafe legacy checkpoints used NumPy's native tuple representation.
+            np.random.set_state(numpy_state)
     if "torch" in state:
         torch.set_rng_state(state["torch"])
     if torch.cuda.is_available() and state.get("cuda") is not None:
@@ -154,7 +175,8 @@ def save_training_checkpoint(
         "elapsed_time": elapsed_time,
         "train_sampler": train_sampler.state_dict(),
         "rng_state": capture_rng_state(),
-        "config": config,
+        "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
+        "config": config_to_dict(config),
     }, path)
 
 
