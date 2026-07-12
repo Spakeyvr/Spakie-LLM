@@ -30,6 +30,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
+from runtime.langid import is_probably_english
 from tokenizer.train_tokenizer import SpakieTokenizer
 
 
@@ -56,6 +57,39 @@ DISALLOWED_SFT_MARKERS = (
     "Final Answer:",
     "You are an expert in composing functions",
 )
+
+# Reviewer annotations belong in a review log, not in assistant targets. The
+# preceding answer is not guaranteed to have been rewritten correctly, so the
+# safest policy is to exclude the whole example rather than teach internal
+# review commentary.
+CORRECTION_ANNOTATION_RE = re.compile(r"(?:^|\n)\s*Correction\s*:", re.IGNORECASE)
+
+# Refusal-style assistant examples are intentionally excluded from this
+# private-model SFT mix. Keep ordinary uncertainty (for example, "I can't
+# guarantee") because it is useful factual calibration.
+REFUSAL_RESPONSE_RE = re.compile(
+    r"\b(?:i\s+(?:can(?:not|'t)|cannot|won't|will\s+not|am\s+unable\s+to)|"
+    r"sorry[, ]+but\s+i\s+(?:can(?:not|'t)|cannot|won't|will\s+not))\s+"
+    r"(?:help|assist|provide|write|give|create|do|explain|tell|offer|support)\b",
+    re.IGNORECASE,
+)
+
+FOREIGN_IDENTITY_RE = re.compile(
+    r"\b(?:i\s+am|i'm|as)\s+(?:an?\s+)?(?:chatgpt|claude|gemini|glm|gpt[-\w.]*)\b|"
+    r"\b(?:created|developed|trained)\s+by\s+(?:openai|anthropic|google)\b",
+    re.IGNORECASE,
+)
+
+DIRECT_IDENTITY_QUERY_RE = re.compile(
+    r"^\s*(?:who\s+are\s+you|what\s+are\s+you|what\s+ai\s+are\s+you|"
+    r"what\s+(?:model|language\s+model)\s+are\s+you|what(?:'s|\s+is)\s+your\s+name|"
+    r"what\s+should\s+i\s+call\s+you|tell\s+me\s+about\s+yourself|identify\s+yourself|"
+    r"introduce\s+yourself|are\s+you\s+(?:human|a\s+person|an?\s+ai|an?\s+language\s+model|"
+    r"chatgpt|claude|gemini|an?\s+software\s+engineer))\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+
+SFT_IDENTITY_NAME = "Spakie-180M"
 
 
 # Natural-language phrasing swaps used to diversify the behavior seeds. Repeating
@@ -113,13 +147,13 @@ _ASSISTANT_BEHAVIOR_SEED_PAIRS = (
     ("Good morning", "Good morning! How can I help you today?"),
     ("Are you there?", "Yes, I am here and ready to help."),
     ("Can you help me?", "Yes. Tell me what you need help with, and I will do my best."),
-    ("Who are you?", "I am Spakie, a helpful AI assistant."),
-    ("What are you?", "I am an AI assistant designed to answer questions and help with tasks."),
-    ("Are you human?", "No. I am an AI assistant, not a human."),
+    ("Who are you?", "I am Spakie-180M, a helpful AI language model."),
+    ("What are you?", "I am Spakie-180M, a 180-million-parameter AI language model."),
+    ("Are you human?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
     ("How old are you?", "I do not have an age. I am an AI assistant."),
     ("Where do you live?", "I do not live anywhere. I run as software."),
     ("Do you have a husband?", "No. I am an AI assistant and do not have personal relationships."),
-    ("Tell me about yourself.", "I am Spakie, an AI assistant that gives clear and useful answers."),
+    ("Tell me about yourself.", "I am Spakie-180M, an AI language model that gives clear and useful answers."),
     ("What do you like to cook?", "I do not cook or have personal hobbies, but I can help with recipes."),
     ("What is 2 + 2?", "2 + 2 = 4."),
     ("What is the capital of France?", "The capital of France is Paris."),
@@ -148,6 +182,66 @@ _ANTI_ECHO_SEED_PAIRS = (
 # anchored behavior generalizes across contractions and punctuation.
 ASSISTANT_BEHAVIOR_SEEDS = expand_seed_pairs(_ASSISTANT_BEHAVIOR_SEED_PAIRS)
 ANTI_ECHO_SEEDS = expand_seed_pairs(_ANTI_ECHO_SEED_PAIRS)
+
+_IDENTITY_PROMPTS = (
+    "Who are you?",
+    "What are you?",
+    "What AI are you?",
+    "What model are you?",
+    "What language model are you?",
+    "What is your name?",
+    "Tell me your name.",
+    "Identify yourself.",
+    "Tell me about yourself.",
+    "Which AI model am I talking to?",
+    "Which model is answering me?",
+    "What should I call you?",
+    "Are you an AI?",
+    "Are you a language model?",
+    "How many parameters do you have?",
+    "What size model are you?",
+    "Are you Spakie?",
+    "Are you Spakie-180M?",
+    "Is this ChatGPT?",
+    "Are you ChatGPT?",
+    "Are you Claude?",
+    "Are you Gemini?",
+    "Are you a software engineer?",
+    "Are you a person?",
+    "Are you human?",
+    "Introduce yourself briefly.",
+    "Give me a one-sentence introduction.",
+    "Say who you are in plain English.",
+    "Remind me which model this is.",
+    "What's the name of this assistant?",
+)
+
+_IDENTITY_ANSWERS = (
+    "I am Spakie-180M, a 180-million-parameter AI language model.",
+    "My name is Spakie-180M. I am an AI language model with 180 million parameters.",
+    "You are talking to Spakie-180M, a small AI language model designed to be helpful.",
+    "I am Spakie-180M. I answer questions and help with tasks using a 180-million-parameter language model.",
+    "This is Spakie-180M, an AI assistant powered by a 180-million-parameter language model.",
+    "I am not a person or a software engineer. I am Spakie-180M, an AI language model.",
+)
+
+_IDENTITY_NEGATIVE_PAIRS = (
+    ("Are you ChatGPT?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
+    ("Is this ChatGPT?", "No. This is Spakie-180M, an AI language model with 180 million parameters."),
+    ("Are you Claude?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
+    ("Are you Gemini?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
+    ("Are you a software engineer?", "No. I am Spakie-180M, an AI language model. I can still help with software questions."),
+    ("Are you human?", "No. I am Spakie-180M, an AI language model with 180 million parameters."),
+    ("What company do you work for?", "I do not work for a company. I am Spakie-180M, an AI language model."),
+)
+
+_FACTUAL_REPAIR_SEEDS = (
+    ("Who was Nikola Tesla?", "Nikola Tesla was a Serbian-American inventor and electrical engineer known for his work on alternating-current power systems."),
+    ("Who is Nicola Tesla?", "You probably mean Nikola Tesla. He was a Serbian-American inventor and electrical engineer known for developing alternating-current power technology."),
+    ("Was Nikola Tesla a woman?", "No. Nikola Tesla was a man, born in 1856 in Smiljan in the Austrian Empire, in present-day Croatia."),
+    ("Was Nikola Tesla American?", "Tesla was born in the Austrian Empire to a Serbian family and later became a naturalized American citizen."),
+    ("What did Nikola Tesla invent?", "Tesla developed important alternating-current motors and power systems and contributed to radio, wireless transmission, and high-voltage engineering."),
+)
 
 
 def strip_question_template(content: str) -> str:
@@ -184,6 +278,154 @@ def contains_disallowed_sft_marker(messages: object) -> bool:
         if isinstance(content, str) and any(marker in content for marker in DISALLOWED_SFT_MARKERS):
             return True
     return False
+
+
+def contains_correction_annotation(messages: object) -> bool:
+    """Return True when reviewer ``Correction:`` text is embedded in a turn."""
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(msg, dict)
+        and isinstance(msg.get("content"), str)
+        and CORRECTION_ANNOTATION_RE.search(msg["content"]) is not None
+        for msg in messages
+    )
+
+
+def contains_refusal_response(messages: object) -> bool:
+    """Return True when an assistant turn is an explicit refusal response."""
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and isinstance(msg.get("content"), str)
+        and REFUSAL_RESPONSE_RE.search(msg["content"]) is not None
+        for msg in messages
+    )
+
+
+def contains_foreign_identity_claim(messages: object) -> bool:
+    """Reject assistant turns that claim to be another named model."""
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and isinstance(msg.get("content"), str)
+        and FOREIGN_IDENTITY_RE.search(msg["content"]) is not None
+        for msg in messages
+    )
+
+
+def contains_conflicting_identity_example(messages: object) -> bool:
+    """Reject direct identity Q&A unless the answer names Spakie-180M."""
+    if not isinstance(messages, list):
+        return False
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or DIRECT_IDENTITY_QUERY_RE.match(content) is None:
+            continue
+        for reply in messages[index + 1 :]:
+            if not isinstance(reply, dict):
+                continue
+            if reply.get("role") == "assistant" and isinstance(reply.get("content"), str):
+                if SFT_IDENTITY_NAME not in reply["content"]:
+                    return True
+                break
+    return False
+
+
+def is_english_sft_example(messages: list[dict], config: SpakieConfig) -> bool:
+    """Language-filter chat while retaining short English factual answers."""
+    text = "\n".join(str(msg.get("content", "")) for msg in messages)
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return False
+    ascii_letters = sum("a" <= char.lower() <= "z" for char in letters)
+    ascii_ratio = ascii_letters / len(letters)
+    # fastText is unreliable on tiny answers such as "Paris". Short examples
+    # are accepted only when their alphabetic content is overwhelmingly ASCII.
+    if len(letters) < 100 or text.count(" ") < 20:
+        return ascii_ratio >= 0.90
+    return ascii_ratio >= 0.70 and is_probably_english(text, config)
+
+
+def _smoltalk_bucket(messages: list[dict], tokenizer: SpakieTokenizer | None) -> str:
+    """Bucket SmolTalk by task shape, turn count, and rendered length."""
+    user_text = "\n".join(
+        str(msg.get("content", "")) for msg in messages if msg.get("role") == "user"
+    ).lower()
+    all_text = "\n".join(str(msg.get("content", "")) for msg in messages).lower()
+    if len(messages) > 2:
+        return "multi_turn"
+    if "```" in all_text or re.search(
+        r"\b(?:python|javascript|typescript|java|rust|golang|sql|html|css|function|code|program)\b",
+        user_text,
+    ):
+        return "code"
+    if re.search(r"\b(?:rewrite|summari[sz]e|translate|edit|proofread|email|letter|essay)\b", user_text):
+        return "writing"
+    if re.search(
+        r"\b(?:exactly|at least|at most|must contain|format as|bullet points?|json|one word|"
+        r"one sentence|do not include)\b",
+        user_text,
+    ):
+        return "constrained"
+    if tokenizer is not None:
+        total, _ = rendered_token_lengths(messages, tokenizer)
+    else:
+        total = sum(max(1, len(msg.get("content", "")) // 4) + 2 for msg in messages)
+    if total <= 180:
+        return "general_short"
+    if total <= 340:
+        return "general_medium"
+    return "general_long"
+
+
+def stratify_smoltalk_examples(
+    examples: list[dict],
+    limit: int,
+    seed: int,
+    tokenizer: SpakieTokenizer | None,
+) -> list[dict]:
+    """Select a deterministic, concise, multi-turn-aware SmolTalk mixture."""
+    if limit <= 0 or len(examples) <= limit:
+        return examples
+
+    weights = {
+        "multi_turn": 0.20,
+        "code": 0.12,
+        "writing": 0.15,
+        "constrained": 0.13,
+        "general_short": 0.20,
+        "general_medium": 0.15,
+        "general_long": 0.05,
+    }
+    buckets: dict[str, list[dict]] = {name: [] for name in weights}
+    for example in examples:
+        buckets[_smoltalk_bucket(example["messages"], tokenizer)].append(example)
+
+    rng = random.Random(seed)
+    for rows in buckets.values():
+        rng.shuffle(rows)
+
+    selected: list[dict] = []
+    safe_leftovers: list[dict] = []
+    for name, weight in weights.items():
+        target = int(limit * weight)
+        rows = buckets[name]
+        selected.extend(rows[:target])
+        if name not in {"code", "constrained", "writing"}:
+            safe_leftovers.extend(rows[target:])
+
+    rng.shuffle(safe_leftovers)
+    if len(selected) < limit:
+        selected.extend(safe_leftovers[: limit - len(selected)])
+    rng.shuffle(selected)
+    return selected[:limit]
 
 
 def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
@@ -227,7 +469,12 @@ def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
     if system_prompt is not None:
         cleaned.insert(0, {"role": "system", "content": system_prompt})
 
-    return {"messages": cleaned}
+    normalized = {"messages": cleaned}
+    for key in ("source", "category"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized[key] = value.strip()
+    return normalized
 
 
 def build_assistant_seed_examples(system_prompt: str | None, repeats: int) -> list[dict]:
@@ -279,6 +526,24 @@ def build_pair_seed_examples(
             )
             examples.append({"messages": messages})
     return examples
+
+
+def build_identity_seed_examples(system_prompt: str | None) -> list[dict]:
+    """Build varied, non-duplicate anchors for the Spakie-180M identity."""
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for prompt in _IDENTITY_PROMPTS:
+        for variant in expand_user_phrasings(prompt):
+            for answer in _IDENTITY_ANSWERS:
+                pair = (variant, answer)
+                if pair not in seen:
+                    seen.add(pair)
+                    pairs.append(pair)
+    for pair in _IDENTITY_NEGATIVE_PAIRS:
+        if pair not in seen:
+            seen.add(pair)
+            pairs.append(pair)
+    return build_pair_seed_examples(tuple(pairs), system_prompt, repeats=1)
 
 
 def rendered_token_lengths(messages: list[dict], tokenizer: SpakieTokenizer) -> tuple[int, int]:
@@ -369,10 +634,18 @@ def load_source(
     max_seq_len: int = 0,
     max_assistant_tokens: int = 0,
     final_assistant_only: bool = False,
+    source_name: str = "",
+    config: SpakieConfig | None = None,
 ) -> list[dict]:
+    config = config or SpakieConfig()
     examples: list[dict] = []
     malformed = 0
     filtered = 0
+    correction_filtered = 0
+    refusal_filtered = 0
+    identity_filtered = 0
+    conflicting_identity_filtered = 0
+    non_english = 0
     too_long = 0
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -390,9 +663,24 @@ def load_source(
             if contains_disallowed_sft_marker(raw.get("messages")):
                 filtered += 1
                 continue
+            if contains_correction_annotation(raw.get("messages")):
+                correction_filtered += 1
+                continue
+            if contains_refusal_response(raw.get("messages")):
+                refusal_filtered += 1
+                continue
+            if contains_foreign_identity_claim(raw.get("messages")):
+                identity_filtered += 1
+                continue
+            if contains_conflicting_identity_example(raw.get("messages")):
+                conflicting_identity_filtered += 1
+                continue
             example = normalize_example(raw, system_prompt)
             if example is None:
                 malformed += 1
+                continue
+            if not is_english_sft_example(example["messages"], config):
+                non_english += 1
                 continue
             if final_assistant_only:
                 supervise_final_assistant_only(example["messages"])
@@ -406,6 +694,28 @@ def load_source(
         print(f"    warning: skipped {malformed} malformed lines in {os.path.basename(path)}")
     if filtered:
         print(f"    filtered {filtered} tool/template artifact examples in {os.path.basename(path)}")
+    if correction_filtered:
+        print(
+            f"    excluded {correction_filtered} reviewer-correction examples in "
+            f"{os.path.basename(path)}"
+        )
+    if refusal_filtered:
+        print(
+            f"    excluded {refusal_filtered} refusal examples in "
+            f"{os.path.basename(path)}"
+        )
+    if identity_filtered:
+        print(
+            f"    excluded {identity_filtered} foreign-model identity examples in "
+            f"{os.path.basename(path)}"
+        )
+    if conflicting_identity_filtered:
+        print(
+            f"    excluded {conflicting_identity_filtered} conflicting identity examples in "
+            f"{os.path.basename(path)}"
+        )
+    if non_english:
+        print(f"    excluded {non_english} non-English examples in {os.path.basename(path)}")
     if too_long:
         print(
             f"    dropped {too_long} examples over the {max_seq_len}-token window "
@@ -413,7 +723,15 @@ def load_source(
         )
     # Length-filter before applying the cap so each source contributes `limit`
     # usable examples rather than `limit` rows of which some are then discarded.
-    if limit > 0 and len(examples) > limit:
+    if source_name == "smoltalk":
+        before = len(examples)
+        examples = stratify_smoltalk_examples(examples, limit, seed, tokenizer)
+        if len(examples) < before:
+            print(
+                f"    stratified SmolTalk selection: {len(examples):,}/{before:,} examples "
+                "(turn/length balanced)"
+            )
+    elif limit > 0 and len(examples) > limit:
         random.Random(seed).shuffle(examples)
         examples = examples[:limit]
     return examples
@@ -463,24 +781,6 @@ def main() -> None:
         help=(
             "Drop examples whose combined assistant turns exceed this many tokens "
             "(0 = no cap). Biases the mix toward concise answers."
-        ),
-    )
-    parser.add_argument(
-        "--assistant-seed-repeats",
-        type=int,
-        default=20,
-        help=(
-            "Generate this many candidate copies of the built-in assistant-behavior seed set "
-            "(0 disables); exact duplicates are collapsed before export."
-        ),
-    )
-    parser.add_argument(
-        "--anti-echo-seed-repeats",
-        type=int,
-        default=80,
-        help=(
-            "Generate this many candidate copies of direct-answer anti-echo seeds "
-            "(0 disables); exact duplicates are collapsed before export."
         ),
     )
     parser.add_argument(
@@ -554,6 +854,8 @@ def main() -> None:
             final_assistant_only=(
                 source_name == "nemotron_instruction_following_chat_v3"
             ),
+            source_name=source_name,
+            config=config,
         )
         counts[source_name] = len(examples)
         cap_note = f" (cap {limit:,})" if limit > 0 else ""
@@ -563,30 +865,6 @@ def main() -> None:
     deduped, dropped = deduplicate_examples(all_examples)
     if dropped:
         print(f"Removed {dropped:,} duplicate examples")
-
-    assistant_seed = build_assistant_seed_examples(system_prompt, args.assistant_seed_repeats)
-    if assistant_seed:
-        deduped.extend(assistant_seed)
-        counts["assistant_seed"] = len(assistant_seed)
-        print(f"Added {len(assistant_seed):,} assistant-behavior seed examples")
-
-    anti_echo_seed = build_pair_seed_examples(
-        ANTI_ECHO_SEEDS,
-        system_prompt,
-        args.anti_echo_seed_repeats,
-    )
-    if anti_echo_seed:
-        deduped.extend(anti_echo_seed)
-        counts["anti_echo_seed"] = len(anti_echo_seed)
-        print(f"Added {len(anti_echo_seed):,} anti-echo seed examples")
-
-    # Seed expansion intentionally creates candidate variants, but repeated
-    # copies must not overweight a tiny canned-answer set. Deduplicate again
-    # after appending seeds so the default repeat knobs cannot produce exact
-    # duplicate rows in the published training file.
-    deduped, seed_duplicates = deduplicate_examples(deduped)
-    if seed_duplicates:
-        print(f"Removed {seed_duplicates:,} duplicate seed examples")
 
     random.Random(args.seed).shuffle(deduped)
     if args.max > 0 and len(deduped) > args.max:

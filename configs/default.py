@@ -257,6 +257,13 @@ class SpakieConfig:
             return int(entry.get("limit", 0))
         return int(entry)
 
+    def sft_source_download_limit(self, source_name: str) -> int:
+        """Return the raw download budget, defaulting to the merge limit."""
+        entry = self.sft_source_limits.get(source_name, 0)
+        if isinstance(entry, dict):
+            return int(entry.get("download_limit", entry.get("limit", 0)))
+        return int(entry)
+
     def enabled_sft_sources(self, available_sources: set[str] | None = None) -> list[str]:
         sources = []
         for source_name in self.sft_source_limits:

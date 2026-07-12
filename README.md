@@ -221,22 +221,27 @@ SFT source data is downloaded to `data/chat_raw/` and merged into `data/chat/tra
 
 ```bash
 python3 scripts/download_sft_data.py
+python3 scripts/build_sft_seed_data.py
 python3 scripts/prepare_sft.py
 python3 scripts/prepare_sft.py --system "Answer clearly and factually."
-python3 scripts/prepare_sft.py --assistant-seed-repeats 0
 python3 scripts/finetune.py --backend mlx --precision auto
 python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
 The default SFT download uses the enabled sources in `configs/default.yaml`.
-The current downloadable defaults are SmolTalk (75,000 usable rows), Nemotron
-instruction-following chat v3 (5,000), Nemotron math v4 (20,000), and TriviaQA
-(3,000), plus uncapped local `DeepSeek-distilled` and `custom` files. Limits are
+The current downloadable defaults target the 180M model: up to 40,000
+quality-stratified SmolTalk rows from a 150,000-row raw sample, 8,000 No Robots,
+6,000 SciQ, 5,000 SQuAD, 3,000 BoolQ, 5,000 Nemotron instruction-following chat,
+and 3,000 TriviaQA rows, plus uncapped local `DeepSeek-distill-V2` and `custom`
+files. Preparation removes non-English, conflicting-identity, refusal, review-
+annotation, and over-context examples. Advanced Nemotron math is intentionally
+not part of this SFT pipeline. Limits are
 applied to usable converted examples rather than raw rows. To download only selected sources:
 
-```bash
-python3 scripts/download_sft_data.py --sources nemotron_math_v4
-```
+`build_sft_seed_data.py` writes the small permanent local sources separately so
+they remain easy to inspect and version: `spakie_180m_identity.jsonl`,
+`assistant_behavior.jsonl`, `anti_echo.jsonl`, and `factual_repairs.jsonl`.
+They live in `data/chat_raw/` and are merged exactly like downloaded sources.
 
 For a small targeted SFT/eval set instead of downloaded SFT sources:
 
@@ -265,10 +270,10 @@ large amount of padded-token work on chat datasets. The conservative defaults
 are `--sft-sampler sortish`, `--sft-bucket-multiple 128`, and no SFT packing or
 varlen attention.
 
-`prepare_sft.py` also adds a small repeated assistant-behavior seed set by
-default. This anchors greetings, identity questions, and simple factual answers
-so a lightly fine-tuned model is less likely to continue pretraining-style web
-text. Set `--assistant-seed-repeats 0` to disable it.
+The permanent assistant-behavior and identity sources anchor greetings,
+Spakie-180M identity questions, direct answers, and simple factual responses so
+a lightly fine-tuned model is less likely to continue pretraining-style web
+text or invent a human occupation.
 
 ## Optimizer
 
@@ -371,7 +376,7 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 ## Chat Template
 
 ```text
-<|system|>You are Spakie, a helpful assistant.<eos>
+<|system|>You are Spakie-180M, a helpful AI language model.<eos>
 <|user|>What is Python?<eos>
 <|assistant|>Python is a programming language.<eos>
 ```

@@ -205,35 +205,47 @@ sft_source_limits:
   # `enabled` controls whether download/prepare uses a source. `limit: 0` means
   # uncapped for local raw JSONL sources during prepare; downloaded sources
   # should keep a positive limit to avoid accidental full-dataset pulls.
-  DeepSeek-distilled:
+  DeepSeek-distill-V2:
     enabled: true
     limit: 0
   custom:
     enabled: true
     limit: 0
+  spakie_180m_identity:
+    enabled: true
+    limit: 0
+  assistant_behavior:
+    enabled: true
+    limit: 0
+  anti_echo:
+    enabled: true
+    limit: 0
+  factual_repairs:
+    enabled: true
+    limit: 0
   nemotron_instruction_following_chat_v3:
     enabled: true
     limit: 5000
-  nemotron_math_v4:
-    enabled: true
-    limit: 20000
   alpaca:
     enabled: false
     limit: 12000
   no_robots:
-    enabled: false
+    enabled: true
     limit: 8000
   smoltalk:
     enabled: true
-    limit: 75000
+    # Draw a larger upstream sample so the English/quality/context filters can
+    # still produce a broad 180M-friendly final mixture.
+    download_limit: 150000
+    limit: 40000
   squad:
-    enabled: false
+    enabled: true
     limit: 5000
   triviaqa:
     enabled: true
     limit: 3000
   sciq:
-    enabled: false
+    enabled: true
     limit: 6000
   arc_challenge:
     enabled: false
@@ -242,7 +254,7 @@ sft_source_limits:
     enabled: false
     limit: 5000
   boolq:
-    enabled: false
+    enabled: true
     limit: 3000
 
 corpus_source_plan:

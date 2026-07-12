@@ -2,8 +2,14 @@
 venv/
 .venv/
 
-# Data (too large for git)
-data/
+# Data (too large for git, except small permanent SFT seed sources)
+data/*
+!data/chat_raw/
+data/chat_raw/*
+!data/chat_raw/spakie_180m_identity.jsonl
+!data/chat_raw/assistant_behavior.jsonl
+!data/chat_raw/anti_echo.jsonl
+!data/chat_raw/factual_repairs.jsonl
 
 # Checkpoints
 checkpoints/

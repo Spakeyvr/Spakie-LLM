@@ -88,6 +88,106 @@ class PrepareSFTTests(unittest.TestCase):
             )
         )
 
+    def test_review_corrections_and_refusals_are_excluded(self):
+        self.assertTrue(
+            prepare_sft.contains_correction_annotation(
+                [{"role": "assistant", "content": "Answer.\n\nCorrection: revise this."}]
+            )
+        )
+        self.assertTrue(
+            prepare_sft.contains_refusal_response(
+                [{"role": "assistant", "content": "I can't help with that request."}]
+            )
+        )
+        self.assertFalse(
+            prepare_sft.contains_refusal_response(
+                [{"role": "assistant", "content": "I can't guarantee the result."}]
+            )
+        )
+
+    def test_foreign_identity_and_non_english_rows_are_detected(self):
+        config = prepare_sft.SpakieConfig()
+        self.assertTrue(
+            prepare_sft.contains_foreign_identity_claim(
+                [{"role": "assistant", "content": "I am ChatGPT, made by OpenAI."}]
+            )
+        )
+        self.assertFalse(
+            prepare_sft.contains_foreign_identity_claim(
+                [{"role": "assistant", "content": "I am Spakie-180M."}]
+            )
+        )
+        self.assertTrue(
+            prepare_sft.contains_conflicting_identity_example(
+                [
+                    {"role": "user", "content": "What are you?"},
+                    {"role": "assistant", "content": "I am a software engineer."},
+                ]
+            )
+        )
+        self.assertFalse(
+            prepare_sft.contains_conflicting_identity_example(
+                [
+                    {"role": "user", "content": "What are you?"},
+                    {"role": "assistant", "content": "I am Spakie-180M."},
+                ]
+            )
+        )
+        self.assertTrue(
+            prepare_sft.is_english_sft_example(
+                [
+                    {"role": "user", "content": "Who are you?"},
+                    {"role": "assistant", "content": "I am Spakie-180M."},
+                ],
+                config,
+            )
+        )
+        self.assertFalse(
+            prepare_sft.is_english_sft_example(
+                [
+                    {"role": "user", "content": "你是谁？"},
+                    {"role": "assistant", "content": "我是一个语言模型。"},
+                ],
+                config,
+            )
+        )
+
+    def test_identity_seeds_name_spakie_180m_consistently(self):
+        examples = prepare_sft.build_identity_seed_examples(None)
+        self.assertGreater(len(examples), 100)
+        for example in examples:
+            answer = example["messages"][-1]["content"]
+            self.assertIn("Spakie-180M", answer)
+
+    def test_smoltalk_stratification_is_deterministic_and_turn_aware(self):
+        examples = []
+        for index in range(8):
+            examples.append(
+                {
+                    "messages": [
+                        {"role": "user", "content": f"short {index}"},
+                        {"role": "assistant", "content": "brief answer"},
+                    ]
+                }
+            )
+        for index in range(8):
+            examples.append(
+                {
+                    "messages": [
+                        {"role": "user", "content": f"question {index}"},
+                        {"role": "assistant", "content": "context answer"},
+                        {"role": "user", "content": "follow up"},
+                        {"role": "assistant", "content": "follow-up answer"},
+                    ]
+                }
+            )
+
+        first = prepare_sft.stratify_smoltalk_examples(examples, 8, 42, None)
+        second = prepare_sft.stratify_smoltalk_examples(examples, 8, 42, None)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 8)
+        self.assertGreaterEqual(sum(len(row["messages"]) > 2 for row in first), 1)
+
     def test_load_source_filters_tool_and_reasoning_artifact_examples(self):
         rows = [
             [],

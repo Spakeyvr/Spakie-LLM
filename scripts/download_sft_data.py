@@ -41,6 +41,13 @@ def trim(text: str) -> str:
     return " ".join(str(text).split()).strip()
 
 
+def clean_message_text(text: object) -> str:
+    """Normalize chat text without destroying code/list line structure."""
+    if text is None:
+        return ""
+    return str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def make_example(user_text: str, assistant_text: str) -> dict | None:
     user_text = trim(user_text)
     assistant_text = trim(assistant_text)
@@ -78,8 +85,7 @@ def clean_chat_messages(messages: object, *, fold_system_into_user: bool = False
         if not isinstance(msg, dict):
             return []
         role = msg.get("role")
-        raw_content = msg.get("content", "")
-        content = "" if raw_content is None else trim(raw_content)
+        content = clean_message_text(msg.get("content", ""))
         if role == "system":
             if fold_system_into_user and content:
                 system_parts.append(content)
@@ -179,8 +185,17 @@ def load_no_robots(limit: int, seed: int) -> list[dict]:
     rows = take_rows(dataset, limit, seed)
     examples = []
     for row in rows:
-        cleaned = clean_chat_messages(row.get("messages"))
-        if append_usable(examples, {"messages": cleaned} if cleaned else None, limit):
+        category = trim(row.get("category", ""))
+        # The Chat category intentionally contains role-play personas. Those
+        # conflict with Spakie-180M's stable identity, so keep the other
+        # human-written instruction categories and preserve their task prompt.
+        if category.lower() == "chat":
+            continue
+        cleaned = clean_chat_messages(row.get("messages"), fold_system_into_user=True)
+        example = {"messages": cleaned} if cleaned else None
+        if example is not None and category:
+            example["category"] = category
+        if append_usable(examples, example, limit):
             break
     return examples
 
@@ -193,7 +208,11 @@ def load_smoltalk(limit: int, seed: int) -> list[dict]:
     examples = []
     for row in rows:
         cleaned = clean_chat_messages(row.get("messages"), fold_system_into_user=True)
-        if append_usable(examples, {"messages": cleaned} if cleaned else None, limit):
+        example = {"messages": cleaned} if cleaned else None
+        source = row.get("source")
+        if example is not None and isinstance(source, str) and source.strip():
+            example["source"] = source.strip()
+        if append_usable(examples, example, limit):
             break
     return examples
 
@@ -346,16 +365,6 @@ def load_nemotron_instruction_following_chat_v3(limit: int, seed: int) -> list[d
     )
 
 
-def load_nemotron_math_v4(limit: int, seed: int) -> list[dict]:
-    return load_hf_chat_messages(
-        "nvidia/Nemotron-SFT-Math-v4",
-        "train",
-        limit,
-        seed,
-        "Nemotron SFT Math v4",
-    )
-
-
 def write_jsonl(path: str, examples: list[dict]) -> None:
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -401,7 +410,6 @@ def main() -> int:
         "openbookqa": lambda limit: load_openbookqa(limit, args.seed),
         "boolq": lambda limit: load_boolq(limit, args.seed),
         "nemotron_instruction_following_chat_v3": lambda limit: load_nemotron_instruction_following_chat_v3(limit, args.seed),
-        "nemotron_math_v4": lambda limit: load_nemotron_math_v4(limit, args.seed),
     }
     requested_sources = parse_sources(args.sources, config, set(source_builders))
     unknown_sources = sorted(set(requested_sources) - set(source_builders))
@@ -415,7 +423,7 @@ def main() -> int:
         if not config.sft_source_enabled(source_name):
             print(f"  {source_name}: disabled")
             continue
-        limit = config.sft_source_limit(source_name)
+        limit = config.sft_source_download_limit(source_name)
         if limit <= 0:
             print(f"  {source_name}: disabled (limit {limit})")
             continue

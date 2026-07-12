@@ -34,6 +34,14 @@ class FakeDataset:
 
 
 class DownloadSFTDataTests(unittest.TestCase):
+    def test_download_limit_can_exceed_merge_limit(self):
+        config = SpakieConfig()
+        config.sft_source_limits = {
+            "smoltalk": {"enabled": True, "limit": 40000, "download_limit": 150000}
+        }
+        self.assertEqual(config.sft_source_limit("smoltalk"), 40000)
+        self.assertEqual(config.sft_source_download_limit("smoltalk"), 150000)
+
     def test_main_skips_zero_limit_sources(self):
         # Use a controlled limits config (decoupled from the live YAML, whose
         # values legitimately change): squad disabled, triviaqa enabled.
@@ -61,22 +69,21 @@ class DownloadSFTDataTests(unittest.TestCase):
     def test_parse_sources_all_uses_enabled_downloadable_sources(self):
         controlled = SpakieConfig()
         controlled.sft_source_limits = {
-            "DeepSeek-distilled": {"enabled": True, "limit": 0},
+            "DeepSeek-distill-V2": {"enabled": True, "limit": 0},
             "custom": {"enabled": True, "limit": 0},
             "nemotron_instruction_following_chat_v3": {"enabled": True, "limit": 50000},
-            "nemotron_math_v4": {"enabled": True, "limit": 50000},
             "alpaca": {"enabled": False, "limit": 12000},
         }
 
         sources = download_sft_data.parse_sources(
             "all",
             controlled,
-            {"alpaca", "nemotron_instruction_following_chat_v3", "nemotron_math_v4"},
+            {"alpaca", "nemotron_instruction_following_chat_v3"},
         )
 
         self.assertEqual(
             sources,
-            ["nemotron_instruction_following_chat_v3", "nemotron_math_v4"],
+            ["nemotron_instruction_following_chat_v3"],
         )
 
     def test_clean_chat_messages_drops_null_content(self):
@@ -89,15 +96,32 @@ class DownloadSFTDataTests(unittest.TestCase):
 
         self.assertEqual(cleaned, [])
 
+    def test_clean_chat_messages_preserves_code_line_structure(self):
+        cleaned = download_sft_data.clean_chat_messages(
+            [
+                {"role": "user", "content": "Write Python."},
+                {
+                    "role": "assistant",
+                    "content": "```python\ndef add(a, b):\n    return a + b\n```",
+                },
+            ]
+        )
+        self.assertEqual(
+            cleaned[-1]["content"],
+            "```python\ndef add(a, b):\n    return a + b\n```",
+        )
+
     def test_load_no_robots_preserves_clean_chat_messages(self):
         rows = FakeDataset([
             {
+                "category": "Open QA",
                 "messages": [
                     {"role": "user", "content": "  Explain photosynthesis.  "},
                     {"role": "assistant", "content": "Plants use light to make sugars."},
                 ]
             },
             {
+                "category": "Chat",
                 "messages": [
                     {"role": "system", "content": "A source-specific persona."},
                     {"role": "user", "content": "Say hello."},
@@ -107,6 +131,7 @@ class DownloadSFTDataTests(unittest.TestCase):
                 ]
             },
             {
+                "category": "Closed QA",
                 "messages": [
                     {"role": "user", "content": "skip malformed"},
                     {"role": "assistant", "content": "one"},
@@ -114,6 +139,7 @@ class DownloadSFTDataTests(unittest.TestCase):
                 ]
             },
             {
+                "category": "Closed QA",
                 "messages": [
                     {"role": "user", "content": "What is 2 + 2?"},
                     {"role": "assistant", "content": "4"},
@@ -129,20 +155,14 @@ class DownloadSFTDataTests(unittest.TestCase):
             examples,
             [
                 {
+                    "category": "Open QA",
                     "messages": [
                         {"role": "user", "content": "Explain photosynthesis."},
                         {"role": "assistant", "content": "Plants use light to make sugars."},
                     ]
                 },
                 {
-                    "messages": [
-                        {"role": "user", "content": "Say hello."},
-                        {"role": "assistant", "content": "Hello."},
-                        {"role": "user", "content": "Say bye."},
-                        {"role": "assistant", "content": "Bye."},
-                    ]
-                },
-                {
+                    "category": "Closed QA",
                     "messages": [
                         {"role": "user", "content": "What is 2 + 2?"},
                         {"role": "assistant", "content": "4"},
@@ -270,7 +290,6 @@ class DownloadSFTDataTests(unittest.TestCase):
                 limit=10,
                 seed=42,
             )
-            math_examples = download_sft_data.load_nemotron_math_v4(limit=10, seed=42)
 
         self.assertEqual(
             chat_examples[0]["messages"],
@@ -280,10 +299,6 @@ class DownloadSFTDataTests(unittest.TestCase):
                 {"role": "user", "content": "Follow-up question."},
                 {"role": "assistant", "content": "Intended target.", "train": True},
             ],
-        )
-        self.assertTrue(
-            all("train" not in message for message in math_examples[0]["messages"]),
-            "other chat-style sources must retain all-assistant supervision by default",
         )
 
 
