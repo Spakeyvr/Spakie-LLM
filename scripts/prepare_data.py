@@ -1001,18 +1001,19 @@ def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[
     words_lower = _SHINGLE_WORD_RE.findall(lowered)
     word_count = len(words_lower)
     text_len = len(text)
+    is_code = source == "python_edu"
 
     mwl = _mean_word_length_from_words(words_lower)
-    if mwl < config.mean_word_length_min or mwl > config.mean_word_length_max:
+    if not is_code and (mwl < config.mean_word_length_min or mwl > config.mean_word_length_max):
         return False, "bad_word_length"
-    if _stopword_hit_count_from_words(words_lower[:200]) < config.min_stopword_count:
+    if not is_code and _stopword_hit_count_from_words(words_lower[:200]) < config.min_stopword_count:
         return False, "low_stopwords"
-    if _symbol_word_ratio_from_words(text, word_count) > config.max_symbol_word_ratio:
+    if not is_code and _symbol_word_ratio_from_words(text, word_count) > config.max_symbol_word_ratio:
         return False, "symbol_heavy"
     # Single Counter pass yields both the noise ratio (checked now) and the
     # top-char share (checked below) without walking every character twice.
     noise, top_share = noise_and_top_char_share(text)
-    if noise > config.max_noise_ratio:
+    if noise > (0.60 if is_code else config.max_noise_ratio):
         return False, "too_noisy"
     if repeated_line_ratio(text) > config.max_repeated_line_ratio:
         return False, "repeated_lines"

@@ -335,6 +335,8 @@ The repo currently supports these presets:
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
 | `92m` | 12 | 768 | 12 | 4 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
 | `180m` | 16 | 896 | 14 | 2 | SwiGLU hidden 2048 | 96 | 2 | 64 | 4 | Mid-size MLX-optimized preset |
+| `180m_gqa4` | 16 | 896 | 16 | 4 | SwiGLU hidden 2048 | 96 | 2 | 64 | 4 | Short-run 4-KV-head architecture ablation |
+| `180m_deep` | 24 | 768 | 12 | 4 | SwiGLU hidden 1536 | 72 | 2 | 48 | 4 | Short-run deep/thin architecture ablation |
 | `300m` | 10 | 1280 | 20 | 4 | GELU `d_ff=9088` | 64 | 3 | 16 | 2 | Config and pipeline default preset; MLX SFT uses sortish length buckets with padding trim |
 
 Shared model defaults:
@@ -348,6 +350,44 @@ Shared model defaults:
 - GELU or SwiGLU MLPs, depending on preset
 - scaled dot-product attention, with grouped-query attention where configured
 - activation checkpointing disabled by default for all current presets
+
+## Balanced Pretraining Corpus
+
+The default corpus target is 10B training tokens (about 10.53B processed with
+the 95/5 split), with `max_seq_len=512`. The source plan is intentionally
+balanced by capability domain:
+
+| Domain | Target share |
+|---|---:|
+| FineWeb-Edu | 32% |
+| General filtered web | 16% |
+| Wikipedia/reference | 17% |
+| Math (`FineMath-4+` + OpenWebMath) | 12% |
+| Educational Python code | 10% |
+| Books | 6% |
+| arXiv + StackExchange | 2% |
+| Cosmopedia synthetic education | 5% |
+
+Download and prepare a fresh generation; existing processed arrays retain the
+old mixture until rebuilt:
+
+```bash
+python3 scripts/download_pretrain_corpus.py --sources all --resume --english-only
+python3 scripts/prepare_data.py
+```
+
+Before a full run, compare the architecture variants at the same token budget:
+
+```bash
+python3 scripts/train.py --preset 180m --backend mlx --target-tokens 300000000
+python3 scripts/train.py --preset 180m_gqa4 --backend mlx --target-tokens 300000000
+python3 scripts/train.py --preset 180m_deep --backend mlx --target-tokens 300000000
+```
+
+Use `scripts/eval_general_capability.py` after each matched run. Its fixed suite
+reports results by category (math, factual recall, instruction following,
+formatting, and edge cases), so architecture selection is not based on aggregate
+validation loss alone.
 
 ## Architecture Notes
 

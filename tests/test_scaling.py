@@ -45,6 +45,43 @@ class FakeTokenizer:
 
 
 class ScalingConfigTests(unittest.TestCase):
+    def test_balanced_corpus_mix_and_fixed_context(self):
+        config = SpakieConfig()
+        enabled = {
+            name: entry for name, entry in config.corpus_source_plan.items()
+            if entry.get("enabled", True)
+        }
+        total = sum(int(entry["target_tokens"]) for entry in enabled.values())
+        by_kind: dict[str, int] = {}
+        for entry in enabled.values():
+            kind = str(entry["kind"])
+            by_kind[kind] = by_kind.get(kind, 0) + int(entry["target_tokens"])
+
+        self.assertEqual(config.target_train_tokens, 10_000_000_000)
+        self.assertEqual(config.max_seq_len, 512)
+        self.assertAlmostEqual(by_kind["synthetic_education"] / total, 0.05)
+        self.assertGreaterEqual(by_kind["math"] / total, 0.12)
+        self.assertGreaterEqual(by_kind["code"] / total, 0.10)
+
+    def test_180m_architecture_ablation_presets(self):
+        baseline = get_preset_config("180m")
+        gqa4 = get_preset_config("180m_gqa4")
+        deep = get_preset_config("180m_deep")
+        self.assertEqual((baseline.max_seq_len, gqa4.max_seq_len, deep.max_seq_len), (512, 512, 512))
+        self.assertEqual(gqa4.n_kv_heads, 4)
+        self.assertEqual(gqa4.n_heads % gqa4.n_kv_heads, 0)
+        self.assertGreater(deep.n_layers, baseline.n_layers)
+        self.assertLess(deep.d_model, baseline.d_model)
+
+    def test_code_documents_do_not_use_prose_only_filters(self):
+        config = SpakieConfig(min_doc_chars=1, source_min_doc_chars={"python_edu": 1})
+        keep, reason = prepare_data.should_keep_document(
+            "def add(x, y):\n    return x + y\n\nclass Counter:\n    pass\n",
+            config,
+            "python_edu",
+        )
+        self.assertTrue(keep, reason)
+
     def test_default_source_plan_matches_processed_target(self):
         config = SpakieConfig()
         source_plan = config.scaled_corpus_source_plan()

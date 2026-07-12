@@ -1,5 +1,5 @@
 default_preset: "300m"
-supported_presets: ["92m", "180m", "300m"]
+supported_presets: ["92m", "180m", "180m_gqa4", "180m_deep", "300m"]
 chat_system_prompt: "Answer clearly and factually. Keep explanations simple, direct, and truthful."
 
 corpus_source_aliases:
@@ -10,6 +10,8 @@ corpus_source_aliases:
   fineweb-sample: fineweb_sample
   open-web-math: openwebmath
   open_web_math: openwebmath
+  fine-math: finemath
+  python-edu: python_edu
   wikipedia: wikipedia_snapshot
 
 defaults:
@@ -104,9 +106,9 @@ defaults:
   checkpoint_dir: ""
 
   # Corpus planning
-  # 7.6B train tokens yields an 8B processed-token download target
+  # 10B train tokens yields a ~10.53B processed-token download target
   # with the default 95/5 train/val split.
-  target_train_tokens: 7600000000
+  target_train_tokens: 10000000000
   target_processed_tokens: 0
   large_corpus_dir: data/raw/large_corpus
   corpus_report_path: data/processed/corpus_report.json
@@ -175,6 +177,42 @@ presets:
     sft_lr: 3.0e-5
     sft_epochs: 4
 
+  # Near-matched-shape 4-KV-head ablation. Sixteen query heads are required
+  # because grouped-query attention requires query heads divisible by KV heads.
+  180m_gqa4:
+    n_layers: 16
+    d_model: 896
+    n_heads: 16
+    n_kv_heads: 4
+    d_ff: 3584
+    mlp_type: swiglu
+    swiglu_hidden: 2048
+    activation_checkpointing: false
+    pretrain_batch_size: 96
+    pretrain_grad_accum_steps: 2
+    sft_batch_size: 64
+    sft_grad_accum_steps: 4
+    sft_lr: 3.0e-5
+    sft_epochs: 4
+
+  # Deep/thin, approximately matched-budget architecture ablation. Context
+  # remains 512 so the comparison does not increase attention memory.
+  180m_deep:
+    n_layers: 24
+    d_model: 768
+    n_heads: 12
+    n_kv_heads: 4
+    d_ff: 3072
+    mlp_type: swiglu
+    swiglu_hidden: 1536
+    activation_checkpointing: false
+    pretrain_batch_size: 72
+    pretrain_grad_accum_steps: 2
+    sft_batch_size: 48
+    sft_grad_accum_steps: 4
+    sft_lr: 3.0e-5
+    sft_epochs: 4
+
   300m:
     n_layers: 10
     d_model: 1280
@@ -198,6 +236,8 @@ source_min_doc_chars:
   arxiv: 220
   stackexchange: 180
   openwebmath: 180
+  finemath: 180
+  python_edu: 80
   open_corpus: 180
   dictionary: 80
 
@@ -259,16 +299,14 @@ sft_source_limits:
 
 corpus_source_plan:
   # Weights below are relative; scaled_corpus_source_plan() normalizes them to
-  # target_processed_tokens (~8B) at runtime, and the same numbers drive the
-  # download budget (download_pretrain_corpus.py). Mix is fact-density weighted:
-  # synthetic-education + Wikipedia carry the QA-extractable knowledge a small
-  # model can actually recall, so they dominate over diffuse raw web.
-  # Resulting mix ~= cosmopedia 38% / fineweb-edu 25% / Wikipedia 20% /
-  # other web (c4+refinedweb+fineweb_sample) 11% / books+technical 6%.
+  # target_processed_tokens (~10.53B) at runtime. The weights define a balanced
+  # 10B-token training mix: 32% educational web, 16% general web, 17%
+  # reference, 12% math, 10% code, 6% books, 2% other technical, and 5%
+  # synthetic education.
   fineweb-edu:
     kind: web
-    target_tokens: 2000000000
-    target_raw_chars: 8000000000
+    target_tokens: 3200000000
+    target_raw_chars: 12800000000
     enabled: true
   dolma:
     kind: web
@@ -277,13 +315,13 @@ corpus_source_plan:
     enabled: false
   refinedweb:
     kind: web
-    target_tokens: 300000000
-    target_raw_chars: 1200000000
+    target_tokens: 500000000
+    target_raw_chars: 2000000000
     enabled: true
   fineweb_sample:
     kind: web
-    target_tokens: 200000000
-    target_raw_chars: 800000000
+    target_tokens: 700000000
+    target_raw_chars: 2800000000
     enabled: true
   c4_en:
     kind: web
@@ -292,31 +330,41 @@ corpus_source_plan:
     enabled: true
   gutenberg:
     kind: books
-    target_tokens: 250000000
-    target_raw_chars: 1000000000
+    target_tokens: 600000000
+    target_raw_chars: 2400000000
     enabled: true
   wikipedia_snapshot:
     kind: reference
-    target_tokens: 1600000000
-    target_raw_chars: 6400000000
+    target_tokens: 1700000000
+    target_raw_chars: 6800000000
     enabled: true
   stackexchange:
     kind: technical
-    target_tokens: 3000000
-    target_raw_chars: 12000000
+    target_tokens: 100000000
+    target_raw_chars: 400000000
     enabled: true
   openwebmath:
-    kind: technical
-    target_tokens: 200000000
-    target_raw_chars: 800000000
+    kind: math
+    target_tokens: 300000000
+    target_raw_chars: 1200000000
     enabled: true
   arxiv:
     kind: technical
-    target_tokens: 3000000
-    target_raw_chars: 12000000
+    target_tokens: 100000000
+    target_raw_chars: 400000000
+    enabled: true
+  finemath:
+    kind: math
+    target_tokens: 900000000
+    target_raw_chars: 3600000000
+    enabled: true
+  python_edu:
+    kind: code
+    target_tokens: 1000000000
+    target_raw_chars: 4000000000
     enabled: true
   cosmopedia_v2:
     kind: synthetic_education
-    target_tokens: 3000000000
-    target_raw_chars: 12000000000
+    target_tokens: 500000000
+    target_raw_chars: 2000000000
     enabled: true

@@ -168,6 +168,28 @@ HF_DATASETS: dict[str, dict] = {
         "license": "ODC-By 1.0 / Common Crawl terms",
         "kind": "technical",
     },
+    "finemath": {
+        "variants": [
+            {"path": "HuggingFaceTB/finemath", "name": "finemath-4plus", "split": "train"},
+        ],
+        "text_fields": ("text",),
+        "id_fields": ("url",),
+        "url_fields": ("url",),
+        "title_fields": (),
+        "license": "ODC-By 1.0 / Common Crawl terms",
+        "kind": "math",
+    },
+    "python_edu": {
+        "variants": [
+            {"path": "HuggingFaceTB/smollm-corpus", "name": "python-edu", "split": "train"},
+        ],
+        "text_fields": ("text", "content"),
+        "id_fields": ("blob_id", "repo_name", "path"),
+        "url_fields": (),
+        "title_fields": ("path",),
+        "license": "ODC-By; upstream repository licenses apply",
+        "kind": "code",
+    },
     "cosmopedia_v2": {
         "variants": [
             {"path": "HuggingFaceTB/smollm-corpus", "name": "cosmopedia-v2", "split": "train"},
@@ -1008,7 +1030,10 @@ def main() -> int:
     parser.add_argument("--max_docs", type=int, default=0, help="Optional per-source document cap")
     parser.add_argument("--resume", action="store_true", help="Resume from progress manifests")
     parser.add_argument("--reset_source", type=str, default="", help="Comma-separated list of sources to reset")
-    parser.add_argument("--english_only", action="store_true", help="Keep only likely English documents")
+    parser.add_argument(
+        "--english-only", "--english_only", dest="english_only", action="store_true",
+        help="Keep only likely English documents",
+    )
     parser.add_argument("--workers", type=int, default=0, help="Concurrent source downloads (0 = one per source)")
     args = parser.parse_args()
     STOP_EVENT.clear()
