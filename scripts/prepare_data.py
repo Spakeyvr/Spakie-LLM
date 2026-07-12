@@ -10,6 +10,7 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import bisect
 import glob
 import json
 import multiprocessing as mp
@@ -764,10 +765,62 @@ def merge_shards(
     *,
     train_tokens_target: int | None = None,
     show_progress: bool = False,
+    source_runs: list[tuple[str, int, int]] | None = None,
 ) -> tuple[int, int]:
     total_tokens = sum(int(np.load(path, mmap_mode="r").shape[0]) for path in shard_paths)
     split_idx = int(total_tokens * train_fraction)
-    if train_tokens_target and train_tokens_target > split_idx:
+    source_train_targets: dict[str, int] | None = None
+    if source_runs:
+        has_gap = any(
+            start != prev_end
+            for (_, _, prev_end), (_, start, _) in zip(source_runs, source_runs[1:])
+        )
+        if source_runs[0][1] != 0 or has_gap:
+            raise ValueError("source_runs must cover the flattened token stream without gaps")
+        if source_runs[-1][2] != total_tokens:
+            raise ValueError(
+                f"source_runs end at {source_runs[-1][2]:,}, but shards contain {total_tokens:,} tokens"
+            )
+        source_totals: dict[str, int] = defaultdict(int)
+        for source, start, end in source_runs:
+            if end < start:
+                raise ValueError(f"invalid source token range for {source}: {start}:{end}")
+            source_totals[source] += end - start
+        if train_tokens_target and 0 < train_tokens_target <= total_tokens:
+            # Allocate an exact global target proportionally, using largest
+            # remainders so every source contributes to the training split.
+            raw_targets = {
+                source: train_tokens_target * count / total_tokens
+                for source, count in source_totals.items()
+            }
+            source_train_targets = {
+                source: int(value) for source, value in raw_targets.items()
+            }
+            remainder = train_tokens_target - sum(source_train_targets.values())
+            for source, _ in sorted(
+                (
+                    (source, raw_targets[source] - source_train_targets[source])
+                    for source in source_totals
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )[:remainder]:
+                source_train_targets[source] += 1
+            split_idx = train_tokens_target
+        else:
+            source_train_targets = {
+                source: int(count * train_fraction)
+                for source, count in source_totals.items()
+            }
+            split_idx = sum(source_train_targets.values())
+            if train_tokens_target and train_tokens_target > total_tokens:
+                print(
+                    f"WARNING: requested {train_tokens_target:,} train tokens but only "
+                    f"{total_tokens:,} processed tokens are available. Falling back to "
+                    f"per-source train_fraction={train_fraction:.4f} -> "
+                    f"{split_idx:,} train / {total_tokens - split_idx:,} val tokens."
+                )
+
+    if train_tokens_target and train_tokens_target > split_idx and source_train_targets is None:
         if train_tokens_target > total_tokens:
             # Don't throw away a long, expensive prepare run just because the
             # corpus came up short of the configured train target. Fall back
@@ -818,6 +871,36 @@ def merge_shards(
         cursor = 0
         train_cursor = 0
         val_cursor = 0
+
+        shard_lengths = [int(np.load(path, mmap_mode="r").shape[0]) for path in shard_paths]
+        shard_starts = [0]
+        for shard_len in shard_lengths[:-1]:
+            shard_starts.append(shard_starts[-1] + shard_len)
+
+        def copy_flat_range(
+            start: int, end: int, destination, destination_cursor: int
+        ) -> int:
+            """Copy a half-open range from flat shards into an output array."""
+            if end <= start:
+                return destination_cursor
+            shard_idx = bisect.bisect_right(shard_starts, start) - 1
+            position = start
+            while position < end:
+                shard_start = shard_starts[shard_idx]
+                shard_end = shard_start + shard_lengths[shard_idx]
+                take_end = min(end, shard_end)
+                shard = np.load(shard_paths[shard_idx], mmap_mode="r")
+                local_start = position - shard_start
+                local_end = take_end - shard_start
+                amount = local_end - local_start
+                destination[destination_cursor:destination_cursor + amount] = shard[
+                    local_start:local_end
+                ]
+                destination_cursor += amount
+                position = take_end
+                shard_idx += 1
+            return destination_cursor
+
         with tqdm(
             total=total_tokens,
             desc="Merging shards",
@@ -825,22 +908,39 @@ def merge_shards(
             unit_scale=True,
             disable=not show_progress,
         ) as progress:
-            for path in shard_paths:
-                shard = np.load(path, mmap_mode="r")
-                shard_len = int(shard.shape[0])
-                shard_start = cursor
-                shard_end = cursor + shard_len
+            if source_runs and source_train_targets is not None:
+                source_seen: dict[str, int] = defaultdict(int)
+                for source, run_start, run_end in source_runs:
+                    run_len = run_end - run_start
+                    source_offset = source_seen[source]
+                    train_limit = source_train_targets[source]
+                    train_amount = max(0, min(run_len, train_limit - source_offset))
+                    train_cursor = copy_flat_range(
+                        run_start, run_start + train_amount, train_arr, train_cursor
+                    )
+                    val_cursor = copy_flat_range(
+                        run_start + train_amount, run_end, val_arr, val_cursor
+                    )
+                    source_seen[source] += run_len
+                    cursor = run_end
+                    progress.update(run_len)
+            else:
+                for path in shard_paths:
+                    shard = np.load(path, mmap_mode="r")
+                    shard_len = int(shard.shape[0])
+                    shard_start = cursor
+                    shard_end = cursor + shard_len
 
-                train_take = max(0, min(split_idx, shard_end) - shard_start)
-                if train_take:
-                    train_arr[train_cursor:train_cursor + train_take] = shard[:train_take]
-                    train_cursor += train_take
-                if train_take < shard_len:
-                    val_slice = shard[train_take:]
-                    val_arr[val_cursor:val_cursor + len(val_slice)] = val_slice
-                    val_cursor += len(val_slice)
-                cursor = shard_end
-                progress.update(shard_len)
+                    train_take = max(0, min(split_idx, shard_end) - shard_start)
+                    if train_take:
+                        train_arr[train_cursor:train_cursor + train_take] = shard[:train_take]
+                        train_cursor += train_take
+                    if train_take < shard_len:
+                        val_slice = shard[train_take:]
+                        val_arr[val_cursor:val_cursor + len(val_slice)] = val_slice
+                        val_cursor += len(val_slice)
+                    cursor = shard_end
+                    progress.update(shard_len)
 
         expected_val_tokens = total_tokens - split_idx
         if cursor != total_tokens or train_cursor != split_idx or val_cursor != expected_val_tokens:
@@ -1096,6 +1196,11 @@ def prepare_data(
         )
 
     total_tokens = 0
+    # Compressed provenance for the flattened token stream. A run is one
+    # contiguous range emitted from the same corpus source; this lets the
+    # final merge allocate train/validation tokens per source even when files
+    # from different sources are interleaved.
+    source_runs: list[tuple[str, int, int]] = []
     shard_paths: list[Path] = []
     shard_dir = Path(config.token_shard_dir)
     existing_shard_paths: list[Path] = []
@@ -1148,7 +1253,17 @@ def prepare_data(
             stats["documents_kept"] += 1
             stats["chars_kept"] += len(item.text)
             stats["tokens_kept"] += len(token_ids)
+            token_start = total_tokens
             total_tokens += len(token_ids)
+            token_end = total_tokens
+            if (
+                source_runs
+                and source_runs[-1][0] == item.source
+                and source_runs[-1][2] == token_start
+            ):
+                source_runs[-1] = (item.source, source_runs[-1][1], token_end)
+            else:
+                source_runs.append((item.source, token_start, token_end))
             if resume_tokens_remaining:
                 if len(token_ids) > resume_tokens_remaining:
                     raise RuntimeError(
@@ -1448,6 +1563,7 @@ def prepare_data(
         output_dtype,
         train_tokens_target=config.target_train_tokens,
         show_progress=True,
+        source_runs=source_runs,
     )
 
     report["processed_tokens"] = train_tokens + val_tokens

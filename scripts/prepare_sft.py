@@ -231,7 +231,12 @@ def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
 
 
 def build_assistant_seed_examples(system_prompt: str | None, repeats: int) -> list[dict]:
-    """Return repeated assistant-behavior examples for SFT anchoring."""
+    """Return candidate assistant-behavior examples for SFT anchoring.
+
+    ``repeats`` is retained for CLI compatibility, but the final dataset pass
+    collapses exact duplicates so it cannot silently turn a handful of seeds
+    into thousands of identical gradient updates.
+    """
     if repeats <= 0:
         return []
 
@@ -256,7 +261,7 @@ def build_pair_seed_examples(
     system_prompt: str | None,
     repeats: int,
 ) -> list[dict]:
-    """Return repeated single-turn user/assistant seed examples."""
+    """Return candidate single-turn seed examples; exact duplicates are removed later."""
     if repeats <= 0:
         return []
 
@@ -327,6 +332,19 @@ def signature(example: dict) -> tuple:
         for msg in example["messages"]
         if msg["role"] != "system"
     )
+
+
+def deduplicate_examples(examples: list[dict]) -> tuple[list[dict], int]:
+    """Drop exact conversation duplicates while preserving first-seen order."""
+    seen: set[tuple] = set()
+    deduped: list[dict] = []
+    for example in examples:
+        sig = signature(example)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        deduped.append(example)
+    return deduped, len(examples) - len(deduped)
 
 
 def supervise_final_assistant_only(messages: list[dict]) -> None:
@@ -452,8 +470,8 @@ def main() -> None:
         type=int,
         default=20,
         help=(
-            "Repeat a small built-in assistant-behavior seed set this many times "
-            "(0 disables). Helps greetings, identity questions, and short factual prompts."
+            "Generate this many candidate copies of the built-in assistant-behavior seed set "
+            "(0 disables); exact duplicates are collapsed before export."
         ),
     )
     parser.add_argument(
@@ -461,8 +479,8 @@ def main() -> None:
         type=int,
         default=80,
         help=(
-            "Repeat direct-answer anti-echo seed examples this many times "
-            "(0 disables). Helps small models answer instead of continuing/repeating prompts."
+            "Generate this many candidate copies of direct-answer anti-echo seeds "
+            "(0 disables); exact duplicates are collapsed before export."
         ),
     )
     parser.add_argument(
@@ -542,15 +560,7 @@ def main() -> None:
         print(f"  {source_name}: {len(examples):,} examples{cap_note}")
         all_examples.extend(examples)
 
-    seen: set[tuple] = set()
-    deduped: list[dict] = []
-    for example in all_examples:
-        sig = signature(example)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        deduped.append(example)
-    dropped = len(all_examples) - len(deduped)
+    deduped, dropped = deduplicate_examples(all_examples)
     if dropped:
         print(f"Removed {dropped:,} duplicate examples")
 
@@ -569,6 +579,14 @@ def main() -> None:
         deduped.extend(anti_echo_seed)
         counts["anti_echo_seed"] = len(anti_echo_seed)
         print(f"Added {len(anti_echo_seed):,} anti-echo seed examples")
+
+    # Seed expansion intentionally creates candidate variants, but repeated
+    # copies must not overweight a tiny canned-answer set. Deduplicate again
+    # after appending seeds so the default repeat knobs cannot produce exact
+    # duplicate rows in the published training file.
+    deduped, seed_duplicates = deduplicate_examples(deduped)
+    if seed_duplicates:
+        print(f"Removed {seed_duplicates:,} duplicate seed examples")
 
     random.Random(args.seed).shuffle(deduped)
     if args.max > 0 and len(deduped) > args.max:

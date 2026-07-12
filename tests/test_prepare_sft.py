@@ -247,6 +247,16 @@ class PrepareSFTTests(unittest.TestCase):
         self.assertNotIn("system", {msg["role"] for msg in examples[0]["messages"]})
         self.assertEqual(prepare_sft.build_pair_seed_examples(prepare_sft.ANTI_ECHO_SEEDS, None, repeats=0), [])
 
+    def test_seed_repeats_are_collapsed_before_export(self):
+        examples = prepare_sft.build_pair_seed_examples(
+            (("What is Python?", "Python is a programming language."),),
+            None,
+            repeats=80,
+        )
+        deduped, dropped = prepare_sft.deduplicate_examples(examples)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(dropped, 79)
+
 
 if __name__ == "__main__":
     unittest.main()

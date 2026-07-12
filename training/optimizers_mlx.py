@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from configs.default import SpakieConfig
 from training.muon_core import (
@@ -31,6 +31,33 @@ def _split_tree_by_ndim(tree, *, split_ndim: int = 2):
 
 def _flatten_arrays(tree) -> dict[str, mx.array]:
     return {k: v for k, v in tree_flatten(tree) if isinstance(v, mx.array)}
+
+
+def _cast_floating_tree(tree, dtype=mx.float32):
+    """Cast floating leaves while preserving integer optimizer metadata."""
+    def cast(value):
+        if isinstance(value, mx.array) and mx.issubdtype(value.dtype, mx.floating):
+            return value.astype(dtype)
+        return value
+
+    return tree_map(cast, tree)
+
+
+def _apply_optimizer_to_master(
+    optimizer,
+    master_params: dict[str, mx.array],
+    grads: dict[str, mx.array],
+) -> None:
+    """Apply an MLX optimizer to FP32 master leaves and update them in place."""
+    if not grads:
+        return
+    grad_tree = tree_unflatten(
+        [(name, grad.astype(mx.float32)) for name, grad in grads.items()]
+    )
+    param_tree = tree_unflatten([(name, master_params[name]) for name in grads])
+    updated = optimizer.apply_gradients(grad_tree, param_tree)
+    for name, value in tree_flatten(updated):
+        master_params[name] = value.astype(mx.float32)
 
 
 def muon_newton_schulz_mlx(
@@ -95,6 +122,8 @@ class DualAdamW:
         self.nodecay = optim.AdamW(
             learning_rate=learning_rate, weight_decay=0.0, betas=betas
         )
+        self.master_params: dict[str, mx.array] = {}
+        self._master_loaded = False
 
     @property
     def learning_rate(self):
@@ -105,19 +134,58 @@ class DualAdamW:
         self.nodecay.learning_rate = lr
 
     def update(self, model, grads) -> None:
-        decay_grads, nodecay_grads = _split_tree_by_ndim(grads)
-        self.decay.update(model, decay_grads)
-        self.nodecay.update(model, nodecay_grads)
+        model_flat = _flatten_arrays(model.parameters())
+        if not self.master_params:
+            self.master_params = {
+                name: value.astype(mx.float32) for name, value in model_flat.items()
+            }
+        grad_flat = _flatten_arrays(grads)
+        decay_names = {
+            name for name, value in model_flat.items() if len(value.shape) >= 2
+        }
+        decay_grads = {name: grad for name, grad in grad_flat.items() if name in decay_names}
+        nodecay_grads = {
+            name: grad for name, grad in grad_flat.items() if name not in decay_names
+        }
+        _apply_optimizer_to_master(self.decay, self.master_params, decay_grads)
+        _apply_optimizer_to_master(self.nodecay, self.master_params, nodecay_grads)
+        model.update(
+            tree_unflatten(
+                [
+                    (name, value.astype(model_flat[name].dtype))
+                    for name, value in self.master_params.items()
+                ]
+            )
+        )
 
     def state_trees(self) -> dict:
-        return {"decay": self.decay.state, "nodecay": self.nodecay.state}
+        return {
+            "master": tree_unflatten(list(self.master_params.items())),
+            "decay": self.decay.state,
+            "nodecay": self.nodecay.state,
+        }
 
     def load_state_trees(self, state: dict) -> None:
-        self.decay.state = state["decay"]
-        self.nodecay.state = state["nodecay"]
+        self.decay.state = _cast_floating_tree(state["decay"])
+        self.nodecay.state = _cast_floating_tree(state["nodecay"])
+        master = state.get("master")
+        if master is not None:
+            self.master_params = {
+                name: value.astype(mx.float32)
+                for name, value in _flatten_arrays(master).items()
+            }
+            self._master_loaded = True
+
+    def sync_master_from_model(self, model) -> None:
+        if self._master_loaded:
+            return
+        self.master_params = {
+            name: value.astype(mx.float32)
+            for name, value in _flatten_arrays(model.parameters()).items()
+        }
 
     def eval_state(self) -> None:
-        mx.eval(self.decay.state, self.nodecay.state)
+        mx.eval(self.master_params, self.decay.state, self.nodecay.state)
 
 
 class MuonAdamWMLX:
@@ -191,6 +259,10 @@ class MuonAdamWMLX:
         self.aux_nodecay = optim.AdamW(
             learning_rate=learning_rate, weight_decay=0.0, betas=betas
         )
+        self.master_params: dict[str, mx.array] = {
+            name: value.astype(mx.float32) for name, value in param_flat.items()
+        }
+        self._master_loaded = False
 
     def set_lr(self, lr: float) -> None:
         self.learning_rate = lr
@@ -199,7 +271,14 @@ class MuonAdamWMLX:
 
     def update(self, model, grads) -> None:
         grad_flat = _flatten_arrays(grads)
-        param_flat = _flatten_arrays(model.parameters())
+        model_flat = _flatten_arrays(model.parameters())
+        # Gradients from a BF16 forward pass are promoted before any optimizer
+        # state or master-parameter arithmetic. This prevents Adam moments and
+        # Muon momentum from inheriting BF16's coarse mantissa.
+        grad_flat = {
+            name: value.astype(mx.float32) for name, value in grad_flat.items()
+        }
+        param_flat = self.master_params
         try:
             if self.grouped_muon:
                 updates, next_muon_state = self._prepare_muon_grouped(grad_flat, param_flat)
@@ -217,13 +296,35 @@ class MuonAdamWMLX:
         except Exception as exc:
             raise MuonPrecomputeError(f"Muon update preparation failed: {exc}") from exc
         if self.aux_decay_names:
-            decay_grads = _subset_tree_by_names(grads, set(self.aux_decay_names))
-            self.aux_decay.update(model, decay_grads)
+            decay_grads = {
+                name: grad_flat[name]
+                for name in self.aux_decay_names
+                if name in grad_flat
+            }
+            _apply_optimizer_to_master(self.aux_decay, self.master_params, decay_grads)
         if self.aux_nodecay_names:
-            nodecay_grads = _subset_tree_by_names(grads, set(self.aux_nodecay_names))
-            self.aux_nodecay.update(model, nodecay_grads)
+            nodecay_grads = {
+                name: grad_flat[name]
+                for name in self.aux_nodecay_names
+                if name in grad_flat
+            }
+            _apply_optimizer_to_master(
+                self.aux_nodecay, self.master_params, nodecay_grads
+            )
+        # Muon updates are already expressed in FP32 master space. Publish a
+        # cast view to the model for the next forward pass while retaining the
+        # higher-precision values for the next optimizer step.
         if updates:
-            model.update(tree_unflatten(list(updates.items())))
+            self.master_params.update(updates)
+        model.update(
+            tree_unflatten(
+                [
+                    (name, value.astype(model_flat[name].dtype))
+                    for name, value in self.master_params.items()
+                ]
+            )
+        )
+        self._master_loaded = True
         self.muon_state = next_muon_state
 
     def _prepare_muon(
@@ -361,18 +462,38 @@ class MuonAdamWMLX:
 
     def state_trees(self) -> dict:
         return {
+            "master": tree_unflatten(list(self.master_params.items())),
             "muon": tree_unflatten(list(self.muon_state.items())),
             "aux_decay": self.aux_decay.state,
             "aux_nodecay": self.aux_nodecay.state,
         }
 
     def load_state_trees(self, state: dict) -> None:
-        self.muon_state = _flatten_arrays(state.get("muon", {}))
-        self.aux_decay.state = state["aux_decay"]
-        self.aux_nodecay.state = state["aux_nodecay"]
+        master = state.get("master")
+        if master is not None:
+            self.master_params = {
+                name: value.astype(mx.float32)
+                for name, value in _flatten_arrays(master).items()
+            }
+            self._master_loaded = True
+        self.muon_state = {
+            name: value.astype(mx.float32)
+            for name, value in _flatten_arrays(state.get("muon", {})).items()
+        }
+        self.aux_decay.state = _cast_floating_tree(state["aux_decay"])
+        self.aux_nodecay.state = _cast_floating_tree(state["aux_nodecay"])
+
+    def sync_master_from_model(self, model) -> None:
+        if self._master_loaded:
+            return
+        self.master_params = {
+            name: value.astype(mx.float32)
+            for name, value in _flatten_arrays(model.parameters()).items()
+        }
 
     def eval_state(self) -> None:
         mx.eval(
+            self.master_params,
             tree_unflatten(list(self.muon_state.items())),
             self.aux_decay.state,
             self.aux_nodecay.state,

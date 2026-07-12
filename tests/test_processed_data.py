@@ -98,6 +98,29 @@ class ProcessedDataPublicationTests(unittest.TestCase):
             self.assertEqual(payload["train"]["tokens"], 3)
             self.assertEqual(payload["val"]["tokens"], 3)
 
+    def test_source_balanced_merge_keeps_each_source_in_train_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processed_dir = Path(tmpdir)
+            shard_paths = [processed_dir / "shard-0.npy"]
+            np.save(shard_paths[0], np.asarray([0, 1, 2, 3, 4, 5], dtype=np.uint16))
+            train_path = processed_dir / "train.npy"
+            val_path = processed_dir / "val.npy"
+
+            counts = prepare_data.merge_shards(
+                shard_paths,
+                train_path,
+                val_path,
+                train_fraction=0.5,
+                dtype=np.uint16,
+                source_runs=[("alpha", 0, 2), ("beta", 2, 4), ("alpha", 4, 6)],
+            )
+
+            self.assertEqual(counts, (3, 3))
+            # alpha contributes [0, 1] to train and [4, 5] to val; beta is
+            # split [2] / [3], despite alpha appearing in two stream runs.
+            np.testing.assert_array_equal(np.load(train_path), [0, 1, 2])
+            np.testing.assert_array_equal(np.load(val_path), [3, 4, 5])
+
 
 class DeterministicParallelStreamTests(unittest.TestCase):
     def test_parallel_stream_uses_order_preserving_pool_map(self):

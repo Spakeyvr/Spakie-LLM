@@ -717,6 +717,11 @@ def pretrain_mlx(
         model.load_weights(tree_flatten(resume_state["model"]), strict=True)
         if "optimizer" in resume_state:
             optimizer.load_state_trees(resume_state["optimizer"])
+        # Older checkpoints predate FP32 master parameters. In that case seed
+        # the new master copy from the restored runtime-dtype model exactly
+        # once; checkpoints that contain a master tree keep their precision.
+        if hasattr(optimizer, "sync_master_from_model"):
+            optimizer.sync_master_from_model(model)
         meta = resume_state["meta"]
         best_val_loss = float(meta.get("best_val_loss", best_val_loss))
         global_step = int(meta.get("step", 0))

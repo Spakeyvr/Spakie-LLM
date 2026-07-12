@@ -491,6 +491,34 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         for name, value in tree_flatten(model.parameters()):
             np.testing.assert_array_equal(np.array(value), before[name], err_msg=name)
 
+    def test_mlx_bfloat16_optimizer_keeps_fp32_master_updates(self):
+        import mlx.core as mx
+        from mlx.utils import tree_flatten, tree_map
+
+        from model.transformer_mlx import SpakieGPTMLX
+        from training.optimizers_mlx import configure_mlx_optimizer
+
+        config = self._tiny_config()
+        model = SpakieGPTMLX(config)
+        model.set_dtype(mx.bfloat16)
+        optimizer = configure_mlx_optimizer(
+            model,
+            config,
+            kind="muon",
+            learning_rate=1e-3,
+            weight_decay=0.1,
+        )
+        norm_name = "blocks.0.ln1.weight"
+        before = dict(tree_flatten(optimizer.state_trees()["master"]))[norm_name]
+        grads = tree_map(lambda value: mx.ones_like(value) * 1e-3, model.trainable_parameters())
+        optimizer.update(model, grads)
+        mx.eval(optimizer.state_trees(), model.parameters())
+        after = dict(tree_flatten(optimizer.state_trees()["master"]))[norm_name]
+
+        self.assertEqual(before.dtype, mx.float32)
+        self.assertEqual(after.dtype, mx.float32)
+        self.assertTrue(np.any(np.asarray(after) != np.asarray(before)))
+
     def test_mlx_atomic_checkpoint_failure_preserves_previous_generation(self):
         import os
         import mlx.core as mx
