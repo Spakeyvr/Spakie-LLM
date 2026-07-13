@@ -121,6 +121,64 @@ class ProcessedDataPublicationTests(unittest.TestCase):
             np.testing.assert_array_equal(np.load(train_path), [0, 1, 2])
             np.testing.assert_array_equal(np.load(val_path), [3, 4, 5])
 
+    def test_single_document_is_never_split_between_train_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processed_dir = Path(tmpdir)
+            shard = processed_dir / "shard-0.npy"
+            np.save(shard, np.arange(10, dtype=np.uint16))
+            train_path = processed_dir / "train.npy"
+            val_path = processed_dir / "val.npy"
+
+            with self.assertRaisesRegex(ValueError, "document-disjoint"):
+                prepare_data.merge_shards(
+                    [shard],
+                    train_path,
+                    val_path,
+                    train_fraction=0.6,
+                    dtype=np.uint16,
+                    source_runs=[("book", 0, 10)],
+                    source_document_ends={"book": [10]},
+                )
+
+    def test_provenance_validation_rejects_tokenizer_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processed_dir = Path(tmpdir)
+            train_path = processed_dir / "train.npy"
+            val_path = processed_dir / "val.npy"
+            np.save(train_path, np.asarray([1, 2], dtype=np.uint16))
+            np.save(val_path, np.asarray([3], dtype=np.uint16))
+            saved_tokenizer = {"vocab_size": 10, "sha256": "old"}
+            publish_processed_data_manifest(
+                train_path,
+                val_path,
+                train_tokens=2,
+                val_tokens=1,
+                dtype=np.uint16,
+                tokenizer=saved_tokenizer,
+                preparation={"schema_version": 1},
+                raw_inputs={"fingerprint": "raw"},
+                max_token_id=3,
+            )
+            with patch(
+                "runtime.processed_data.tokenizer_contract",
+                return_value={"vocab_size": 10, "sha256": "new"},
+            ):
+                ready, reason = validate_processed_data(
+                    processed_dir,
+                    tokenizer_path="tokenizer.model",
+                    require_provenance=True,
+                )
+            self.assertFalse(ready)
+            self.assertIn("different tokenizer", reason)
+
+    def test_token_shard_writer_rejects_out_of_vocab_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = prepare_data.TokenShardWriter(
+                Path(tmpdir), 8, np.uint16, vocab_size=10
+            )
+            with self.assertRaisesRegex(ValueError, "outside vocabulary"):
+                writer.add([2, 10])
+
 
 class DeterministicParallelStreamTests(unittest.TestCase):
     def test_parallel_stream_uses_order_preserving_pool_map(self):

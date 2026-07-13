@@ -18,8 +18,10 @@ from runtime.checkpoint_io import (
     config_from_checkpoint_payload,
     discard_training_state,
     load_mlx_checkpoint_config,
+    load_mlx_checkpoint_meta,
     load_mlx_model_weights_strict,
     load_torch_checkpoint,
+    validate_checkpoint_tokenizer,
 )
 from training.muon_core import (
     MUON_ADJUST_LR_CHOICES,
@@ -328,6 +330,12 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
         )
     elif not args.allow_legacy_config:
         raise ValueError("checkpoint has no full config; use --allow-legacy-config only for a verified legacy file")
+    validate_checkpoint_tokenizer(
+        ckpt,
+        config.tokenizer_prefix + ".model",
+        source=ckpt_path,
+        allow_unverified=args.allow_unverified_tokenizer,
+    )
     discard_training_state(ckpt)
     apply_sft_cli_overrides(config, args)
     config.checkpoint_dir = output_checkpoint_dir
@@ -442,6 +450,12 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     else:
         config = inherit_attention_shape_from_tensors(config, model_flat)
         config = inherit_mlp_shape_from_tensors(config, model_flat)
+    validate_checkpoint_tokenizer(
+        load_mlx_checkpoint_meta(ckpt_path),
+        config.tokenizer_prefix + ".model",
+        source=ckpt_path,
+        allow_unverified=args.allow_unverified_tokenizer,
+    )
     apply_sft_cli_overrides(config, args)
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPTMLX(config)
@@ -515,6 +529,8 @@ def main():
                         help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint")
     parser.add_argument("--allow-legacy-config", action="store_true",
                         help="Allow shape guessing for verified legacy checkpoints without full config metadata")
+    parser.add_argument("--allow-unverified-tokenizer", action="store_true",
+                        help="Allow a legacy checkpoint without tokenizer identity metadata")
     parser.add_argument("--list-models", action="store_true",
                         help="List available source checkpoints and exit")
     parser.add_argument("--no-model-prompt", action="store_true",

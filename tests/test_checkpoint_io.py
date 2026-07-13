@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -23,6 +24,8 @@ from runtime.checkpoint_io import (
     load_mlx_checkpoint_config,
     load_mlx_model_weights_strict,
     load_torch_checkpoint,
+    validate_checkpoint_processed_data,
+    validate_checkpoint_tokenizer,
 )
 from scripts.train import check_resume_optimizer, resume_sampler_mismatches
 from scripts.run_pipeline import default_pretrain_checkpoint
@@ -307,6 +310,41 @@ class CheckpointIOTests(unittest.TestCase):
             state, "muon", backend="mlx", reset_optimizer=True
         )
         self.assertNotIn("optimizer", state)
+
+    def test_checkpoint_tokenizer_contract_must_match(self):
+        saved = {"sha256": "expected", "vocab_size": 16}
+        with patch(
+            "runtime.checkpoint_io.tokenizer_contract",
+            return_value={"sha256": "different", "vocab_size": 16},
+        ):
+            with self.assertRaisesRegex(ValueError, "different tokenizer"):
+                validate_checkpoint_tokenizer(
+                    {"tokenizer": saved}, "tokenizer.model", source="model.pt"
+                )
+
+    def test_legacy_checkpoint_requires_explicit_tokenizer_opt_in(self):
+        with self.assertRaisesRegex(ValueError, "no tokenizer provenance"):
+            validate_checkpoint_tokenizer(
+                {}, "tokenizer.model", source="legacy.pt"
+            )
+        validate_checkpoint_tokenizer(
+            {},
+            "tokenizer.model",
+            source="legacy.pt",
+            allow_unverified=True,
+        )
+
+    def test_resume_rejects_different_processed_generation(self):
+        with patch(
+            "runtime.checkpoint_io.processed_manifest_sha256",
+            return_value="current",
+        ):
+            with self.assertRaisesRegex(ValueError, "different processed-data"):
+                validate_checkpoint_processed_data(
+                    {"processed_data_manifest_sha256": "old"},
+                    "processed",
+                    source="resume.pt",
+                )
 
 
 if __name__ == "__main__":

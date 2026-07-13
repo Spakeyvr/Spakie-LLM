@@ -132,7 +132,10 @@ def _example_signature(example: dict) -> str:
         role = msg.get("role", "")
         if role == "system":
             continue
-        content = " ".join(str(msg.get("content", "")).lower().split())
+        if role == "assistant" and msg.get("train", True) is not False:
+            content = "<supervised-target>"
+        else:
+            content = " ".join(str(msg.get("content", "")).lower().split())
         parts.append((role, content))
     return json.dumps(parts, ensure_ascii=False, sort_keys=True)
 

@@ -17,6 +17,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer_mlx import SpakieGPTMLX
+from runtime.checkpoint_io import checkpoint_tokenizer_contract
 from runtime.mlx_backend import (
     MLXRuntimeSettings,
     clip_grads,
@@ -68,6 +69,7 @@ def _save_sft_checkpoint(
     meta = dict(meta)
     meta["config_schema_version"] = CHECKPOINT_CONFIG_SCHEMA_VERSION
     meta["config"] = config_to_dict(config)
+    meta["tokenizer"] = checkpoint_tokenizer_contract(config)
     save_safetensors_checkpoint(base_path, flat, meta)
 
 
@@ -240,8 +242,9 @@ def finetune_mlx(
     loss_log_path: str | None = None,
     allow_adamw_fallback: bool = False,
 ) -> float:
-    if runtime.dtype != mx.float32:
-        model.set_dtype(runtime.dtype)
+    # The caller may have loaded BF16 checkpoint arrays. Explicit FP32 must
+    # cast those weights too, so always apply the resolved runtime dtype.
+    model.set_dtype(runtime.dtype)
     model.train()
 
     optimizer = configure_mlx_optimizer(

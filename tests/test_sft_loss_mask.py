@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from training.dataset import ChatSFTDataset
-from training.dataset_mlx import ChatSFTDatasetMLX
+from training.dataset import ChatSFTDataset, train_val_split
+from training.dataset_mlx import ChatSFTDatasetMLX, train_val_split_mlx
 
 
 class FakeTokenizer:
@@ -80,6 +80,37 @@ class SFTLossMaskTests(unittest.TestCase):
 
     def test_mlx_dataset_defaults_to_all_assistant_turns(self):
         self._assert_ordinary_assistant_turns_remain_supervised(ChatSFTDatasetMLX)
+
+    def test_same_prompt_with_different_targets_stays_in_one_split(self):
+        class RawDataset:
+            examples = [
+                {"messages": [
+                    {"role": "user", "content": "Explain gravity"},
+                    {"role": "assistant", "content": "Answer A"},
+                ]},
+                {"messages": [
+                    {"role": "user", "content": "Explain gravity"},
+                    {"role": "assistant", "content": "Answer B"},
+                ]},
+                {"messages": [
+                    {"role": "user", "content": "Explain photosynthesis"},
+                    {"role": "assistant", "content": "Answer C"},
+                ]},
+            ]
+
+            def __len__(self):
+                return len(self.examples)
+
+            def __getitem__(self, index):
+                return self.examples[index]
+
+        dataset = RawDataset()
+        torch_train, torch_val = train_val_split(dataset, val_fraction=0.34, seed=1)
+        mlx_train, mlx_val = train_val_split_mlx(dataset, val_fraction=0.34, seed=1)
+        self.assertEqual(0 in torch_train.indices, 1 in torch_train.indices)
+        self.assertEqual(0 in torch_val.indices, 1 in torch_val.indices)
+        self.assertEqual(0 in mlx_train, 1 in mlx_train)
+        self.assertEqual(0 in mlx_val, 1 in mlx_val)
 
 
 if __name__ == "__main__":

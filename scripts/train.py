@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from configs.default import (
@@ -16,9 +17,13 @@ from runtime.checkpoint_io import (
     config_from_checkpoint_payload,
     load_mlx_checkpoint_config,
     load_torch_checkpoint,
+    validate_checkpoint_processed_data,
+    validate_checkpoint_tokenizer,
 )
+from runtime.processed_data import validate_processed_data
 from training.muon_core import (
     MUON_ADJUST_LR_CHOICES,
+    MUON_OPTIMIZER_SCHEMA_VERSION,
     OPTIMIZER_CHOICES,
     adamw_fallback_warning,
 )
@@ -73,10 +78,14 @@ def check_resume_optimizer(resume_state, requested: str, *, backend: str, reset_
             "eps": requested_config.muon_eps,
             "adjust_lr_fn": requested_config.muon_adjust_lr_fn,
             "qkv_split": requested_config.muon_qkv_split,
+            "optimizer_schema_version": MUON_OPTIMIZER_SCHEMA_VERSION,
         } if requested_config is not None else saved_hparams
         mismatches = [
             key for key, value in expected.items()
-            if key in saved_hparams and saved_hparams[key] != value
+            if saved_hparams.get(
+                key,
+                1 if key == "optimizer_schema_version" else value,
+            ) != value
         ]
         if not mismatches:
             return
@@ -106,6 +115,27 @@ def print_optimizer_banner(kind: str, *, stage: str) -> None:
         print(adamw_fallback_warning(stage))
     else:
         print("Optimizer: Muon (required default)")
+
+
+def require_processed_data(config, args) -> None:
+    """Require data produced by the current tokenizer and preparation contract."""
+    if args.unsafe_skip_data_validation:
+        print(
+            "WARNING: processed-data provenance validation is disabled; "
+            "tokenizer/data mismatches can corrupt training."
+        )
+        return
+    ready, reason = validate_processed_data(
+        Path(config.processed_data_dir),
+        tokenizer_path=Path(config.tokenizer_prefix + ".model"),
+        require_provenance=True,
+    )
+    if not ready:
+        raise RuntimeError(
+            f"Processed pretraining data is not safe to use: {reason}. "
+            "Re-run scripts/prepare_data.py, or use "
+            "--unsafe-skip-data-validation only for a deliberate diagnostic run."
+        )
 
 
 def resume_sampler_mismatches(
@@ -244,6 +274,12 @@ def run_torch_pretrain(args, config):
                 "only after verifying its original training settings."
             )
         apply_pretrain_cli_overrides(config, args)
+        validate_checkpoint_tokenizer(
+            resume_state,
+            config.tokenizer_prefix + ".model",
+            source=resume_path,
+            allow_unverified=args.allow_unverified_tokenizer,
+        )
         resume_state["_requested_config"] = config
         check_resume_optimizer(
             resume_state,
@@ -274,6 +310,15 @@ def run_torch_pretrain(args, config):
 
     if not resume_state:
         apply_pretrain_cli_overrides(config, args)
+
+    require_processed_data(config, args)
+    if resume_state:
+        validate_checkpoint_processed_data(
+            resume_state,
+            config.processed_data_dir,
+            source=resume_path,
+            allow_unverified=args.unsafe_skip_data_validation,
+        )
 
     runtime = resolve_runtime_settings(args.device, args.precision)
     device = runtime.device
@@ -381,6 +426,12 @@ def run_mlx_pretrain(args, config):
         if args.reset_best_loss:
             resume_state.setdefault("meta", {})["best_val_loss"] = float("inf")
         apply_pretrain_cli_overrides(config, args)
+        validate_checkpoint_tokenizer(
+            resume_state.get("meta", {}),
+            config.tokenizer_prefix + ".model",
+            source=resume_path,
+            allow_unverified=args.allow_unverified_tokenizer,
+        )
         resume_state["_requested_config"] = config
         check_resume_optimizer(
             resume_state,
@@ -412,6 +463,15 @@ def run_mlx_pretrain(args, config):
 
     if not resume_state:
         apply_pretrain_cli_overrides(config, args)
+
+    require_processed_data(config, args)
+    if resume_state:
+        validate_checkpoint_processed_data(
+            resume_state.get("meta", {}),
+            config.processed_data_dir,
+            source=resume_path,
+            allow_unverified=args.unsafe_skip_data_validation,
+        )
 
     # Resume restoration can change the NS transform and other Muon settings;
     # verify the configuration that will actually train, not the CLI preset.
@@ -602,6 +662,16 @@ def main():
         "--allow-legacy-config",
         action="store_true",
         help="Allow inexact shape-only recovery from a checkpoint without full config metadata",
+    )
+    parser.add_argument(
+        "--allow-unverified-tokenizer",
+        action="store_true",
+        help="Allow a legacy checkpoint without tokenizer identity metadata",
+    )
+    parser.add_argument(
+        "--unsafe-skip-data-validation",
+        action="store_true",
+        help="Skip processed-data provenance checks (unsafe; diagnostic use only)",
     )
     parser.add_argument(
         "--reset-sampler",

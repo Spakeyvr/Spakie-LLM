@@ -14,7 +14,7 @@ from training.muon_core import (
     MuonSettings,
     adjusted_muon_lr,
     is_muon_parameter_name,
-    is_qkv_parameter_name,
+    muon_projection_split_count,
     muon_settings_from_config,
     normalize_optimizer_kind,
 )
@@ -147,8 +147,9 @@ class MuonAdamW:
             self.state.setdefault(param, {})["momentum_buffer"] = next_momentum
 
     def _update_chunks(self, name: str, update: torch.Tensor):
-        if self.settings.qkv_split and is_qkv_parameter_name(name) and update.shape[0] % 3 == 0:
-            chunk_size = update.shape[0] // 3
+        split_count = muon_projection_split_count(name) if self.settings.qkv_split else 1
+        if split_count > 1 and update.shape[0] % split_count == 0:
+            chunk_size = update.shape[0] // split_count
             for start in range(0, update.shape[0], chunk_size):
                 yield start, update.narrow(0, start, chunk_size)
             return

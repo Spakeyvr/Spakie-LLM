@@ -12,6 +12,7 @@ from configs.default import (
     SpakieConfig,
     config_from_dict,
 )
+from runtime.processed_data import processed_manifest_sha256, tokenizer_contract
 
 
 class UnsafeCheckpointError(RuntimeError):
@@ -77,8 +78,92 @@ def load_torch_checkpoint(
 
 def discard_training_state(checkpoint: dict) -> None:
     """Release state that inference and fresh SFT runs never consume."""
-    for key in ("optimizer", "train_sampler", "rng_state", "scaler"):
+    for key in (
+        "optimizer", "train_sampler", "rng_state", "scaler",
+        "processed_data_manifest_sha256",
+    ):
         checkpoint.pop(key, None)
+
+
+def checkpoint_tokenizer_contract(config: SpakieConfig) -> dict | None:
+    path = config.tokenizer_prefix + ".model"
+    if not os.path.exists(path):
+        return None
+    return tokenizer_contract(path)
+
+
+def checkpoint_processed_data_fingerprint(config: SpakieConfig) -> str | None:
+    try:
+        return processed_manifest_sha256(config.processed_data_dir)
+    except FileNotFoundError:
+        return None
+
+
+def validate_checkpoint_tokenizer(
+    metadata: dict | None,
+    tokenizer_path: str,
+    *,
+    source: str,
+    allow_unverified: bool = False,
+) -> None:
+    saved = metadata.get("tokenizer") if isinstance(metadata, dict) else None
+    if not isinstance(saved, dict):
+        if allow_unverified:
+            print(f"WARNING: checkpoint '{source}' has no tokenizer provenance")
+            return
+        raise ValueError(
+            f"Checkpoint '{source}' has no tokenizer provenance. Pass "
+            "--allow-unverified-tokenizer only after verifying the tokenizer manually."
+        )
+    current = tokenizer_contract(tokenizer_path)
+    if current != saved:
+        if allow_unverified:
+            print(
+                f"WARNING: checkpoint '{source}' tokenizer contract does not match "
+                f"{tokenizer_path}"
+            )
+            return
+        raise ValueError(
+            f"Checkpoint '{source}' was created with a different tokenizer contract."
+        )
+
+
+def validate_checkpoint_processed_data(
+    metadata: dict | None,
+    processed_dir: str,
+    *,
+    source: str,
+    allow_unverified: bool = False,
+) -> None:
+    saved = (
+        metadata.get("processed_data_manifest_sha256")
+        if isinstance(metadata, dict)
+        else None
+    )
+    try:
+        current = processed_manifest_sha256(processed_dir)
+    except FileNotFoundError as exc:
+        if allow_unverified:
+            print(f"WARNING: processed data for checkpoint '{source}' has no manifest")
+            return
+        raise ValueError(
+            f"Processed data for checkpoint '{source}' has no completion manifest."
+        ) from exc
+    if not isinstance(saved, str) or not saved:
+        if allow_unverified:
+            print(f"WARNING: checkpoint '{source}' has no processed-data fingerprint")
+            return
+        raise ValueError(
+            f"Checkpoint '{source}' has no processed-data generation fingerprint. "
+            "Pass --unsafe-skip-data-validation only after verifying the data manually."
+        )
+    if saved != current:
+        if allow_unverified:
+            print(f"WARNING: checkpoint '{source}' used a different data generation")
+            return
+        raise ValueError(
+            f"Checkpoint '{source}' was created from a different processed-data generation."
+        )
 
 
 def load_mlx_checkpoint_meta(path: str) -> dict | None:

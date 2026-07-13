@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -18,6 +19,7 @@ SPECIAL_TOKENS = ["<|user|>", "<|assistant|>", "<|system|>", "<|json|>"]
 SUPPORTED_EXTENSIONS = (".md", ".txt", ".jsonl")
 # Field names tried in order when extracting text from JSONL records.
 _JSONL_TEXT_KEYS = ("text", "content", "input", "instruction", "output")
+TOKENIZER_MAX_SENTENCE_BYTES = 4096
 
 
 def _extract_jsonl_text(payload: dict) -> str:
@@ -53,6 +55,54 @@ def _iter_path_texts(paths: list[Path]) -> Iterator[str]:
             continue
 
 
+def iter_sentencepiece_chunks(
+    text: str, *, max_bytes: int = TOKENIZER_MAX_SENTENCE_BYTES
+) -> Iterator[str]:
+    """Yield non-empty one-line samples that fit SentencePiece's byte limit."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    # Paragraph boundaries preserve useful local context. Whitespace inside a
+    # sample is normalized because SentencePiece consumes one sentence per line.
+    for paragraph in re.split(r"\n\s*\n", text):
+        words = paragraph.split()
+        if not words:
+            continue
+        current: list[str] = []
+        current_bytes = 0
+        for word in words:
+            encoded = word.encode("utf-8")
+            separator = 1 if current else 0
+            if current and current_bytes + separator + len(encoded) > max_bytes:
+                yield " ".join(current)
+                current = []
+                current_bytes = 0
+                separator = 0
+            if len(encoded) > max_bytes:
+                if current:
+                    yield " ".join(current)
+                    current = []
+                    current_bytes = 0
+                raw = encoded
+                while raw:
+                    cut = min(max_bytes, len(raw))
+                    while cut > 0:
+                        try:
+                            piece = raw[:cut].decode("utf-8")
+                            break
+                        except UnicodeDecodeError:
+                            cut -= 1
+                    if cut == 0:
+                        break
+                    if piece:
+                        yield piece
+                    raw = raw[cut:]
+                continue
+            current.append(word)
+            current_bytes += separator + len(encoded)
+        if current:
+            yield " ".join(current)
+
+
 def _source_name(root: Path, path: Path) -> str:
     parts = path.relative_to(root).parts
     if len(parts) >= 3 and parts[0] == "large_corpus":
@@ -75,7 +125,11 @@ def iter_training_texts(raw_root: str):
             continue
         grouped.setdefault(_source_name(root, path), []).append(path)
 
-    active = deque(_iter_path_texts(grouped[source]) for source in sorted(grouped))
+    def source_chunks(source: str) -> Iterator[str]:
+        for text in _iter_path_texts(grouped[source]):
+            yield from iter_sentencepiece_chunks(text)
+
+    active = deque(source_chunks(source) for source in sorted(grouped))
     while active:
         iterator = active.popleft()
         try:
@@ -90,15 +144,15 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
 
     Args:
         config: SpakieConfig. Uses defaults if None.
-        max_sentences: Cap on sentences written to the training file. Prevents
+        max_sentences: Cap on bounded samples written to the training file. Prevents
                        multi-GB temp files when training on large corpora.
     """
     config = config or SpakieConfig()
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
         count = 0
-        for text in iter_training_texts(config.raw_data_dir):
-            tmp.write(text.replace("\n", " "))
+        for sentence in iter_training_texts(config.raw_data_dir):
+            tmp.write(sentence)
             tmp.write("\n")
             count += 1
             if count >= max_sentences:
@@ -126,6 +180,7 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
             add_dummy_prefix=False,   # no leading-space artifact on first token
             split_digits=True,        # each digit is its own token (better for arithmetic)
             character_coverage=0.9999,
+            max_sentence_length=TOKENIZER_MAX_SENTENCE_BYTES,
             num_threads=os.cpu_count(),
         )
     finally:

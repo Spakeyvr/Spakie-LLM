@@ -20,6 +20,32 @@ import tokenizer.train_tokenizer as train_tokenizer
 
 
 class CompactResumeIndexTests(unittest.TestCase):
+    def test_download_progress_uses_compact_rate_and_readable_eta(self):
+        self.assertEqual(
+            download_pretrain_corpus.AcceptedRateMonitor._format_rate(4_410_000),
+            "4.41M",
+        )
+        self.assertEqual(
+            download_pretrain_corpus.AcceptedRateMonitor._format_duration(4_980),
+            "1h 23min",
+        )
+        self.assertEqual(
+            download_pretrain_corpus.AcceptedRateMonitor._format_duration(185),
+            "3min 5s",
+        )
+
+    def test_interrupt_exit_flushes_then_terminates_without_thread_shutdown_wait(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(download_pretrain_corpus.sys, "stdout", stdout),
+            patch.object(download_pretrain_corpus.sys, "stderr", stderr),
+            patch.object(download_pretrain_corpus.os, "_exit") as hard_exit,
+        ):
+            download_pretrain_corpus.exit_process(130)
+
+        hard_exit.assert_called_once_with(130)
+
     def test_ctrl_c_returns_without_waiting_for_blocked_source_worker(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = SpakieConfig(
@@ -578,6 +604,58 @@ class TokenizerSamplingTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first, ["early-0", "late-0", "early-1", "late-1", "early-2", "late-2"])
 
+    def test_sentencepiece_chunks_never_exceed_byte_limit(self):
+        text = ("alpha beta gamma delta " * 20) + ("é" * 30)
+        chunks = list(train_tokenizer.iter_sentencepiece_chunks(text, max_bytes=40))
+        self.assertTrue(chunks)
+        self.assertTrue(all(len(chunk.encode("utf-8")) <= 40 for chunk in chunks))
+        self.assertIn("é", "".join(chunks))
+
+
+class PretrainCleaningTests(unittest.TestCase):
+    def test_code_normalization_preserves_indentation(self):
+        text = "def outer():\r\n    if True:\r\n        return 1   \r\n"
+        cleaned = download_pretrain_corpus.normalize_text(
+            text, preserve_indentation=True
+        )
+        self.assertEqual(cleaned, "def outer():\n    if True:\n        return 1")
+
+    def test_structured_cleaning_preserves_math_code_and_indexing(self):
+        text = "  def f(x):\n    return values[1] if x < y else values[2]  "
+        cleaned = prepare_data.clean_text(text, "python_edu")
+        self.assertIn("    return values[1]", cleaned)
+        self.assertIn("x < y", cleaned)
+
+    def test_wikipedia_cleaning_removes_known_markup_and_citations(self):
+        cleaned = prepare_data.clean_text(
+            "<p>A fact [12]</p> followed by x < y.", "wikipedia_snapshot"
+        )
+        self.assertEqual(cleaned, "A fact followed by x < y.")
+
+    def test_minhash_result_is_independent_of_block_size(self):
+        text = " ".join(f"word{i % 97}" for i in range(20_000))
+        with patch.object(prepare_data, "_MINHASH_BLOCK", 31):
+            small = prepare_data.compute_minhash_signature(
+                text, num_perm=32, shingle_size=5
+            )
+        with patch.object(prepare_data, "_MINHASH_BLOCK", 4096):
+            large = prepare_data.compute_minhash_signature(
+                text, num_perm=32, shingle_size=5
+            )
+        self.assertEqual(small.tolist(), large.tolist())
+
+    def test_python_edu_titles_are_namespaced_by_repository(self):
+        variant = download_pretrain_corpus.HF_DATASETS["python_edu"]["variants"][0]
+        row = {
+            "repo_name": "owner/repo",
+            "path": "src/main.py",
+            "text": "print('hello')",
+        }
+        formatted = download_pretrain_corpus.format_hf_record(
+            "python_edu", row, variant
+        )
+        self.assertEqual(formatted["title"], "owner/repo:src/main.py")
+
 
 class CanonicalLanguageFilterTests(unittest.TestCase):
     def test_prepare_data_filters_long_non_english_document(self):
@@ -601,6 +679,8 @@ class CanonicalLanguageFilterTests(unittest.TestCase):
             (raw / "docs.jsonl").write_text(
                 json.dumps({"text": "KEEP " + "ordinary prose " * 40})
                 + "\n"
+                + json.dumps({"text": "KEEP " + "different english text " * 35})
+                + "\n"
                 + json.dumps({"text": "DROP " + "foreign prose " * 40})
                 + "\n",
                 encoding="utf-8",
@@ -612,7 +692,7 @@ class CanonicalLanguageFilterTests(unittest.TestCase):
                 token_shard_dir=str(root / "processed" / "shards"),
                 tokenizer_prefix=str(root / "tokenizer"),
                 token_shard_size=100,
-                target_train_tokens=10,
+                target_train_tokens=500,
                 min_doc_chars=1,
                 source_min_doc_chars={"fineweb-edu": 1},
                 corpus_source_plan={
@@ -626,6 +706,11 @@ class CanonicalLanguageFilterTests(unittest.TestCase):
             )
             with (
                 patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer),
+                patch.object(
+                    prepare_data,
+                    "tokenizer_contract",
+                    return_value={"sha256": "fake", "vocab_size": 8192},
+                ),
                 patch.object(prepare_data, "should_keep_document", return_value=(True, "")),
                 patch.object(
                     prepare_data,
@@ -642,7 +727,7 @@ class CanonicalLanguageFilterTests(unittest.TestCase):
                 )
 
         stats = report["source_stats"]["fineweb-edu"]
-        self.assertEqual(stats["documents_kept"], 1)
+        self.assertEqual(stats["documents_kept"], 2)
         self.assertEqual(stats["drop_reasons"]["non_english"], 1)
 
 

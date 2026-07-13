@@ -12,7 +12,7 @@ from training.muon_core import (
     MuonSettings,
     adjusted_muon_lr,
     is_muon_parameter_name,
-    is_qkv_parameter_name,
+    muon_projection_split_count,
     muon_settings_from_config,
     normalize_optimizer_kind,
 )
@@ -117,10 +117,12 @@ class DualAdamW:
     def __init__(self, learning_rate: float, weight_decay: float, betas: tuple[float, float]):
         self._weight_decay = weight_decay
         self.decay = optim.AdamW(
-            learning_rate=learning_rate, weight_decay=weight_decay, betas=betas
+            learning_rate=learning_rate, weight_decay=weight_decay, betas=betas,
+            bias_correction=True,
         )
         self.nodecay = optim.AdamW(
-            learning_rate=learning_rate, weight_decay=0.0, betas=betas
+            learning_rate=learning_rate, weight_decay=0.0, betas=betas,
+            bias_correction=True,
         )
         self.master_params: dict[str, mx.array] = {}
         self._master_loaded = False
@@ -254,10 +256,12 @@ class MuonAdamWMLX:
             name for name, param in param_flat.items() if name not in self.muon_names and len(param.shape) < 2
         ]
         self.aux_decay = optim.AdamW(
-            learning_rate=learning_rate, weight_decay=weight_decay, betas=betas
+            learning_rate=learning_rate, weight_decay=weight_decay, betas=betas,
+            bias_correction=True,
         )
         self.aux_nodecay = optim.AdamW(
-            learning_rate=learning_rate, weight_decay=0.0, betas=betas
+            learning_rate=learning_rate, weight_decay=0.0, betas=betas,
+            bias_correction=True,
         )
         self.master_params: dict[str, mx.array] = {
             name: value.astype(mx.float32) for name, value in param_flat.items()
@@ -373,8 +377,9 @@ class MuonAdamWMLX:
                 next_param = next_param * (1.0 - self.learning_rate * self.weight_decay)
             bases[name] = next_param
 
-            if self.settings.qkv_split and is_qkv_parameter_name(name) and update.shape[0] % 3 == 0:
-                for chunk_idx, chunk in enumerate(mx.split(update, 3, axis=0)):
+            split_count = muon_projection_split_count(name) if self.settings.qkv_split else 1
+            if split_count > 1 and update.shape[0] % split_count == 0:
+                for chunk_idx, chunk in enumerate(mx.split(update, split_count, axis=0)):
                     lr = adjusted_muon_lr(
                         self.learning_rate, tuple(chunk.shape), self.settings.adjust_lr_fn
                     )
@@ -388,7 +393,7 @@ class MuonAdamWMLX:
                 grouped.setdefault(key, []).append((name, None, update, param.dtype))
 
         updates: dict[str, mx.array] = {}
-        qkv_updates: dict[str, list[mx.array | None]] = {}
+        split_updates: dict[str, list[mx.array | None]] = {}
         for (_, _, lr), records in grouped.items():
             stacked = mx.stack([record[2] for record in records])
             orthogonal = self._newton_schulz_stacked(stacked)
@@ -397,20 +402,22 @@ class MuonAdamWMLX:
                 if chunk_idx is None:
                     updates[name] = bases[name] - update_piece
                 else:
-                    pieces = qkv_updates.setdefault(name, [None, None, None])
+                    piece_count = muon_projection_split_count(name)
+                    pieces = split_updates.setdefault(name, [None] * piece_count)
                     pieces[chunk_idx] = update_piece
 
-        for name, pieces in qkv_updates.items():
+        for name, pieces in split_updates.items():
             if any(piece is None for piece in pieces):
-                raise RuntimeError(f"incomplete grouped qkv update for {name}")
+                raise RuntimeError(f"incomplete grouped projection update for {name}")
             updates[name] = bases[name] - mx.concatenate(pieces, axis=0)
 
         return updates, next_muon_state
 
     def _orthogonal_update(self, name: str, update: mx.array, dtype) -> mx.array:
-        if self.settings.qkv_split and is_qkv_parameter_name(name) and update.shape[0] % 3 == 0:
+        split_count = muon_projection_split_count(name) if self.settings.qkv_split else 1
+        if split_count > 1 and update.shape[0] % split_count == 0:
             pieces = []
-            for chunk in mx.split(update, 3, axis=0):
+            for chunk in mx.split(update, split_count, axis=0):
                 orthogonal = self._newton_schulz(chunk).astype(dtype)
                 chunk_lr = adjusted_muon_lr(
                     self.learning_rate, tuple(chunk.shape), self.settings.adjust_lr_fn

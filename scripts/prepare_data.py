@@ -18,8 +18,11 @@ import os
 import queue
 import re
 import shutil
+import struct
 import tempfile
 import threading
+from array import array
+from collections import deque
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +39,8 @@ from runtime.langid import is_probably_english
 from runtime.processed_data import (
     invalidate_processed_data,
     publish_processed_data_manifest,
+    stable_payload_sha256,
+    tokenizer_contract,
 )
 from tokenizer.train_tokenizer import SpakieTokenizer
 
@@ -46,6 +51,10 @@ IGNORED_PATTERNS = ("seen_", ".manifest.")
 DEFAULT_TOKENIZE_BATCH_SIZE = 512
 DEFAULT_TOKENIZE_BATCH_CHARS = 8_000_000
 MAX_RECOMMENDED_TOKENIZER_THREADS = 16
+SHARD_RUN_MANIFEST = "shard_run_manifest.json"
+SHARD_RESUME_JOURNAL = "accepted_documents.bin"
+PREPARATION_SCHEMA_VERSION = 3
+_JOURNAL_HEADER = struct.Struct("<HIIQH")
 
 
 @dataclass
@@ -66,6 +75,64 @@ class PendingTokenization:
     signature: np.ndarray | None = None
 
 
+@dataclass(frozen=True)
+class AcceptedDocument:
+    source: str
+    token_count: int
+    char_count: int
+    exact_hash: int
+    band_keys: tuple[int, ...]
+
+
+def append_accepted_document(handle, record: AcceptedDocument) -> None:
+    source = record.source.encode("utf-8")
+    if len(source) > 65_535:
+        raise ValueError("Corpus source name is too long for the resume journal")
+    handle.write(
+        _JOURNAL_HEADER.pack(
+            len(source),
+            record.token_count,
+            record.char_count,
+            record.exact_hash,
+            len(record.band_keys),
+        )
+    )
+    handle.write(source)
+    if record.band_keys:
+        handle.write(struct.pack(f"<{len(record.band_keys)}Q", *record.band_keys))
+
+
+def iter_accepted_documents(path: Path) -> Iterator[AcceptedDocument]:
+    if not path.exists():
+        return
+    with path.open("rb") as handle:
+        while True:
+            header = handle.read(_JOURNAL_HEADER.size)
+            if not header:
+                return
+            if len(header) != _JOURNAL_HEADER.size:
+                raise RuntimeError(f"Truncated resume journal header in {path}")
+            source_len, token_count, char_count, exact_hash, band_count = (
+                _JOURNAL_HEADER.unpack(header)
+            )
+            payload = handle.read(source_len + band_count * 8)
+            if len(payload) != source_len + band_count * 8:
+                raise RuntimeError(f"Truncated resume journal record in {path}")
+            source = payload[:source_len].decode("utf-8")
+            band_keys = (
+                struct.unpack(f"<{band_count}Q", payload[source_len:])
+                if band_count
+                else ()
+            )
+            yield AcceptedDocument(
+                source=source,
+                token_count=int(token_count),
+                char_count=int(char_count),
+                exact_hash=int(exact_hash),
+                band_keys=tuple(int(value) for value in band_keys),
+            )
+
+
 # Lines that are pure navigation chrome — matched whole-line, case-insensitive.
 # Kept narrow and literal to avoid stripping legitimate content.
 _NAV_LINE_RE = re.compile(
@@ -83,10 +150,22 @@ _NAV_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Wikipedia/citation residue: [edit], [1], [42], [citation needed], [note 3], [nb 2].
-# Constrained to short bracketed tokens so we don't strip URLs or date stamps.
+# Wikipedia/citation residue. Numeric references are removed only for sources
+# known to be prose; globally deleting ``[1]`` corrupts code indexing and math.
 _CITATION_RE = re.compile(
     r"\[(?:edit|citation needed|note\s+\d+|nb\s+\d+|\d{1,3})\]",
+    re.IGNORECASE,
+)
+
+_CITATION_SOURCES = frozenset({"wikipedia", "wikipedia_snapshot"})
+_STRUCTURED_TEXT_SOURCES = frozenset({"python_edu", "openwebmath", "finemath", "arxiv"})
+_WEB_RESIDUE_SOURCES = frozenset(
+    {"wikipedia", "wikipedia_snapshot", "fineweb", "fineweb-edu"}
+)
+_KNOWN_HTML_TAG_RE = re.compile(
+    r"</?(?:a|article|aside|blockquote|body|br|code|div|em|footer|h[1-6]|head|"
+    r"header|html|i|li|main|nav|ol|p|pre|section|span|strong|table|tbody|td|"
+    r"th|thead|title|tr|ul)(?:\s+[^<>\n]*)?/?>",
     re.IGNORECASE,
 )
 
@@ -105,32 +184,39 @@ _JS_CSS_LINE_RE = re.compile(
 )
 
 
-def clean_text(text: str) -> str:
-    text = re.sub(r"<[^>]+>", "", text)
-    text = _CITATION_RE.sub("", text)
+def clean_text(text: str, source: str = "") -> str:
+    """Clean extracted prose without rewriting code or mathematical syntax."""
+    text = _KNOWN_HTML_TAG_RE.sub("", text)
+    if source in _CITATION_SOURCES:
+        text = _CITATION_RE.sub("", text)
     text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
+    if source in _STRUCTURED_TEXT_SOURCES:
+        text = "\n".join(line.rstrip(" \t") for line in text.split("\n"))
+    else:
+        text = re.sub(r"[ \t]+", " ", text)
     lines = [
         ln for ln in text.splitlines()
-        if not _NAV_LINE_RE.match(ln) and not _JS_CSS_LINE_RE.match(ln)
+        if not _NAV_LINE_RE.match(ln)
+        and not (source in _WEB_RESIDUE_SOURCES and _JS_CSS_LINE_RE.match(ln))
     ]
     text = "\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return text.strip("\n") if source in _STRUCTURED_TEXT_SOURCES else text.strip()
 
 
 _SHINGLE_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def _iter_shingles(text: str, n: int):
-    words = _SHINGLE_WORD_RE.findall(text.lower())
-    if not words:
-        return
-    if len(words) < n:
-        yield " ".join(words)
-        return
-    for i in range(len(words) - n + 1):
-        yield " ".join(words[i:i + n])
+    window: deque[str] = deque(maxlen=max(1, n))
+    yielded = False
+    for match in _SHINGLE_WORD_RE.finditer(text):
+        window.append(match.group(0).lower())
+        if len(window) == window.maxlen:
+            yielded = True
+            yield " ".join(window)
+    if window and not yielded:
+        yield " ".join(window)
 
 
 # xxh32 over the shingle bytes — drop-in replacement for datasketch's default
@@ -176,29 +262,33 @@ def compute_minhash_signature(
 ) -> np.ndarray:
     """Build a MinHash signature for ``text`` and return its raw hashvalues.
 
-    Fully vectorized: all shingle hashes are computed once, then the permuted
-    min-hash reduction runs as blocked numpy matrix ops instead of a Python
-    per-shingle ``MinHash.update`` loop (~3.5x faster on real docs). Output is
-    byte-identical to the datasketch path. The returned uint64 array can be
-    shipped across process boundaries and fed straight to the LSH index.
+    Shingle hashes and the permutation matrix are both processed in bounded
+    blocks. Output is byte-identical to the datasketch path without retaining
+    every shingle string/hash for multi-megabyte documents.
     """
     a, b, prime, max_hash = _minhash_params(num_perm)
-    shingles = list(_iter_shingles(text, max(1, shingle_size)))
-    if not shingles:
-        return np.full(num_perm, max_hash, dtype=np.uint64)
-
-    hv = np.fromiter(
-        (xxhash.xxh32_intdigest(s.encode("utf-8")) for s in shingles),
-        dtype=np.uint64,
-        count=len(shingles),
-    )
     running = np.full(num_perm, max_hash, dtype=np.uint64)
-    for start in range(0, hv.shape[0], _MINHASH_BLOCK):
-        chunk = hv[start:start + _MINHASH_BLOCK]
+    block: list[int] = []
+    saw_shingle = False
+
+    def reduce_block(values: list[int]) -> None:
+        if not values:
+            return
+        chunk = np.asarray(values, dtype=np.uint64)
         # uint64 arithmetic wraps mod 2^64 elementwise, exactly matching
         # datasketch's scalar (a*hv + b) before the Mersenne modulo.
         phv = ((chunk[:, None] * a[None, :] + b[None, :]) % prime) & max_hash
         np.minimum(running, phv.min(axis=0), out=running)
+
+    for shingle in _iter_shingles(text, max(1, shingle_size)):
+        saw_shingle = True
+        block.append(xxhash.xxh32_intdigest(shingle.encode("utf-8")))
+        if len(block) >= _MINHASH_BLOCK:
+            reduce_block(block)
+            block.clear()
+    reduce_block(block)
+    if not saw_shingle:
+        return np.full(num_perm, max_hash, dtype=np.uint64)
     return running
 
 
@@ -237,7 +327,10 @@ class NearDuplicateIndex:
         self._ranges: list[tuple[int, int]] = [
             (i * rows, (i + 1) * rows) for i in range(bands)
         ]
-        self._tables: list[set[bytes]] = [set() for _ in range(bands)]
+        # Store 64-bit fingerprints rather than the full band byte strings.
+        # This cuts the dominant dedup index memory by roughly an order of
+        # magnitude; the xxh64 collision probability is negligible here.
+        self._tables: list[set[int]] = [set() for _ in range(bands)]
         self._exact_hashes: set[int] = set()
 
     # Convenience wrapper for the serial path: hash + signature + LSH check.
@@ -266,7 +359,7 @@ class NearDuplicateIndex:
         return self._check_and_insert(exact_hash, signature)
 
     def _check_and_insert(self, exact_hash: int, signature: np.ndarray) -> bool:
-        band_keys = [signature[start:end].tobytes() for start, end in self._ranges]
+        band_keys = self.band_keys(signature)
         for table, key in zip(self._tables, band_keys):
             if key in table:
                 self._exact_hashes.add(exact_hash)
@@ -275,6 +368,21 @@ class NearDuplicateIndex:
             table.add(key)
         self._exact_hashes.add(exact_hash)
         return False
+
+    def band_keys(self, signature: np.ndarray) -> tuple[int, ...]:
+        return tuple(
+            xxhash.xxh64_intdigest(signature[start:end].tobytes())
+            for start, end in self._ranges
+        )
+
+    def insert_known(self, exact_hash: int, band_keys: tuple[int, ...]) -> None:
+        if len(band_keys) != len(self._tables):
+            raise RuntimeError(
+                "Resume journal was produced with a different MinHash band layout"
+            )
+        self._exact_hashes.add(exact_hash)
+        for table, key in zip(self._tables, band_keys):
+            table.add(int(key))
 
 
 def infer_source(root: Path, path: Path) -> str:
@@ -360,6 +468,7 @@ _WORKER_RAW_ROOT: Path | None = None
 _WORKER_DEDUP_ENABLED: bool = False
 _WORKER_NUM_PERM: int = 128
 _WORKER_SHINGLE_SIZE: int = 5
+_WORKER_RESUME_HASHES = None
 
 
 def _worker_init(
@@ -368,14 +477,26 @@ def _worker_init(
     dedup_enabled: bool,
     num_perm: int,
     shingle_size: int,
+    resume_hashes_path: str = "",
 ) -> None:
     global _WORKER_CONFIG, _WORKER_RAW_ROOT
     global _WORKER_DEDUP_ENABLED, _WORKER_NUM_PERM, _WORKER_SHINGLE_SIZE
+    global _WORKER_RESUME_HASHES
     _WORKER_CONFIG = config
     _WORKER_RAW_ROOT = Path(raw_root_str)
     _WORKER_DEDUP_ENABLED = dedup_enabled
     _WORKER_NUM_PERM = num_perm
     _WORKER_SHINGLE_SIZE = shingle_size
+    _WORKER_RESUME_HASHES = (
+        np.load(resume_hashes_path, mmap_mode="r") if resume_hashes_path else None
+    )
+
+
+def _hash_is_in_sorted_array(exact_hash: int, values) -> bool:
+    if values is None or len(values) == 0:
+        return False
+    index = int(np.searchsorted(values, np.uint64(exact_hash)))
+    return index < len(values) and int(values[index]) == exact_hash
 
 
 def _worker_process_file(file_path_str: str) -> dict:
@@ -390,13 +511,17 @@ def _worker_process_file(file_path_str: str) -> dict:
     documents: list[FilteredDoc] = []
     for doc in _iter_file_documents(raw_root, path):
         raw_bytes = len(doc.text.encode("utf-8"))
-        text = clean_text(doc.text)
+        text = clean_text(doc.text, doc.source)
         keep, reason = should_keep_document(text, config, doc.source)
-        if keep and dedup_enabled:
+        if keep:
             exact_hash = compute_exact_hash(text)
-            signature = compute_minhash_signature(
-                text, num_perm=num_perm, shingle_size=shingle_size
-            )
+            signature = None
+            if dedup_enabled and not _hash_is_in_sorted_array(
+                exact_hash, _WORKER_RESUME_HASHES
+            ):
+                signature = compute_minhash_signature(
+                    text, num_perm=num_perm, shingle_size=shingle_size
+                )
         else:
             exact_hash = None
             signature = None
@@ -429,16 +554,19 @@ def _doc_stream_serial(
     dedup_enabled: bool,
     num_perm: int,
     shingle_size: int,
+    resume_hashes=None,
 ) -> Iterator[FilteredDoc]:
     for doc in iter_documents(raw_root, files, progress=progress):
         raw_bytes = len(doc.text.encode("utf-8"))
-        text = clean_text(doc.text)
+        text = clean_text(doc.text, doc.source)
         keep, reason = should_keep_document(text, config, doc.source)
-        if keep and dedup_enabled:
+        if keep:
             exact_hash = compute_exact_hash(text)
-            signature = compute_minhash_signature(
-                text, num_perm=num_perm, shingle_size=shingle_size
-            )
+            signature = None
+            if dedup_enabled and not _hash_is_in_sorted_array(exact_hash, resume_hashes):
+                signature = compute_minhash_signature(
+                    text, num_perm=num_perm, shingle_size=shingle_size
+                )
         else:
             exact_hash = None
             signature = None
@@ -463,13 +591,21 @@ def _doc_stream_parallel(
     dedup_enabled: bool,
     num_perm: int,
     shingle_size: int,
+    resume_hashes_path: str = "",
 ) -> Iterator[FilteredDoc]:
     file_paths = [str(path) for path in files]
     ctx = mp.get_context("spawn")
     with ctx.Pool(
         processes=workers,
         initializer=_worker_init,
-        initargs=(config, str(raw_root), dedup_enabled, num_perm, shingle_size),
+        initargs=(
+            config,
+            str(raw_root),
+            dedup_enabled,
+            num_perm,
+            shingle_size,
+            resume_hashes_path,
+        ),
     ) as pool:
         try:
             # ``imap`` still processes files concurrently but buffers completed
@@ -705,6 +841,72 @@ def count_shard_tokens(shard_paths: list[Path]) -> int:
     return sum(int(np.load(path, mmap_mode="r").shape[0]) for path in shard_paths)
 
 
+def raw_input_contract(raw_root: Path, files: list[Path]) -> dict:
+    entries = []
+    total_bytes = 0
+    for path in files:
+        stat = path.stat()
+        total_bytes += stat.st_size
+        try:
+            name = str(path.relative_to(raw_root))
+        except ValueError:
+            name = str(path)
+        entries.append((name, int(stat.st_size), int(stat.st_mtime_ns)))
+    return {
+        "schema_version": 1,
+        "files": len(entries),
+        "bytes": total_bytes,
+        "fingerprint": stable_payload_sha256(entries),
+    }
+
+
+def preparation_contract(
+    config: SpakieConfig,
+    *,
+    target_tokens: int,
+    dedup: bool,
+    source_glob: str | None,
+    source_dirs: list[str] | None,
+) -> dict:
+    fields = (
+        "min_doc_chars", "source_min_doc_chars", "max_repeated_line_ratio",
+        "max_noise_ratio", "mean_word_length_min", "mean_word_length_max",
+        "min_stopword_count", "max_symbol_word_ratio", "max_top_2gram_char_share",
+        "max_top_3gram_char_share", "max_dup_5gram_char_share", "max_top_char_share",
+        "max_url_email_line_ratio", "near_dup_jaccard_threshold", "near_dup_num_perm",
+        "near_dup_shingle_size", "train_split_fraction", "token_shard_size",
+    )
+    return {
+        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "target_tokens": int(target_tokens),
+        "dedup": bool(dedup),
+        "source_glob": source_glob or "",
+        "source_dirs": list(source_dirs or []),
+        "config": {name: getattr(config, name) for name in fields},
+        "source_plan": config.scaled_corpus_source_plan(
+            target_processed_tokens=target_tokens
+        ),
+    }
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
 class TokenShardWriter:
     def __init__(
         self,
@@ -714,6 +916,8 @@ class TokenShardWriter:
         *,
         start_index: int = 0,
         existing_paths: list[Path] | None = None,
+        vocab_size: int | None = None,
+        max_token_id: int = -1,
     ):
         self.shard_dir = shard_dir
         self.shard_size = shard_size
@@ -722,8 +926,21 @@ class TokenShardWriter:
         self.offset = 0
         self.index = start_index
         self.paths: list[Path] = list(existing_paths or [])
+        self.vocab_size = vocab_size
+        self.max_token_id = int(max_token_id)
 
     def add(self, token_ids: list[int]) -> None:
+        if not token_ids:
+            return
+        min_id = min(token_ids)
+        max_id = max(token_ids)
+        if min_id < 0:
+            raise ValueError(f"Tokenizer produced negative token ID {min_id}")
+        if self.vocab_size is not None and max_id >= self.vocab_size:
+            raise ValueError(
+                f"Tokenizer produced ID {max_id} outside vocabulary size {self.vocab_size}"
+            )
+        self.max_token_id = max(self.max_token_id, max_id)
         token_array = np.asarray(token_ids, dtype=self.dtype)
         start = 0
         total = int(token_array.shape[0])
@@ -766,6 +983,11 @@ def merge_shards(
     train_tokens_target: int | None = None,
     show_progress: bool = False,
     source_runs: list[tuple[str, int, int]] | None = None,
+    source_document_ends: dict[str, list[int] | array] | None = None,
+    tokenizer_provenance: dict | None = None,
+    preparation_provenance: dict | None = None,
+    raw_input_provenance: dict | None = None,
+    max_token_id: int | None = None,
 ) -> tuple[int, int]:
     total_tokens = sum(int(np.load(path, mmap_mode="r").shape[0]) for path in shard_paths)
     split_idx = int(total_tokens * train_fraction)
@@ -820,6 +1042,21 @@ def merge_shards(
                     f"{split_idx:,} train / {total_tokens - split_idx:,} val tokens."
                 )
 
+        if source_document_ends:
+            adjusted_targets: dict[str, int] = {}
+            for source, target in source_train_targets.items():
+                total = source_totals[source]
+                boundaries = [int(value) for value in source_document_ends.get(source, [])]
+                # Zero and the final document end are valid choices. A source
+                # containing one document must go wholly to one split rather
+                # than leaking a prefix into train and its suffix into val.
+                candidates = [0]
+                candidates.extend(value for value in boundaries if 0 < value < total)
+                candidates.append(total)
+                adjusted_targets[source] = min(candidates, key=lambda value: abs(value - target))
+            source_train_targets = adjusted_targets
+            split_idx = sum(source_train_targets.values())
+
     if train_tokens_target and train_tokens_target > split_idx and source_train_targets is None:
         if train_tokens_target > total_tokens:
             # Don't throw away a long, expensive prepare run just because the
@@ -835,6 +1072,12 @@ def merge_shards(
             )
         else:
             split_idx = train_tokens_target
+
+    if total_tokens and (split_idx <= 0 or split_idx >= total_tokens):
+        raise ValueError(
+            "Cannot create non-empty document-disjoint train and validation splits. "
+            "Add more independent documents or adjust the split/target."
+        )
 
     processed_dir = train_path.parent
     if val_path.parent != processed_dir:
@@ -970,6 +1213,10 @@ def merge_shards(
             train_tokens=split_idx,
             val_tokens=expected_val_tokens,
             dtype=dtype,
+            tokenizer=tokenizer_provenance,
+            preparation=preparation_provenance,
+            raw_inputs=raw_input_provenance,
+            max_token_id=max_token_id,
         )
         return split_idx, expected_val_tokens
     except BaseException:
@@ -1164,6 +1411,7 @@ def prepare_data(
     target_tokens = target_tokens or config.target_processed_tokens
     source_plan = config.scaled_corpus_source_plan(target_processed_tokens=target_tokens)
     tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
+    tokenizer_provenance = tokenizer_contract(config.tokenizer_prefix + ".model")
     token_dtype = pick_token_dtype(tokenizer)
     tokenizer_threads = tokenizer_threads or recommended_tokenizer_threads()
     tokenize_batch_size = max(1, tokenize_batch_size)
@@ -1176,6 +1424,22 @@ def prepare_data(
         raise FileNotFoundError(f"No supported files found in {raw_root}")
 
     raw_bytes = sum(path.stat().st_size for path in files)
+    raw_input_provenance = raw_input_contract(raw_root, files)
+    preparation_provenance = preparation_contract(
+        config,
+        target_tokens=target_tokens,
+        dedup=dedup,
+        source_glob=source_glob,
+        source_dirs=source_dirs,
+    )
+    run_contract = {
+        "schema_version": 2,
+        "tokenizer": tokenizer_provenance,
+        "preparation": preparation_provenance,
+        "raw_inputs": raw_input_provenance,
+        "max_token_id": -1,
+        "resume_journal": SHARD_RESUME_JOURNAL,
+    }
     print(f"Found {len(files):,} input files")
     print(f"Discovered raw bytes: {raw_bytes:,}")
 
@@ -1202,16 +1466,51 @@ def prepare_data(
     # final merge allocate train/validation tokens per source even when files
     # from different sources are interleaved.
     source_runs: list[tuple[str, int, int]] = []
+    source_document_ends: dict[str, array] = defaultdict(lambda: array("Q"))
     shard_paths: list[Path] = []
     shard_dir = Path(config.token_shard_dir)
+    shard_run_manifest = shard_dir / SHARD_RUN_MANIFEST
+    resume_journal = shard_dir / SHARD_RESUME_JOURNAL
+    resume_hashes_path = shard_dir / "resume_exact_hashes.npy"
     existing_shard_paths: list[Path] = []
     resume_tokens = 0
     if resume and not dry_run and shard_dir.exists():
         existing_shard_paths = list_token_shards(shard_dir)
         resume_tokens = count_shard_tokens(existing_shard_paths)
+        if existing_shard_paths:
+            if not shard_run_manifest.exists():
+                raise RuntimeError(
+                    f"Existing token shards have no provenance manifest {shard_run_manifest}; "
+                    "rerun without --resume."
+                )
+            saved_run_contract = json.loads(
+                shard_run_manifest.read_text(encoding="utf-8")
+            )
+            if saved_run_contract.get("schema_version") != run_contract["schema_version"]:
+                raise RuntimeError(
+                    "Existing token shards use an incompatible resume metadata schema; "
+                    "rerun without --resume."
+                )
+            for key in ("tokenizer", "preparation", "raw_inputs"):
+                if saved_run_contract.get(key) != run_contract[key]:
+                    raise RuntimeError(
+                        f"Existing token shards have a different {key} contract; "
+                        "rerun without --resume."
+                    )
+            run_contract["max_token_id"] = int(
+                saved_run_contract.get("max_token_id", -1)
+            )
+            if not resume_journal.exists():
+                raise RuntimeError(
+                    f"Existing token shards have no accepted-document journal "
+                    f"{resume_journal}; rerun without --resume."
+                )
     if shard_dir.exists() and not dry_run and not resume:
         shutil.rmtree(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
+    if not dry_run and not existing_shard_paths:
+        _write_json_atomic(shard_run_manifest, run_contract)
+        resume_journal.touch()
     start_shard_index = (
         token_shard_index(existing_shard_paths[-1]) + 1
         if existing_shard_paths
@@ -1223,10 +1522,40 @@ def prepare_data(
         dtype=token_dtype,
         start_index=start_shard_index,
         existing_paths=existing_shard_paths,
+        vocab_size=tokenizer.vocab_size,
+        max_token_id=int(run_contract.get("max_token_id", -1)),
+    )
+    resume_hash_values = array("Q")
+    resume_record_count = 0
+    resume_record_tokens = 0
+    if resume_tokens:
+        for record in iter_accepted_documents(resume_journal):
+            resume_record_count += 1
+            resume_record_tokens += record.token_count
+            resume_hash_values.append(record.exact_hash)
+            if dup_index is not None:
+                dup_index.insert_known(record.exact_hash, record.band_keys)
+        if resume_record_tokens != resume_tokens:
+            raise RuntimeError(
+                "Accepted-document resume journal does not align with existing token "
+                f"shards ({resume_record_tokens:,} journal tokens vs "
+                f"{resume_tokens:,} shard tokens); rerun without --resume."
+            )
+        sorted_hashes = np.frombuffer(resume_hash_values, dtype=np.uint64).copy()
+        sorted_hashes.sort()
+        np.save(resume_hashes_path, sorted_hashes)
+        resume_hashes = np.load(resume_hashes_path, mmap_mode="r")
+        resume_records = iter(iter_accepted_documents(resume_journal))
+        expected_resume_record = next(resume_records, None)
+    else:
+        resume_hashes = None
+        resume_records = iter(())
+        expected_resume_record = None
+    journal_handle = (
+        resume_journal.open("ab", buffering=1024 * 1024) if not dry_run else None
     )
     pending: list[PendingTokenization] = []
     pending_chars = 0
-    resume_tokens_remaining = resume_tokens
 
     pipeline: TokenizerPipeline | None = None
     # Bound concurrency to 1 in-flight batch: while the encoder works on
@@ -1240,7 +1569,7 @@ def prepare_data(
     def process_encoded_batch(
         batch: list[PendingTokenization], encoded_batch: list[list[int]]
     ) -> bool:
-        nonlocal total_tokens, resume_tokens_remaining
+        nonlocal total_tokens
         reached_target = False
         for item, token_ids in zip(batch, encoded_batch):
             stats = source_stats[item.source]
@@ -1254,6 +1583,7 @@ def prepare_data(
             stats["documents_kept"] += 1
             stats["chars_kept"] += len(item.text)
             stats["tokens_kept"] += len(token_ids)
+            source_document_ends[item.source].append(stats["tokens_kept"])
             token_start = total_tokens
             total_tokens += len(token_ids)
             token_end = total_tokens
@@ -1265,15 +1595,23 @@ def prepare_data(
                 source_runs[-1] = (item.source, source_runs[-1][1], token_end)
             else:
                 source_runs.append((item.source, token_start, token_end))
-            if resume_tokens_remaining:
-                if len(token_ids) > resume_tokens_remaining:
-                    raise RuntimeError(
-                        "Existing token shards end in the middle of an accepted document. "
-                        "Remove the shard directory and rerun without --resume."
-                    )
-                resume_tokens_remaining -= len(token_ids)
-            else:
-                writer.add(token_ids)
+            writer.add(token_ids)
+            assert journal_handle is not None and item.exact_hash is not None
+            band_keys = (
+                dup_index.band_keys(item.signature)
+                if dup_index is not None and item.signature is not None
+                else ()
+            )
+            append_accepted_document(
+                journal_handle,
+                AcceptedDocument(
+                    source=item.source,
+                    token_count=len(token_ids),
+                    char_count=len(item.text),
+                    exact_hash=item.exact_hash,
+                    band_keys=band_keys,
+                ),
+            )
             if total_tokens >= target_tokens:
                 print(f"Reached target token budget: {total_tokens:,}")
                 reached_target = True
@@ -1350,11 +1688,22 @@ def prepare_data(
     }
     if worker_count > 1:
         doc_stream = _doc_stream_parallel(
-            raw_root, files, config, docs_progress, worker_count, **stream_kwargs
+            raw_root,
+            files,
+            config,
+            docs_progress,
+            worker_count,
+            resume_hashes_path=str(resume_hashes_path) if resume_tokens else "",
+            **stream_kwargs,
         )
     else:
         doc_stream = _doc_stream_serial(
-            raw_root, files, config, docs_progress, **stream_kwargs
+            raw_root,
+            files,
+            config,
+            docs_progress,
+            resume_hashes=resume_hashes,
+            **stream_kwargs,
         )
 
     if not dry_run:
@@ -1395,15 +1744,58 @@ def prepare_data(
                 stats["drop_reasons"]["source_cap_reached"] += 1
                 continue
 
+            # A compatible resume journal lets us replay the already-written
+            # prefix without rerunning SentencePiece or MinHash. Cleaning and
+            # the exact content hash still verify deterministic input order.
+            if expected_resume_record is not None:
+                assert exact_hash is not None
+                if (
+                    source == expected_resume_record.source
+                    and exact_hash == expected_resume_record.exact_hash
+                ):
+                    if len(text) != expected_resume_record.char_count:
+                        raise RuntimeError(
+                            "Resume journal content length differs from the cleaned raw document"
+                        )
+                    token_count = expected_resume_record.token_count
+                    if source_cap and stats["tokens_kept"] + token_count > source_cap:
+                        raise RuntimeError(
+                            "Resume journal no longer fits the configured source token cap"
+                        )
+                    stats["documents_kept"] += 1
+                    stats["chars_kept"] += len(text)
+                    stats["tokens_kept"] += token_count
+                    source_document_ends[source].append(stats["tokens_kept"])
+                    token_start = total_tokens
+                    total_tokens += token_count
+                    if (
+                        source_runs
+                        and source_runs[-1][0] == source
+                        and source_runs[-1][2] == token_start
+                    ):
+                        source_runs[-1] = (
+                            source,
+                            source_runs[-1][1],
+                            total_tokens,
+                        )
+                    else:
+                        source_runs.append((source, token_start, total_tokens))
+                    expected_resume_record = next(resume_records, None)
+                    if total_tokens >= target_tokens:
+                        print(f"Reached target token budget: {total_tokens:,}")
+                        break
+                    continue
+
             # Dedup runs in the producer loop now (was previously post-encode)
             # so we don't burn tokenizer cycles on near-duplicates. Workers
             # already computed exact_hash + signature in parallel.
             if dup_index is not None:
-                assert exact_hash is not None and signature is not None
+                assert exact_hash is not None
                 if dup_index.is_duplicate_exact(exact_hash):
                     stats["documents_dropped"] += 1
                     stats["drop_reasons"]["exact_duplicate"] += 1
                     continue
+                assert signature is not None
                 if dup_index.query_signature(exact_hash, signature):
                     stats["documents_dropped"] += 1
                     stats["drop_reasons"]["near_duplicate"] += 1
@@ -1451,10 +1843,14 @@ def prepare_data(
     finally:
         docs_progress.close()
 
-    if resume_tokens_remaining and not interrupted and total_tokens < target_tokens:
+    if expected_resume_record is not None and not interrupted:
+        if pipeline is not None:
+            pipeline.close_input()
+        if journal_handle is not None:
+            journal_handle.close()
         raise RuntimeError(
-            "Existing token shards contain more accepted tokens than this run could reproduce. "
-            "Check that the raw inputs and prepare_data.py options match the interrupted run."
+            "Existing token shards contain an accepted-document prefix that this run "
+            "could not reproduce. Check raw inputs and prepare_data.py options."
         )
 
     if not dry_run:
@@ -1465,6 +1861,12 @@ def prepare_data(
             drain_all()
         pipeline.close_input()
         shard_paths = writer.close()
+        assert journal_handle is not None
+        journal_handle.flush()
+        os.fsync(journal_handle.fileno())
+        journal_handle.close()
+        run_contract["max_token_id"] = writer.max_token_id
+        _write_json_atomic(shard_run_manifest, run_contract)
 
     normalized_source_stats = {}
     for source, stats in source_stats.items():
@@ -1518,7 +1920,8 @@ def prepare_data(
     if resume:
         report["resume_existing_shards"] = len(existing_shard_paths)
         report["resume_existing_tokens"] = resume_tokens
-        report["resume_tokens_remaining"] = resume_tokens_remaining
+        report["resume_journal_records"] = resume_record_count
+        report["resume_prefix_replayed"] = expected_resume_record is None
 
     processed_dir = Path(config.processed_data_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
@@ -1565,6 +1968,11 @@ def prepare_data(
         train_tokens_target=config.target_train_tokens,
         show_progress=True,
         source_runs=source_runs,
+        source_document_ends=source_document_ends,
+        tokenizer_provenance=tokenizer_provenance,
+        preparation_provenance=preparation_provenance,
+        raw_input_provenance=raw_input_provenance,
+        max_token_id=writer.max_token_id,
     )
 
     report["processed_tokens"] = train_tokens + val_tokens

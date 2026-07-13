@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer import SpakieGPT
 from runtime import RuntimeSettings, autocast_context, dataloader_kwargs
-from runtime.checkpoint_io import atomic_torch_save
+from runtime.checkpoint_io import atomic_torch_save, checkpoint_tokenizer_contract
 from runtime.backends import create_grad_scaler
 from training.dataset import ChatSFTDataset, train_val_split
 from training.monitor import (
@@ -268,6 +268,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     "muon_verified": config.muon_verified,
                     "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
                     "config": config_to_dict(config),
+                    "tokenizer": checkpoint_tokenizer_contract(config),
                 }, ckpt_path)
                 status_writer.update(
                     force=True,
@@ -305,6 +306,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             "best_val_loss": best_val_loss,
             "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
             "config": config_to_dict(config),
+            "tokenizer": checkpoint_tokenizer_contract(config),
         }, interrupt_path)
         status_writer.finish(
             "interrupted",

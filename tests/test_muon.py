@@ -18,6 +18,7 @@ from training.muon_core import (
     MUON_BF16_MAX_REL,
     MuonPrecomputeError,
     is_muon_parameter_name,
+    muon_projection_split_count,
     should_adamw_fallback,
 )
 from training.optimizers import MuonAdamW, configure_torch_optimizer, muon_newton_schulz_torch
@@ -43,6 +44,8 @@ class MuonCoreTests(unittest.TestCase):
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.fc1.weight", 2))
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.gate_up.weight", 2))
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.down.weight", 2))
+        self.assertEqual(muon_projection_split_count("blocks.0.attn.qkv.weight"), 3)
+        self.assertEqual(muon_projection_split_count("blocks.0.attn.kv_proj.weight"), 2)
 
     def test_runtime_fallback_is_only_allowed_before_mutation(self):
         optimizer = type("Optimizer", (), {"optimizer_kind": "muon"})()
@@ -175,6 +178,25 @@ class TorchMuonOptimizerTests(unittest.TestCase):
         for name, param in model.named_parameters():
             self.assertTrue(torch.equal(param, before[name]), name)
         self.assertFalse(optimizer.state)
+
+    def test_fused_kv_projection_is_split_into_two_muon_updates(self):
+        config = self._config()
+        model = SpakieGPT(config)
+        optimizer = configure_torch_optimizer(
+            model,
+            config,
+            RuntimeSettings(device=torch.device("cpu"), precision="fp32"),
+            kind="muon",
+            lr=1e-3,
+            weight_decay=0.1,
+        )
+        chunks = list(
+            optimizer._update_chunks(
+                "blocks.0.attn.kv_proj.weight", torch.zeros(12, 8)
+            )
+        )
+        self.assertEqual([start for start, _ in chunks], [0, 6])
+        self.assertEqual([tuple(chunk.shape) for _, chunk in chunks], [(6, 8), (6, 8)])
 
 
 if __name__ == "__main__":

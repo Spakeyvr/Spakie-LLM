@@ -23,6 +23,10 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer_mlx import SpakieGPTMLX
+from runtime.checkpoint_io import (
+    checkpoint_processed_data_fingerprint,
+    checkpoint_tokenizer_contract,
+)
 from runtime.mlx_backend import (
     MLXRuntimeSettings,
     clip_grads,
@@ -42,7 +46,11 @@ from training.monitor import (
     start_background_monitor,
     stop_background_monitor,
 )
-from training.muon_core import adamw_fallback_warning, should_adamw_fallback
+from training.muon_core import (
+    MUON_OPTIMIZER_SCHEMA_VERSION,
+    adamw_fallback_warning,
+    should_adamw_fallback,
+)
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.prefetch_mlx import BatchPrefetcher
 
@@ -523,6 +531,7 @@ def _build_checkpoint_payload(
         if getattr(optimizer, "optimizer_kind", config.pretrain_optimizer) == "adamw"
         else "",
         "muon_hyperparameters": {
+            "optimizer_schema_version": MUON_OPTIMIZER_SCHEMA_VERSION,
             "momentum": config.muon_momentum,
             "nesterov": config.muon_nesterov,
             "ns_steps": config.muon_ns_steps,
@@ -534,6 +543,8 @@ def _build_checkpoint_payload(
         "muon_verified": config.muon_verified,
         "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
         "config": config_to_dict(config),
+        "tokenizer": checkpoint_tokenizer_contract(config),
+        "processed_data_manifest_sha256": checkpoint_processed_data_fingerprint(config),
     }
     return flat, meta
 
@@ -689,8 +700,11 @@ def pretrain_mlx(
     use_vmap_accum_step: bool = False,
     allow_adamw_fallback: bool = False,
 ) -> float:
-    if runtime.dtype != mx.float32:
-        model.set_dtype(runtime.dtype)
+    if resume_state:
+        model.load_weights(tree_flatten(resume_state["model"]), strict=True)
+    # Loading replaces arrays with checkpoint dtypes. Cast after loading even
+    # for explicit FP32 so the requested runtime precision is authoritative.
+    model.set_dtype(runtime.dtype)
     model.train()
 
     optimizer = configure_mlx_optimizer(
@@ -714,7 +728,6 @@ def pretrain_mlx(
     interrupted = False
 
     if resume_state:
-        model.load_weights(tree_flatten(resume_state["model"]), strict=True)
         if "optimizer" in resume_state:
             optimizer.load_state_trees(resume_state["optimizer"])
         # Older checkpoints predate FP32 master parameters. In that case seed

@@ -32,10 +32,9 @@ class MLXSFTAccumulationTests(unittest.TestCase):
     def test_partial_tail_gradient_tree_is_rescaled(self):
         try:
             import mlx.core as mx
-        except ImportError:
-            self.skipTest("MLX is not installed")
-
-        from training.finetune_mlx import _scale_partial_accum_grads
+            from training.finetune_mlx import _scale_partial_accum_grads
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"MLX is unavailable: {exc}")
 
         config = SpakieConfig()
         config.sft_grad_accum_steps = 4

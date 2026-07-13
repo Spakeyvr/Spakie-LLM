@@ -19,7 +19,12 @@ from model.transformer import SpakieGPT
 from model.utils import count_parameters
 from runtime import RuntimeSettings, autocast_context
 from runtime.backends import create_grad_scaler
-from runtime.checkpoint_io import atomic_torch_save
+from runtime.checkpoint_io import (
+    atomic_torch_save,
+    checkpoint_processed_data_fingerprint,
+    checkpoint_tokenizer_contract,
+)
+from training.muon_core import MUON_OPTIMIZER_SCHEMA_VERSION
 from training.monitor import (
     TrainingStatusWriter,
     format_monitor_start_message,
@@ -162,6 +167,7 @@ def save_training_checkpoint(
         if getattr(optimizer, "optimizer_kind", config.pretrain_optimizer) == "adamw"
         else "",
         "muon_hyperparameters": {
+            "optimizer_schema_version": MUON_OPTIMIZER_SCHEMA_VERSION,
             "momentum": config.muon_momentum,
             "nesterov": config.muon_nesterov,
             "ns_steps": config.muon_ns_steps,
@@ -180,6 +186,8 @@ def save_training_checkpoint(
         "rng_state": capture_rng_state(),
         "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
         "config": config_to_dict(config),
+        "tokenizer": checkpoint_tokenizer_contract(config),
+        "processed_data_manifest_sha256": checkpoint_processed_data_fingerprint(config),
     }
     if scaler is not None:
         payload["scaler"] = scaler.state_dict()

@@ -82,7 +82,12 @@ def main() -> None:
 
     from configs.default import get_preset_config, inherit_attention_shape_from_tensors, inherit_mlp_shape_from_tensors
     from model.transformer_mlx import SpakieGPTMLX
-    from runtime.checkpoint_io import load_mlx_checkpoint_config, load_mlx_model_weights_strict
+    from runtime.checkpoint_io import (
+        load_mlx_checkpoint_config,
+        load_mlx_checkpoint_meta,
+        load_mlx_model_weights_strict,
+        validate_checkpoint_tokenizer,
+    )
     from runtime.mlx_backend import load_safetensors, resolve_mlx_runtime
     from tokenizer.train_tokenizer import SpakieTokenizer
 
@@ -93,6 +98,11 @@ def main() -> None:
     saved_config = load_mlx_checkpoint_config(checkpoint, allow_legacy_config=False)
     config = saved_config or inherit_mlp_shape_from_tensors(
         inherit_attention_shape_from_tensors(config, model_flat), model_flat
+    )
+    validate_checkpoint_tokenizer(
+        load_mlx_checkpoint_meta(checkpoint),
+        config.tokenizer_prefix + ".model",
+        source=checkpoint,
     )
     model = SpakieGPTMLX(config)
     load_mlx_model_weights_strict(model, flat, path=checkpoint)

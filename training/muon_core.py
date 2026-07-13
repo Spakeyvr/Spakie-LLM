@@ -21,6 +21,7 @@ MUON_FP32_MAX_ABS = 1e-2
 MUON_FP32_MAX_REL = 5e-2
 MUON_BF16_MAX_ABS = 2e-2
 MUON_BF16_MAX_REL = 5e-2
+MUON_OPTIMIZER_SCHEMA_VERSION = 2
 
 
 class MuonPrecomputeError(RuntimeError):
@@ -105,7 +106,16 @@ def is_muon_parameter_name(name: str, ndim: int) -> bool:
 
 
 def is_qkv_parameter_name(name: str) -> bool:
-    return name.endswith("attn.qkv.weight")
+    return muon_projection_split_count(name) > 1
+
+
+def muon_projection_split_count(name: str) -> int:
+    """Number of independent attention projections fused in ``name``."""
+    if name.endswith("attn.qkv.weight"):
+        return 3
+    if name.endswith("attn.kv_proj.weight"):
+        return 2
+    return 1
 
 
 def adamw_fallback_warning(stage: str) -> str:

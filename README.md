@@ -131,7 +131,7 @@ their checkpoints, then exits without waiting for blocked HTTP retries; pressing
 Ctrl+C again skips the grace period. Sources already at their saved target are
 skipped before their potentially large resume indexes are loaded.
 
-`scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies quality filters, fastText language ID, and MinHash/LSH near-deduplication, tokenizes in deterministic input order, writes token shards under `data/processed/shards/`, and transactionally merges them into `data/processed/train.npy` and `data/processed/val.npy`. A `processed_data_manifest.json` commit marker is published only after both arrays are complete and durable; the pipeline will not train from arrays without that marker.
+`scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies quality filters, fastText language ID, and MinHash/LSH near-deduplication, tokenizes in deterministic input order, writes token shards under `data/processed/shards/`, and transactionally merges them into `data/processed/train.npy` and `data/processed/val.npy`. A `processed_data_manifest.json` commit marker is published only after both arrays are complete and durable. It records the exact tokenizer, preparation settings, raw-input generation, token-ID bounds, and array file identity; training refuses stale or unverifiable arrays by default.
 
 Useful prepare commands:
 
@@ -142,6 +142,12 @@ python3 scripts/prepare_data.py --target_train_tokens 100000000
 python3 scripts/prepare_data.py --source_dirs large_corpus,wiki
 python3 scripts/prepare_data.py --workers 1
 ```
+
+Resume requires the shard-generation provenance and accepted-document journal
+from the interrupted run. A compatible resume verifies the raw prefix while
+skipping repeated SentencePiece and MinHash work for accepted documents;
+changed raw files, tokenizer, or preparation settings are rejected instead of
+being mixed into old shards.
 
 ## Pretraining and SFT
 
@@ -310,7 +316,7 @@ Muon options include `--muon-adjust-lr-fn {match_rms_adamw,original,none}`, `--m
 
 ## Checkpoints and Chat
 
-Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. New Torch and MLX checkpoints store a complete versioned configuration, and every model load validates all tensor keys and shapes. Torch uses PyTorch's restricted loader by default; `--trust-checkpoint` is required for a legacy pickle that contains custom Python objects. MLX files created before full config metadata are refused by default; `--allow-legacy-config` is an explicit inexact compatibility opt-in. `pretrain_interrupt.*` is the rolling resume checkpoint; every successful run also atomically publishes `pretrain_final.*`, even when it ends before an evaluation boundary.
+Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. New Torch and MLX checkpoints store a complete versioned configuration plus tokenizer identity; pretraining checkpoints also bind resume state to the processed-data generation. Every model load validates all tensor keys and shapes. Torch uses PyTorch's restricted loader by default; `--trust-checkpoint` is required for a legacy pickle that contains custom Python objects. MLX files created before full config metadata are refused by default; `--allow-legacy-config` is an explicit inexact compatibility opt-in. Legacy files without tokenizer identity additionally require `--allow-unverified-tokenizer`. `pretrain_interrupt.*` is the rolling resume checkpoint; every successful run also atomically publishes `pretrain_final.*`, even when it ends before an evaluation boundary.
 
 Useful commands:
 

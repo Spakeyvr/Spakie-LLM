@@ -265,6 +265,9 @@ sft_source_limits:
     limit: 0
   nemotron_instruction_following_chat_v3:
     enabled: true
+    # Most raw rows are removed by language, artifact, identity, and context
+    # filters. Oversample upstream so the final usable cap can actually fill.
+    download_limit: 100000
     limit: 5000
   alpaca:
     enabled: false

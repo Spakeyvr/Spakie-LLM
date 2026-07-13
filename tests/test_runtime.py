@@ -21,9 +21,27 @@ from runtime.backends import (
     resolve_precision,
     resolve_runtime_settings,
 )
+import runtime.langid as langid
 
 
 class RuntimeResolutionTests(unittest.TestCase):
+    def test_mfa_varlen_rejects_grouped_query_attention(self):
+        with self.assertRaisesRegex(ValueError, "does not support GQA"):
+            SpakieConfig(
+                n_heads=4,
+                n_kv_heads=2,
+                d_model=32,
+                attention_backend="mfa-varlen",
+            )
+
+    def test_language_filter_fails_closed_without_model(self):
+        text = "This is ordinary English prose with enough words to satisfy the " * 10
+        with patch.object(langid, "load_langid_model", return_value=None):
+            self.assertFalse(langid.is_probably_english(text))
+            self.assertTrue(
+                langid.is_probably_english(text, allow_heuristic_fallback=True)
+            )
+
     def test_auto_device_prefers_mps_when_cuda_is_unavailable(self):
         with patch("runtime.backends.torch.cuda.is_available", return_value=False), patch(
             "runtime.backends.torch.backends.mps.is_available",

@@ -29,8 +29,10 @@ from runtime.checkpoint_io import (
     config_from_checkpoint_payload,
     discard_training_state,
     load_mlx_checkpoint_config,
+    load_mlx_checkpoint_meta,
     load_mlx_model_weights_strict,
     load_torch_checkpoint,
+    validate_checkpoint_tokenizer,
 )
 from scripts.chat import (
     apply_mode_defaults,
@@ -64,6 +66,13 @@ def _generate_torch_once(args: argparse.Namespace, config, ckpt_path: str) -> st
         )
     elif not getattr(args, "allow_legacy_config", False):
         raise ValueError("checkpoint has no full config; use --allow-legacy-config only for a verified legacy file")
+    tokenizer_path = args.tokenizer or (config.tokenizer_prefix + ".model")
+    validate_checkpoint_tokenizer(
+        ckpt,
+        tokenizer_path,
+        source=ckpt_path,
+        allow_unverified=getattr(args, "allow_unverified_tokenizer", False),
+    )
     discard_training_state(ckpt)
 
     model = SpakieGPT(config)
@@ -71,7 +80,7 @@ def _generate_torch_once(args: argparse.Namespace, config, ckpt_path: str) -> st
     model.to(runtime.device)
     model.eval()
 
-    tokenizer = SpakieTokenizer(args.tokenizer or (config.tokenizer_prefix + ".model"))
+    tokenizer = SpakieTokenizer(tokenizer_path)
     if args.mode == "continue":
         prompt_ids = tokenizer.encode(args.prompt)
         prompt_ids = prompt_ids[-max(1, config.max_seq_len - args.max_new_tokens):]
@@ -148,6 +157,14 @@ def _generate_mlx_once(args: argparse.Namespace, config, ckpt_path: str) -> str:
         config = inherit_attention_shape_from_tensors(config, model_flat)
         config = inherit_mlp_shape_from_tensors(config, model_flat)
 
+    tokenizer_path = args.tokenizer or (config.tokenizer_prefix + ".model")
+    validate_checkpoint_tokenizer(
+        load_mlx_checkpoint_meta(ckpt_path),
+        tokenizer_path,
+        source=ckpt_path,
+        allow_unverified=getattr(args, "allow_unverified_tokenizer", False),
+    )
+
     model = SpakieGPTMLX(config)
     load_mlx_model_weights_strict(model, flat, path=ckpt_path)
     del flat, model_flat
@@ -155,7 +172,7 @@ def _generate_mlx_once(args: argparse.Namespace, config, ckpt_path: str) -> str:
         model.set_dtype(runtime.dtype)
     model.eval()
 
-    tokenizer = SpakieTokenizer(args.tokenizer or (config.tokenizer_prefix + ".model"))
+    tokenizer = SpakieTokenizer(tokenizer_path)
     if args.mode == "continue":
         prompt_ids = tokenizer.encode(args.prompt)
         prompt_ids = prompt_ids[-max(1, config.max_seq_len - args.max_new_tokens):]
@@ -270,6 +287,8 @@ def main() -> int:
                         help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint")
     parser.add_argument("--allow-legacy-config", action="store_true",
                         help="Allow shape guessing for verified legacy checkpoints without full config metadata")
+    parser.add_argument("--allow-unverified-tokenizer", action="store_true",
+                        help="Allow a legacy checkpoint without tokenizer identity metadata")
     args = parser.parse_args()
 
     try:

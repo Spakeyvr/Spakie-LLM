@@ -95,6 +95,9 @@ CURRENT_RATE_WINDOW_SECONDS = 15.0
 INTERRUPT_GRACE_SECONDS = 5.0
 MIN_DOCUMENT_CHARS = 400
 JSONL_BUFFER_BYTES = 1024 * 1024
+DOWNLOAD_PROGRESS_BAR_FORMAT = (
+    "{percentage:.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]"
+)
 PYTHON_EDU_FETCH_AHEAD = 4
 DEFAULT_ITEM_WORKERS = min(32, max(8, (os.cpu_count() or 8) * 2))
 DEFAULT_HF_WORKERS = 4
@@ -139,6 +142,20 @@ class AcceptedRateMonitor:
             return f"{rate / 1_000:.1f}k"
         return f"{rate:.0f}"
 
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total_seconds = max(0, int(seconds + 0.5))
+        days, remainder = divmod(total_seconds, 86_400)
+        hours, remainder = divmod(remainder, 3_600)
+        minutes, seconds = divmod(remainder, 60)
+        if days:
+            return f"{days}d {hours}h"
+        if hours:
+            return f"{hours}h {minutes}min"
+        if minutes:
+            return f"{minutes}min {seconds}s"
+        return f"{seconds}s"
+
     def _refresh(self) -> None:
         now = time.monotonic()
         with self.progress_lock:
@@ -150,9 +167,9 @@ class AcceptedRateMonitor:
             started, initial = self.samples[0]
             rate = max(current - initial, 0) / max(now - started, 1e-9)
             remaining = max(int(self.progress_bar.total or current) - current, 0)
-            eta = f", ETA {remaining / rate:.0f}s" if rate > 0 and remaining else ""
+            eta = self._format_duration(remaining / rate) if rate > 0 else "--"
             self.progress_bar.set_postfix_str(
-                f"15s {self._format_rate(rate)} est tok/s{eta}", refresh=True
+                f"{self._format_rate(rate)} tok/s, ETA {eta}", refresh=True
             )
 
     def _run(self) -> None:
@@ -406,11 +423,16 @@ def html_to_text(raw_html: str) -> str:
     return normalize_text(text)
 
 
-def normalize_text(text: str) -> str:
+def normalize_text(text: str, *, preserve_indentation: bool = False) -> str:
     text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
+    if preserve_indentation:
+        # Code indentation is semantic. Only discard trailing horizontal
+        # whitespace; never collapse leading spaces or tabs.
+        text = "\n".join(line.rstrip(" \t") for line in text.split("\n"))
+    else:
+        text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return text.strip("\n") if preserve_indentation else text.strip()
 
 
 def sanitize_filename(name: str, max_len: int = 120) -> str:
@@ -802,7 +824,10 @@ class SourceState:
         )
 
     def accept(self, record: dict, english_only: bool) -> bool:
-        text = normalize_text(record.get("text", ""))
+        text = normalize_text(
+            record.get("text", ""),
+            preserve_indentation=self.budget.kind == "code",
+        )
         if len(text) < MIN_DOCUMENT_CHARS or looks_navigation_heavy(text):
             return False
         if english_only and not is_probably_english(text, self.config):
@@ -944,6 +969,10 @@ def format_hf_record(source_name: str, row: dict, variant: dict) -> dict | None:
     if not text:
         return None
     title = pick_first(row, spec["title_fields"])
+    if source_name == "python_edu" and title:
+        repo_name = str(row.get("repo_name", "") or "").strip()
+        if repo_name:
+            title = f"{repo_name}:{title}"
     url = pick_first(row, spec["url_fields"])
     if source_name == "wikipedia_snapshot" and title and not url:
         url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
@@ -1180,7 +1209,12 @@ def ingest_hf_source(
                             pass
 
                     blob_id = str(row.get("blob_id", "") or "").strip()
-                    keys = state.identity_keys(blob_id, row.get("path", ""), "")
+                    repo_name = str(row.get("repo_name", "") or "").strip()
+                    source_path = str(row.get("path", "") or "").strip()
+                    namespaced_path = (
+                        f"{repo_name}:{source_path}" if repo_name and source_path else source_path
+                    )
+                    keys = state.identity_keys(blob_id, namespaced_path, "")
                     duplicate = state.has_seen_identity_keys(keys)
                     if keys[0] and keys[0] in scheduled_ids:
                         duplicate = True
@@ -1479,7 +1513,8 @@ def run_source(
             SOURCE_HANDLERS[source_name](state, english_only)
     finally:
         state.close()
-    log(f"  completed [{source_name}]: {state.progress_summary()}")
+    if not STOP_EVENT.is_set():
+        log(f"  completed [{source_name}]: {state.progress_summary()}")
     return int(state.progress["estimated_tokens"])
 
 
@@ -1631,12 +1666,11 @@ def main() -> int:
     progress_bar = tqdm(
         total=total_target_tokens or None,
         initial=already_done,
-        desc="Accepted corpus",
         unit=" est tok",
         unit_scale=True,
         # Omit tqdm's update-triggered rate: it remains stale during retries or
         # cursor work. AcceptedRateMonitor includes zero-progress wall time.
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]",
+        bar_format=DOWNLOAD_PROGRESS_BAR_FORMAT,
     )
     rate_monitor = AcceptedRateMonitor(progress_bar, progress_lock)
 
@@ -1776,10 +1810,29 @@ def main() -> int:
     return 0
 
 
+def exit_process(exit_code: int) -> None:
+    """Exit promptly after a flushed Ctrl+C shutdown.
+
+    Hugging Face/fsspec may leave non-daemon retry workers alive after the
+    downloader's own source workers have saved and closed. A normal
+    ``sys.exit(130)`` waits for those third-party workers during interpreter
+    shutdown, which can produce retries against closed file descriptors.
+    """
+    if exit_code != 130:
+        raise SystemExit(exit_code)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(exit_code)
+
+
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        code = main()
     except KeyboardInterrupt:
         STOP_EVENT.set()
         log("\nInterrupted while downloading pretraining data.")
-        sys.exit(130)
+        code = 130
+    exit_process(code)

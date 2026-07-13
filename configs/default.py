@@ -230,6 +230,12 @@ class SpakieConfig:
         self.attention_backend = (self.attention_backend or "sdpa").lower()
         if self.attention_backend not in {"sdpa", "mfa", "mfa-varlen"}:
             raise ValueError("attention_backend must be 'sdpa', 'mfa', or 'mfa-varlen'")
+        effective_kv_heads = self.n_kv_heads or self.n_heads
+        if self.attention_backend == "mfa-varlen" and effective_kv_heads != self.n_heads:
+            raise ValueError(
+                "attention_backend='mfa-varlen' does not support GQA; use sdpa/mfa "
+                "or set n_kv_heads == n_heads"
+            )
         self.muon_route = (self.muon_route or "all").lower()
         if self.muon_route not in {"all", "mlp", "attn", "none"}:
             raise ValueError("muon_route must be 'all', 'mlp', 'attn', or 'none'")

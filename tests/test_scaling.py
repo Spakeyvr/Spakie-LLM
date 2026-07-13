@@ -20,12 +20,14 @@ import scripts.prepare_data as prepare_data
 class FakeTokenizer:
     encode_batch_calls = 0
     encode_batch_threads: list[int] = []
+    encode_calls = 0
 
     def __init__(self, _model_path: str):
         self.vocab_size = 8192
         self.eos_id = 1
 
     def encode(self, text: str) -> list[int]:
+        self.__class__.encode_calls += 1
         tokens = [2 + ((ord(ch) + idx) % 8000) for idx, ch in enumerate(text)]
         return tokens or [2]
 
@@ -45,6 +47,13 @@ class FakeTokenizer:
 
 
 class ScalingConfigTests(unittest.TestCase):
+    def test_nemotron_download_oversamples_for_usable_final_cap(self):
+        entry = SpakieConfig().sft_source_limits[
+            "nemotron_instruction_following_chat_v3"
+        ]
+        self.assertEqual(entry["limit"], 5_000)
+        self.assertGreater(entry["download_limit"], entry["limit"])
+
     def test_balanced_corpus_mix_and_fixed_context(self):
         config = SpakieConfig()
         enabled = {
@@ -142,7 +151,14 @@ class ScalingConfigTests(unittest.TestCase):
                 },
             )
 
-            with patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer):
+            with (
+                patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer),
+                patch.object(
+                    prepare_data,
+                    "tokenizer_contract",
+                    return_value={"sha256": "fake", "vocab_size": 8192},
+                ),
+            ):
                 report = prepare_data.prepare_data(config=config, dry_run=True)
 
             self.assertEqual(report["target_train_tokens"], 100)
@@ -190,6 +206,11 @@ class ScalingConfigTests(unittest.TestCase):
 
             with (
                 patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer),
+                patch.object(
+                    prepare_data,
+                    "tokenizer_contract",
+                    return_value={"sha256": "fake", "vocab_size": 8192},
+                ),
                 patch.object(prepare_data, "should_keep_document", side_effect=KeyboardInterrupt),
             ):
                 report = prepare_data.prepare_data(config=config, dry_run=True, workers=1)
@@ -242,7 +263,7 @@ class ScalingConfigTests(unittest.TestCase):
                     processed_data_dir=str(root / name / "processed"),
                     corpus_report_path=str(root / name / "processed" / "corpus_report.json"),
                     token_shard_dir=str(root / name / "processed" / "shards"),
-                    target_train_tokens=10,
+                    target_train_tokens=250,
                     min_doc_chars=1,
                     token_shard_size=7,
                     source_min_doc_chars={"fineweb-edu": 1},
@@ -256,7 +277,14 @@ class ScalingConfigTests(unittest.TestCase):
                     },
                 )
 
-            with patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer):
+            with (
+                patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer),
+                patch.object(
+                    prepare_data,
+                    "tokenizer_contract",
+                    return_value={"sha256": "fake", "vocab_size": 8192},
+                ),
+            ):
                 FakeTokenizer.encode_batch_calls = 0
                 FakeTokenizer.encode_batch_threads = []
                 serial_report = prepare_data.prepare_data(
@@ -310,7 +338,7 @@ class ScalingConfigTests(unittest.TestCase):
                     processed_data_dir=str(root / name / "processed"),
                     corpus_report_path=str(root / name / "processed" / "corpus_report.json"),
                     token_shard_dir=str(root / name / "processed" / "shards"),
-                    target_train_tokens=10,
+                    target_train_tokens=100,
                     min_doc_chars=1,
                     token_shard_size=11,
                     source_min_doc_chars={"fineweb-edu": 1},
@@ -324,7 +352,14 @@ class ScalingConfigTests(unittest.TestCase):
                     },
                 )
 
-            with patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer):
+            with (
+                patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer),
+                patch.object(
+                    prepare_data,
+                    "tokenizer_contract",
+                    return_value={"sha256": "fake", "vocab_size": 8192},
+                ),
+            ):
                 full_report = prepare_data.prepare_data(
                     config=make_config("full"),
                     target_tokens=1_053,
@@ -336,27 +371,52 @@ class ScalingConfigTests(unittest.TestCase):
                 full_val = np.load(root / "full" / "processed" / "val.npy")
 
                 resume_config = make_config("resume")
-                partial_report = prepare_data.prepare_data(
-                    config=resume_config,
-                    target_tokens=40,
-                    tokenizer_threads=1,
-                    tokenize_batch_size=2,
-                    workers=2,
-                )
-                resumed_report = prepare_data.prepare_data(
-                    config=resume_config,
-                    target_tokens=1_053,
-                    tokenizer_threads=1,
-                    tokenize_batch_size=2,
-                    resume=True,
-                    workers=2,
-                )
+                original_should_keep = prepare_data.should_keep_document
+                calls = 0
+
+                def interrupt_after_prefix(text, config, source):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 4:
+                        raise KeyboardInterrupt
+                    return original_should_keep(text, config, source)
+
+                with patch.object(
+                    prepare_data,
+                    "should_keep_document",
+                    side_effect=interrupt_after_prefix,
+                ):
+                    partial_report = prepare_data.prepare_data(
+                        config=resume_config,
+                        target_tokens=1_053,
+                        tokenizer_threads=1,
+                        tokenize_batch_size=1,
+                        workers=1,
+                    )
+                FakeTokenizer.encode_calls = 0
+                with patch.object(
+                    prepare_data,
+                    "compute_minhash_signature",
+                    wraps=prepare_data.compute_minhash_signature,
+                ) as minhash_mock:
+                    resumed_report = prepare_data.prepare_data(
+                        config=resume_config,
+                        target_tokens=1_053,
+                        tokenizer_threads=1,
+                        tokenize_batch_size=1,
+                        resume=True,
+                        workers=1,
+                    )
+                    resume_minhash_calls = minhash_mock.call_count
+                resume_encode_calls = FakeTokenizer.encode_calls
                 resumed_train = np.load(root / "resume" / "processed" / "train.npy")
                 resumed_val = np.load(root / "resume" / "processed" / "val.npy")
 
             self.assertGreater(partial_report["processed_tokens"], 0)
             self.assertEqual(full_report["processed_tokens"], resumed_report["processed_tokens"])
             self.assertGreater(resumed_report["resume_existing_shards"], 0)
+            self.assertLess(resume_encode_calls, len(rows))
+            self.assertLess(resume_minhash_calls, len(rows))
             self.assertEqual(full_train.tolist(), resumed_train.tolist())
             self.assertEqual(full_val.tolist(), resumed_val.tolist())
 
