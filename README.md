@@ -110,6 +110,27 @@ python3 scripts/scrape_open_corpus.py
 python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
 ```
 
+The downloader streams Gutenberg, Stack Exchange, and arXiv from bulk corpus
+snapshots rather than rate-limited public APIs. Python-Edu metadata is resolved
+through persistent concurrent HTTPS connections to Software Heritage's public
+S3 bucket; rows that are too short or already accepted are rejected before the
+content request. By default, each Hugging Face source keeps four input shards
+active (`--hf-workers-per-source`) and Python-Edu uses up to thirty-two persistent
+content fetchers (`--item-workers`, scaled down on smaller machines). New progress
+files store exact Hugging Face stream state, so `--resume` continues at the saved
+input shard instead of replaying every earlier row. Near-complete progress files
+from the old row-counter format skip their multi-million-row replay and fill the
+small remaining tail from a source with a direct cursor. Progress is labelled
+`Accepted corpus`; the displayed rate is accepted estimated tokens over the
+last 15 seconds, so retries, filtering, and other zero-progress time reduce it
+instead of leaving an earlier burst rate on screen. If a requested source is
+exhausted or unavailable, its shortfall is filled from another requested
+streaming source; use `--no-redistribute-shortfall` to preserve strict
+per-source quotas instead. Ctrl+C gives active workers five seconds to flush
+their checkpoints, then exits without waiting for blocked HTTP retries; pressing
+Ctrl+C again skips the grace period. Sources already at their saved target are
+skipped before their potentially large resume indexes are loaded.
+
 `scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies quality filters, fastText language ID, and MinHash/LSH near-deduplication, tokenizes in deterministic input order, writes token shards under `data/processed/shards/`, and transactionally merges them into `data/processed/train.npy` and `data/processed/val.npy`. A `processed_data_manifest.json` commit marker is published only after both arrays are complete and durable; the pipeline will not train from arrays without that marker.
 
 Useful prepare commands:

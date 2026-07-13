@@ -4,7 +4,7 @@ sentencepiece>=0.2.0
 tqdm
 numpy
 requests
-datasets>=2.19.0
+datasets>=4.0.0
 fasttext>=0.9.2
 datasketch>=1.6.5
 xxhash>=3.0.0
