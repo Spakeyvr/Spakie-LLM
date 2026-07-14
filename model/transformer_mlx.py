@@ -236,14 +236,15 @@ class CausalSelfAttentionMLX(nn.Module):
                 q, k, v = mx.split(qkv, 3, axis=-1)
         else:
             if use_compact_proj:
+                compact_x = _compact_rows(linear_x, valid_indices)
                 q = _scatter_compact_rows(
-                    self.q_proj(_compact_rows(linear_x, valid_indices)),
+                    self.q_proj(compact_x),
                     valid_indices,
                     valid_mask,
                     shape=(B, T, C),
                 )
                 kv = _scatter_compact_rows(
-                    self.kv_proj(_compact_rows(linear_x, valid_indices)),
+                    self.kv_proj(compact_x),
                     valid_indices,
                     valid_mask,
                     shape=(B, T, 2 * self.n_kv_heads * self.head_dim),
@@ -823,13 +824,13 @@ class SpakieGPTMLX(nn.Module):
     ) -> mx.array:
         W = self.tok_emb.weight
         flat_x = x.flatten(0, 1)
-        flat_targets = targets.flatten()
         if loss_indices is not None:
             if loss_targets is None or loss_mask is None:
                 raise ValueError("loss_indices requires loss_targets and loss_mask")
             loss_x = mx.take(flat_x, loss_indices, axis=0)
             return _indexed_cross_entropy_mean(loss_x, W, loss_targets, loss_mask)
 
+        flat_targets = targets.flatten()
         N = flat_x.shape[0]
         chunk = self.config.loss_chunk_size or N
         if chunk <= 0 or chunk >= N:
@@ -870,8 +871,9 @@ class SpakieGPTMLX(nn.Module):
                 loss_sum = loss_sum + cl
                 valid_count = valid_count + mx.array(float(j - i), dtype=mx.float32)
             else:
-                cmask = (ct != ignore_index).astype(clogits.dtype)
-                csafe = mx.where(ct != ignore_index, ct, mx.zeros_like(ct))
+                valid = ct != ignore_index
+                cmask = valid.astype(clogits.dtype)
+                csafe = mx.where(valid, ct, mx.zeros_like(ct))
                 cper = nn.losses.cross_entropy(clogits, csafe, reduction="none")
                 loss_sum = loss_sum + (cper * cmask).sum().astype(mx.float32)
                 valid_count = valid_count + cmask.sum().astype(mx.float32)
@@ -887,8 +889,9 @@ def _ce_with_optional_mask(
 ) -> mx.array:
     if ignore_index is None:
         return nn.losses.cross_entropy(flat_logits, flat_targets, reduction="mean")
-    mask = (flat_targets != ignore_index).astype(logits_dtype)
-    safe = mx.where(flat_targets != ignore_index, flat_targets, mx.zeros_like(flat_targets))
+    valid = flat_targets != ignore_index
+    mask = valid.astype(logits_dtype)
+    safe = mx.where(valid, flat_targets, mx.zeros_like(flat_targets))
     per_tok = nn.losses.cross_entropy(flat_logits, safe, reduction="none")
     denom = mx.maximum(mask.sum(), mx.array(1.0, dtype=mask.dtype))
     return (per_tok * mask).sum() / denom
@@ -936,8 +939,9 @@ def _unpack_varlen_heads(
 
 def _block_causal_attention_mask(segment_ids: mx.array, *, dtype) -> mx.array:
     B, T = segment_ids.shape
-    q_pos = mx.arange(T)[:, None]
-    k_pos = mx.arange(T)[None, :]
+    positions = mx.arange(T)
+    q_pos = positions[:, None]
+    k_pos = positions[None, :]
     causal = k_pos <= q_pos
     q_seg = segment_ids[:, :, None]
     k_seg = segment_ids[:, None, :]

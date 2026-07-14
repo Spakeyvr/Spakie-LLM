@@ -1,17 +1,15 @@
-"""Background-thread prefetcher for numpy batches.
+"""Background-thread prefetcher for NumPy batches.
 
-The training loop spends non-trivial time in `stack_batch` (numpy advanced
-indexing + np.stack). Running that on a worker thread overlaps data
-preparation with the previous step's GPU work. We deliberately only pass
-numpy arrays across the thread boundary — MLX arrays stay on the main
-thread, which sidesteps any cross-thread eager-eval ambiguity.
+Batch assembly and optional NumPy-only transforms run on a worker thread so
+they overlap the previous step's GPU work. MLX arrays stay on the main thread,
+which sidesteps cross-thread eager-evaluation ambiguity.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 
@@ -36,9 +34,11 @@ class BatchPrefetcher:
         sampler: ResumableBatchSamplerMLX,
         *,
         maxsize: int = 2,
+        prepare_batch: Callable[[tuple[np.ndarray, ...]], tuple[np.ndarray, ...]] | None = None,
     ):
         self._dataset = dataset
         self._sampler = sampler
+        self._prepare_batch = prepare_batch
         self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self._stop = threading.Event()
         self._error: BaseException | None = None
@@ -55,6 +55,8 @@ class BatchPrefetcher:
                     self._sampler_iter = iter(self._sampler)
                     batch_indices = next(self._sampler_iter)
                 batch = stack_batch(self._dataset, batch_indices)
+                if self._prepare_batch is not None:
+                    batch = self._prepare_batch(batch)
                 while not self._stop.is_set():
                     try:
                         self._queue.put(batch, timeout=0.1)
@@ -68,7 +70,7 @@ class BatchPrefetcher:
     def __iter__(self) -> "BatchPrefetcher":
         return self
 
-    def __next__(self) -> tuple[np.ndarray, np.ndarray]:
+    def __next__(self) -> tuple[np.ndarray, ...]:
         item = self._queue.get()
         if item is _SENTINEL:
             if self._error is not None:

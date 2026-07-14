@@ -34,6 +34,17 @@ class PretrainDatasetMLX:
         chunk = np.asarray(self.data[start : start + self.seq_len + 1], dtype=np.int32)
         return chunk[:-1], chunk[1:]
 
+    def get_batch(self, indices: list[int] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Build contiguous input/target arrays without per-item temporaries."""
+        batch_size = len(indices)
+        x = np.empty((batch_size, self.seq_len), dtype=np.int32)
+        y = np.empty((batch_size, self.seq_len), dtype=np.int32)
+        for row, idx in enumerate(indices):
+            start = int(idx) * self.seq_len
+            x[row] = self.data[start : start + self.seq_len]
+            y[row] = self.data[start + 1 : start + self.seq_len + 1]
+        return x, y
+
 
 class ChatSFTDatasetMLX:
     """JSONL chat dataset with loss masking on non-assistant turns (numpy arrays)."""
@@ -89,6 +100,9 @@ class ChatSFTDatasetMLX:
 
         return np.asarray(x, dtype=np.int32), np.asarray(y, dtype=np.int32)
 
+    def get_batch(self, indices: list[int] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return _stack_items(self, indices)
+
 
 class PretokenizedChatSFTDatasetMLX:
     """In-memory exact cache for SFT `(x, y)` arrays.
@@ -131,6 +145,13 @@ class PretokenizedChatSFTDatasetMLX:
 
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
         return self.x[idx], self.y[idx]
+
+    def get_batch(self, indices: list[int] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        indices_array = np.asarray(indices, dtype=np.int64)
+        return (
+            np.ascontiguousarray(self.x[indices_array]),
+            np.ascontiguousarray(self.y[indices_array]),
+        )
 
 
 def train_val_split_mlx(dataset, val_fraction: float = 0.05, seed: int = 42):
@@ -198,12 +219,20 @@ class SubsetView:
     def __init__(self, dataset, indices):
         self.dataset = dataset
         self.indices = list(indices)
+        self._indices_array = np.asarray(self.indices, dtype=np.int64)
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, idx: int):
         return self.dataset[self.indices[idx]]
+
+    def get_batch(self, indices: list[int] | np.ndarray):
+        mapped = self._indices_array[np.asarray(indices, dtype=np.int64)]
+        get_batch = getattr(self.dataset, "get_batch", None)
+        if get_batch is not None:
+            return get_batch(mapped)
+        return _stack_items(self.dataset, mapped)
 
 
 class ResumableBatchSamplerMLX:
@@ -252,6 +281,22 @@ class ResumableBatchSamplerMLX:
             batch = self.indices[self.position : next_position]
             self.position = next_position
             yield batch
+
+    def advance_batches(self, count: int) -> None:
+        """Advance sampler state without allocating batches that are discarded."""
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        while count:
+            remaining = len(self.indices) - self.position
+            if remaining < self.batch_size:
+                if not self.drop_last and remaining > 0:
+                    self._refresh_indices()
+                    count -= 1
+                else:
+                    self._refresh_indices()
+                continue
+            self.position += self.batch_size
+            count -= 1
 
     def iter_fixed(self, max_batches: int | None = None):
         """Iterate a stable prefix of the current permutation without mutating state.
@@ -302,13 +347,23 @@ def sequence_length_at(dataset, idx: int, *, pad_id: int = 0, ignore_index: int 
 
 
 def sequence_lengths(dataset, *, pad_id: int = 0, ignore_index: int = -100) -> np.ndarray:
-    return np.asarray(
-        [
-            sequence_length_at(dataset, i, pad_id=pad_id, ignore_index=ignore_index)
-            for i in range(len(dataset))
-        ],
-        dtype=np.int32,
-    )
+    lengths = np.empty((len(dataset),), dtype=np.int32)
+    batch_size = 4096
+    for start in range(0, len(dataset), batch_size):
+        stop = min(start + batch_size, len(dataset))
+        x, y = stack_batch(dataset, np.arange(start, stop, dtype=np.int64))[:2]
+        keep = (x != pad_id) | (y != ignore_index)
+        if keep.shape[1] == 0:
+            lengths[start:stop] = 1
+            continue
+        has_tokens = keep.any(axis=1)
+        last_from_right = np.argmax(keep[:, ::-1], axis=1)
+        lengths[start:stop] = np.where(
+            has_tokens,
+            keep.shape[1] - last_from_right,
+            1,
+        ).astype(np.int32, copy=False)
+    return lengths
 
 
 class LengthBucketBatchSamplerMLX:
@@ -602,10 +657,10 @@ class TokenBudgetLengthBatchSamplerMLX:
                 yield batches[int(batch_idx)]
 
 
-def stack_batch(dataset, indices: list[int] | np.ndarray):
+def _stack_items(dataset, indices: list[int] | np.ndarray):
     columns = None
     for idx in indices:
-        item = dataset[idx]
+        item = dataset[int(idx)]
         if not isinstance(item, tuple):
             item = (item,)
         if columns is None:
@@ -615,6 +670,13 @@ def stack_batch(dataset, indices: list[int] | np.ndarray):
     if columns is None:
         raise ValueError("cannot stack an empty batch")
     return tuple(np.stack(column) for column in columns)
+
+
+def stack_batch(dataset, indices: list[int] | np.ndarray):
+    get_batch = getattr(dataset, "get_batch", None)
+    if get_batch is not None:
+        return get_batch(indices)
+    return _stack_items(dataset, indices)
 
 
 def pack_sft_batch(
@@ -645,12 +707,20 @@ def pack_sft_batch(
     row_cursors: list[int] = []
     row_segments: list[int] = []
 
-    lengths = np.zeros((logical_batch,), dtype=np.int32)
-    for row_idx in range(logical_batch):
-        keep = (x[row_idx] != pad_id) | (y[row_idx] != ignore_index)
-        if keep.any():
-            lengths[row_idx] = min(int(np.nonzero(keep)[0].max()) + 1, max_len)
+    keep = (x != pad_id) | (y != ignore_index)
+    if original_seq_len:
+        has_tokens = keep.any(axis=1)
+        last_from_right = np.argmax(keep[:, ::-1], axis=1)
+        lengths = np.where(
+            has_tokens,
+            original_seq_len - last_from_right,
+            0,
+        ).astype(np.int32, copy=False)
+        np.minimum(lengths, max_len, out=lengths)
+    else:
+        lengths = np.zeros((logical_batch,), dtype=np.int32)
     row_order = np.argsort(lengths)[::-1]
+    positions = np.arange(max_len, dtype=np.int32)
 
     for row_idx in row_order:
         length = int(lengths[row_idx])
@@ -674,7 +744,7 @@ def pack_sft_batch(
         rows_x[target][cursor:end] = x[row_idx, :length]
         rows_y[target][cursor:end] = y[row_idx, :length]
         rows_seg[target][cursor:end] = row_segments[target]
-        rows_pos[target][cursor:end] = np.arange(length, dtype=np.int32)
+        rows_pos[target][cursor:end] = positions[:length]
         row_cursors[target] = end
         row_segments[target] += 1
 
@@ -780,8 +850,7 @@ def append_valid_token_indices(
         n = 0
 
     if n < capacity:
-        invalid_positions = np.flatnonzero(~flat_keep).astype(np.int32, copy=False)
-        pad_position = int(invalid_positions[0]) if invalid_positions.size else 0
+        pad_position = int(np.argmax(~flat_keep))
         valid_indices[n:] = pad_position
 
     return (
@@ -803,34 +872,30 @@ def append_packed_varlen_attention_metadata(
     if segment_ids.ndim != 2:
         raise ValueError("segment_ids must be rank-2")
 
-    flat_indices: list[int] = []
-    lengths: list[int] = []
-    rows, seq_len = segment_ids.shape
-    for row in range(rows):
-        row_seg = segment_ids[row]
-        valid = np.nonzero(row_seg >= 0)[0]
-        if valid.size == 0:
-            continue
-        start = 0
-        while start < valid.size:
-            first_pos = int(valid[start])
-            seg = int(row_seg[first_pos])
-            stop = start + 1
-            while stop < valid.size and int(row_seg[int(valid[stop])]) == seg:
-                stop += 1
-            positions = valid[start:stop].astype(np.int32, copy=False)
-            flat_indices.extend((row * seq_len + positions).tolist())
-            lengths.append(int(stop - start))
-            start = stop
-
-    if not flat_indices:
-        flat_indices = [0]
-        lengths = [1]
-    cu = np.zeros((len(lengths) + 1,), dtype=np.int32)
-    cu[1:] = np.cumsum(np.asarray(lengths, dtype=np.int32))
+    _, seq_len = segment_ids.shape
+    flat_segment_ids = segment_ids.reshape(-1)
+    flat_indices = np.flatnonzero(flat_segment_ids >= 0).astype(np.int32, copy=False)
+    if flat_indices.size:
+        selected_segments = flat_segment_ids[flat_indices]
+        row_ids = flat_indices.astype(np.int64, copy=False) // seq_len
+        segment_starts = np.empty((flat_indices.size,), dtype=bool)
+        segment_starts[0] = True
+        segment_starts[1:] = (
+            (row_ids[1:] != row_ids[:-1])
+            | (selected_segments[1:] != selected_segments[:-1])
+        )
+        starts = np.flatnonzero(segment_starts)
+        lengths = np.diff(
+            np.append(starts, flat_indices.size)
+        ).astype(np.int32, copy=False)
+    else:
+        flat_indices = np.asarray([0], dtype=np.int32)
+        lengths = np.asarray([1], dtype=np.int32)
+    cu = np.zeros((lengths.size + 1,), dtype=np.int32)
+    cu[1:] = np.cumsum(lengths, dtype=np.int64)
     return (
         *batch,
-        np.ascontiguousarray(np.asarray(flat_indices, dtype=np.int32)),
+        np.ascontiguousarray(flat_indices),
         np.ascontiguousarray(cu),
     )
 
@@ -847,10 +912,11 @@ def trim_right_padding_bucket(
     if x.ndim != 2 or y.ndim != 2 or x.shape != y.shape:
         return x, y
     keep = (x != pad_id) | (y != ignore_index)
-    if not keep.any():
+    active_columns = np.flatnonzero(keep.any(axis=0))
+    if active_columns.size == 0:
         target_len = 1
     else:
-        target_len = int(np.nonzero(keep)[1].max()) + 1
+        target_len = int(active_columns[-1]) + 1
     if bucket_multiple > 1:
         target_len = (
             (target_len + bucket_multiple - 1) // bucket_multiple
@@ -877,10 +943,11 @@ def trim_after_last_supervised_bucket(
     if x.ndim != 2 or y.ndim != 2 or x.shape != y.shape:
         return x, y
     supervised = y != ignore_index
-    if not supervised.any():
+    active_columns = np.flatnonzero(supervised.any(axis=0))
+    if active_columns.size == 0:
         target_len = 1
     else:
-        target_len = int(np.nonzero(supervised)[1].max()) + 1
+        target_len = int(active_columns[-1]) + 1
     if bucket_multiple > 1:
         target_len = (
             (target_len + bucket_multiple - 1) // bucket_multiple

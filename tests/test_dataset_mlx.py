@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,13 +11,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from training.dataset_mlx import (
+    append_packed_varlen_attention_metadata,
     ChatSFTDatasetMLX,
     HomogeneousStepSortedBatchSamplerMLX,
     LengthBucketBatchSamplerMLX,
     pack_sft_batch,
+    PretrainDatasetMLX,
     PretokenizedChatSFTDatasetMLX,
     ResumableBatchSamplerMLX,
     sequence_lengths,
+    stack_batch,
+    SubsetView,
     StepSortedBatchSamplerMLX,
     trim_after_last_supervised_bucket,
     trim_right_padding_bucket,
@@ -36,6 +41,53 @@ class FakeTokenizer:
 
 
 class MLXDatasetUtilityTests(unittest.TestCase):
+    def test_resumable_sampler_fast_advance_matches_iteration(self):
+        for drop_last in (False, True):
+            with self.subTest(drop_last=drop_last):
+                iterated = ResumableBatchSamplerMLX(
+                    dataset_size=11,
+                    batch_size=4,
+                    drop_last=drop_last,
+                    seed=321,
+                )
+                advanced = ResumableBatchSamplerMLX.from_state_dict(
+                    iterated.state_dict()
+                )
+                iterator = iter(iterated)
+                for _ in range(7):
+                    next(iterator)
+                advanced.advance_batches(7)
+
+                self.assertEqual(iterated.position, advanced.position)
+                self.assertEqual(
+                    iterated.rng.bit_generator.state,
+                    advanced.rng.bit_generator.state,
+                )
+                np.testing.assert_array_equal(iterated.indices, advanced.indices)
+                np.testing.assert_array_equal(next(iterator), next(iter(advanced)))
+
+    def test_pretrain_batch_fetch_matches_item_stacking_and_subset_mapping(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "tokens.npy"
+            np.save(path, np.arange(81, dtype=np.uint16))
+            dataset = PretrainDatasetMLX(str(path), seq_len=8)
+            indices = np.asarray([4, 0, 7], dtype=np.int64)
+
+            expected_x = np.stack([dataset[int(idx)][0] for idx in indices])
+            expected_y = np.stack([dataset[int(idx)][1] for idx in indices])
+            actual_x, actual_y = stack_batch(dataset, indices)
+
+            np.testing.assert_array_equal(actual_x, expected_x)
+            np.testing.assert_array_equal(actual_y, expected_y)
+            self.assertTrue(actual_x.flags.c_contiguous)
+            self.assertTrue(actual_y.flags.c_contiguous)
+
+            subset = SubsetView(dataset, [7, 2, 5])
+            subset_x, subset_y = stack_batch(subset, [2, 0])
+            direct_x, direct_y = stack_batch(dataset, [5, 7])
+            np.testing.assert_array_equal(subset_x, direct_x)
+            np.testing.assert_array_equal(subset_y, direct_y)
+
     def test_fixed_sampler_iteration_is_repeatable_and_does_not_advance_state(self):
         sampler = ResumableBatchSamplerMLX(
             dataset_size=11,
@@ -135,7 +187,7 @@ class MLXDatasetUtilityTests(unittest.TestCase):
     def test_sequence_lengths_uses_input_or_label_content(self):
         class Dataset:
             def __len__(self):
-                return 2
+                return 3
 
             def __getitem__(self, idx):
                 if idx == 0:
@@ -143,12 +195,20 @@ class MLXDatasetUtilityTests(unittest.TestCase):
                         np.asarray([1, 2, 0, 0], dtype=np.int32),
                         np.asarray([-100, -100, -100, -100], dtype=np.int32),
                     )
+                if idx == 1:
+                    return (
+                        np.asarray([0, 0, 0, 0], dtype=np.int32),
+                        np.asarray([-100, 3, 4, -100], dtype=np.int32),
+                    )
                 return (
                     np.asarray([0, 0, 0, 0], dtype=np.int32),
-                    np.asarray([-100, 3, 4, -100], dtype=np.int32),
+                    np.asarray([-100, -100, -100, -100], dtype=np.int32),
                 )
 
-        np.testing.assert_array_equal(sequence_lengths(Dataset()), np.asarray([2, 3], dtype=np.int32))
+        np.testing.assert_array_equal(
+            sequence_lengths(Dataset()),
+            np.asarray([2, 3, 1], dtype=np.int32),
+        )
 
     def test_length_bucket_sampler_groups_similar_lengths(self):
         lengths = np.asarray([5, 100, 6, 99, 7, 98, 8, 97], dtype=np.int32)
@@ -291,6 +351,32 @@ class MLXDatasetUtilityTests(unittest.TestCase):
         np.testing.assert_array_equal(px[1, :3], np.asarray([10, 11, 12], dtype=np.int32))
         np.testing.assert_array_equal(segments[1, :3], np.asarray([0, 0, 0], dtype=np.int32))
         np.testing.assert_array_equal(positions[1, :3], np.asarray([0, 1, 2], dtype=np.int32))
+
+    def test_packed_varlen_metadata_preserves_flat_order_and_segment_lengths(self):
+        segment_ids = np.asarray(
+            [
+                [0, 0, -1, 1, 1, -1],
+                [2, -1, 2, 3, -1, -1],
+            ],
+            dtype=np.int32,
+        )
+        batch = (
+            np.zeros_like(segment_ids),
+            np.full_like(segment_ids, -100),
+            segment_ids,
+            np.zeros_like(segment_ids),
+        )
+
+        output = append_packed_varlen_attention_metadata(batch)
+
+        np.testing.assert_array_equal(
+            output[-2],
+            np.asarray([0, 1, 3, 4, 6, 8, 9], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            output[-1],
+            np.asarray([0, 2, 4, 6, 7], dtype=np.int32),
+        )
 
 
 if __name__ == "__main__":

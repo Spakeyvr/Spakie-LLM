@@ -7,6 +7,7 @@ catch algebra/index/mask bugs when porting — not to regress on bitwise identit
 
 from __future__ import annotations
 
+import os
 import sys
 import subprocess
 import tempfile
@@ -120,6 +121,56 @@ class TorchMLXForwardParityTests(unittest.TestCase):
                 )
 
         mlx_model.update(tree_unflatten(list(overrides.items())))
+
+    def test_mlx_sft_prefetch_optimizer_step_smoke(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+        from runtime.mlx_backend import MLXRuntimeSettings
+        from training.finetune_mlx import finetune_mlx
+
+        class Dataset:
+            def __init__(self, rows: int):
+                base = np.arange(16, dtype=np.int32)
+                self.x = np.stack([(base + row) % 127 for row in range(rows)])
+                self.y = np.roll(self.x, -1, axis=1)
+                self.y[:, ::3] = -100
+
+            def __len__(self):
+                return len(self.x)
+
+            def __getitem__(self, idx):
+                return self.x[idx], self.y[idx]
+
+            def get_batch(self, indices):
+                indices = np.asarray(indices, dtype=np.int64)
+                return self.x[indices], self.y[indices]
+
+        config = self._tiny_config()
+        config.preset_name = "test"
+        config.sft_batch_size = 2
+        config.sft_grad_accum_steps = 2
+        config.sft_epochs = 1
+        config.sft_optimizer = "adamw"
+        config.sft_patience = 2
+        runtime = MLXRuntimeSettings(precision="fp32", dtype=mx.float32)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config.checkpoint_dir = tmpdir
+            model = SpakieGPTMLX(config)
+            with mock.patch.dict(os.environ, {"SPAKIE_MONITOR": "0"}):
+                best_loss = finetune_mlx(
+                    model,
+                    Dataset(8),
+                    Dataset(4),
+                    config,
+                    runtime,
+                    use_compile=True,
+                    use_prefetch=True,
+                    max_steps=1,
+                )
+
+        self.assertEqual(best_loss, float("inf"))
 
     def test_forward_logits_match_within_tolerance(self):
         import mlx.core as mx

@@ -60,6 +60,21 @@ def _apply_optimizer_to_master(
         master_params[name] = value.astype(mx.float32)
 
 
+def _publish_master_params(
+    model,
+    master_params: dict[str, mx.array],
+    model_dtypes: dict[str, object],
+) -> dict:
+    published = tree_unflatten(
+        [
+            (name, value.astype(model_dtypes[name]))
+            for name, value in master_params.items()
+        ]
+    )
+    model.update(published)
+    return published
+
+
 def muon_newton_schulz_mlx(
     update: mx.array,
     *,
@@ -114,7 +129,7 @@ class DualAdamW:
 
     optimizer_kind = "adamw"
 
-    def __init__(self, learning_rate: float, weight_decay: float, betas: tuple[float, float]):
+    def __init__(self, model, learning_rate: float, weight_decay: float, betas: tuple[float, float]):
         self._weight_decay = weight_decay
         self.decay = optim.AdamW(
             learning_rate=learning_rate, weight_decay=weight_decay, betas=betas,
@@ -124,7 +139,15 @@ class DualAdamW:
             learning_rate=learning_rate, weight_decay=0.0, betas=betas,
             bias_correction=True,
         )
-        self.master_params: dict[str, mx.array] = {}
+        self.model_parameters = model.parameters()
+        param_flat = _flatten_arrays(self.model_parameters)
+        self._model_dtypes = {name: value.dtype for name, value in param_flat.items()}
+        self._decay_names = {
+            name for name, value in param_flat.items() if len(value.shape) >= 2
+        }
+        self.master_params: dict[str, mx.array] = {
+            name: value.astype(mx.float32) for name, value in param_flat.items()
+        }
         self._master_loaded = False
 
     @property
@@ -136,28 +159,17 @@ class DualAdamW:
         self.nodecay.learning_rate = lr
 
     def update(self, model, grads) -> None:
-        model_flat = _flatten_arrays(model.parameters())
-        if not self.master_params:
-            self.master_params = {
-                name: value.astype(mx.float32) for name, value in model_flat.items()
-            }
         grad_flat = _flatten_arrays(grads)
-        decay_names = {
-            name for name, value in model_flat.items() if len(value.shape) >= 2
+        decay_grads = {
+            name: grad for name, grad in grad_flat.items() if name in self._decay_names
         }
-        decay_grads = {name: grad for name, grad in grad_flat.items() if name in decay_names}
         nodecay_grads = {
-            name: grad for name, grad in grad_flat.items() if name not in decay_names
+            name: grad for name, grad in grad_flat.items() if name not in self._decay_names
         }
         _apply_optimizer_to_master(self.decay, self.master_params, decay_grads)
         _apply_optimizer_to_master(self.nodecay, self.master_params, nodecay_grads)
-        model.update(
-            tree_unflatten(
-                [
-                    (name, value.astype(model_flat[name].dtype))
-                    for name, value in self.master_params.items()
-                ]
-            )
+        self.model_parameters = _publish_master_params(
+            model, self.master_params, self._model_dtypes
         )
 
     def state_trees(self) -> dict:
@@ -181,13 +193,24 @@ class DualAdamW:
     def sync_master_from_model(self, model) -> None:
         if self._master_loaded:
             return
+        self.model_parameters = model.parameters()
+        model_flat = _flatten_arrays(self.model_parameters)
+        self._model_dtypes = {name: value.dtype for name, value in model_flat.items()}
         self.master_params = {
             name: value.astype(mx.float32)
-            for name, value in _flatten_arrays(model.parameters()).items()
+            for name, value in model_flat.items()
         }
 
+    def evaluation_state(self) -> tuple:
+        return (
+            self.model_parameters,
+            self.master_params,
+            self.decay.state,
+            self.nodecay.state,
+        )
+
     def eval_state(self) -> None:
-        mx.eval(self.master_params, self.decay.state, self.nodecay.state)
+        mx.eval(*self.evaluation_state())
 
 
 class MuonAdamWMLX:
@@ -230,7 +253,9 @@ class MuonAdamWMLX:
 
             self._compiled_muon_ns = _compiled_muon_ns
         self.muon_state: dict[str, mx.array] = {}
-        param_flat = _flatten_arrays(model.parameters())
+        self.model_parameters = model.parameters()
+        param_flat = _flatten_arrays(self.model_parameters)
+        self._model_dtypes = {name: value.dtype for name, value in param_flat.items()}
         muon_route = (muon_route or "all").lower()
 
         def _route_allows(name: str) -> bool:
@@ -275,7 +300,6 @@ class MuonAdamWMLX:
 
     def update(self, model, grads) -> None:
         grad_flat = _flatten_arrays(grads)
-        model_flat = _flatten_arrays(model.parameters())
         # Gradients from a BF16 forward pass are promoted before any optimizer
         # state or master-parameter arithmetic. This prevents Adam moments and
         # Muon momentum from inheriting BF16's coarse mantissa.
@@ -320,13 +344,8 @@ class MuonAdamWMLX:
         # higher-precision values for the next optimizer step.
         if updates:
             self.master_params.update(updates)
-        model.update(
-            tree_unflatten(
-                [
-                    (name, value.astype(model_flat[name].dtype))
-                    for name, value in self.master_params.items()
-                ]
-            )
+        self.model_parameters = _publish_master_params(
+            model, self.master_params, self._model_dtypes
         )
         self._master_loaded = True
         self.muon_state = next_muon_state
@@ -493,18 +512,25 @@ class MuonAdamWMLX:
     def sync_master_from_model(self, model) -> None:
         if self._master_loaded:
             return
+        self.model_parameters = model.parameters()
+        model_flat = _flatten_arrays(self.model_parameters)
+        self._model_dtypes = {name: value.dtype for name, value in model_flat.items()}
         self.master_params = {
             name: value.astype(mx.float32)
-            for name, value in _flatten_arrays(model.parameters()).items()
+            for name, value in model_flat.items()
         }
 
-    def eval_state(self) -> None:
-        mx.eval(
+    def evaluation_state(self) -> tuple:
+        return (
+            self.model_parameters,
             self.master_params,
-            tree_unflatten(list(self.muon_state.items())),
+            self.muon_state,
             self.aux_decay.state,
             self.aux_nodecay.state,
         )
+
+    def eval_state(self) -> None:
+        mx.eval(*self.evaluation_state())
 
 
 def configure_mlx_optimizer(
@@ -517,7 +543,12 @@ def configure_mlx_optimizer(
 ):
     optimizer_kind = normalize_optimizer_kind(kind)
     if optimizer_kind == "adamw":
-        return DualAdamW(learning_rate=learning_rate, weight_decay=weight_decay, betas=(0.9, 0.95))
+        return DualAdamW(
+            model,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.95),
+        )
     return MuonAdamWMLX(
         model,
         learning_rate=learning_rate,

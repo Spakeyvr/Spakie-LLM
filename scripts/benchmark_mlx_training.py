@@ -738,10 +738,17 @@ def _benchmark_steps(
 
         def eval_optimizer_boundary(loss_value):
             targets = []
-            if optimizer_eval_target in {"all", "model"}:
-                targets.append(model.parameters())
             if optimizer_eval_target == "all":
-                targets.append(optimizer.state_trees())
+                if compiled_optimizer_step is not None or compiled_full_step is not None:
+                    targets.extend((model.parameters(), optimizer.state_trees()))
+                else:
+                    targets.extend(optimizer.evaluation_state())
+            elif optimizer_eval_target == "model":
+                targets.append(
+                    model.parameters()
+                    if compiled_optimizer_step is not None or compiled_full_step is not None
+                    else optimizer.model_parameters
+                )
             targets.append(loss_value)
             if async_step_eval:
                 mx.async_eval(*targets)
@@ -955,7 +962,10 @@ def _benchmark_steps(
             if loss_log is not None:
                 loss_log.write(f"{step_idx + 1},{float(last_loss.item()):.8f}\n")
                 loss_log.flush()
-        mx.eval(model.parameters(), optimizer.state_trees(), last_loss)
+        if compiled_optimizer_step is not None or compiled_full_step is not None:
+            mx.eval(model.parameters(), optimizer.state_trees(), last_loss)
+        else:
+            mx.eval(*optimizer.evaluation_state(), last_loss)
         elapsed = time.perf_counter() - start
     finally:
         if loss_log is not None:

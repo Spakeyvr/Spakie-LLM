@@ -30,6 +30,16 @@ class PretrainDataset(Dataset):
         y = torch.from_numpy(chunk[1:].copy())
         return x, y
 
+    def __getitems__(self, indices):
+        """Fetch a batch with one allocation and one corpus read per row."""
+        batch = np.empty((len(indices), self.seq_len + 1), dtype=np.int64)
+        for row, idx in enumerate(indices):
+            start = int(idx) * self.seq_len
+            batch[row] = self.data[start : start + self.seq_len + 1]
+
+        tokens = torch.from_numpy(batch)
+        return list(zip(tokens[:, :-1], tokens[:, 1:]))
+
 
 class ChatSFTDataset(Dataset):
     """JSONL chat dataset with loss masking on non-assistant turns."""

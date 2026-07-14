@@ -307,7 +307,16 @@ def finetune_mlx(
     print(format_monitor_start_message(monitor_info))
     atexit.register(stop_background_monitor, monitor_info)
 
-    def varlen_microbatch_step(batch_mx, cu_key: tuple[int, ...] | None = None):
+    use_varlen_step = sft_pack and config.attention_backend == "mfa-varlen"
+    prepare_sft_batch = partial(
+        _prepare_sft_batch_np,
+        config=config,
+        sft_pack=sft_pack,
+        sft_gather_loss=sft_gather_loss,
+        sft_bucket_multiple=sft_bucket_multiple,
+    )
+
+    def varlen_microbatch_step(batch_mx, cu_key: bytes | None = None):
         x_arg, y_arg, seg_arg, pos_arg, idx_arg, cu_arg = batch_mx[:6]
         if cu_key is None:
             raise RuntimeError("mfa-varlen SFT requires a precomputed static cu-seqlens key")
@@ -380,9 +389,9 @@ def finetune_mlx(
             else:
                 raise
         if async_step_eval:
-            mx.async_eval(model.parameters(), optimizer.state_trees())
+            mx.async_eval(*optimizer.evaluation_state(), accum_loss_lazy)
         else:
-            mx.eval(model.parameters(), optimizer.state_trees())
+            mx.eval(*optimizer.evaluation_state(), accum_loss_lazy)
 
         step_sum_loss = float(accum_loss_lazy.item()) * config.sft_grad_accum_steps
         step_mean_loss = step_sum_loss / max(micro_in_step, 1)
@@ -425,7 +434,13 @@ def finetune_mlx(
                 desc=f"SFT[mlx] Epoch {epoch + 1}/{config.sft_epochs}",
             )
             prefetcher = (
-                BatchPrefetcher(train_dataset, train_sampler) if use_prefetch else None
+                BatchPrefetcher(
+                    train_dataset,
+                    train_sampler,
+                    prepare_batch=prepare_sft_batch,
+                )
+                if use_prefetch
+                else None
             )
             train_iter = None if prefetcher is not None else iter(train_sampler)
 
@@ -457,20 +472,14 @@ def finetune_mlx(
                         profiler.add("batch_fetch", now() - batch_start)
                     else:
                         batch_np = next_batch()
-                    if profiler.enabled and sft_pack:
-                        pack_start = now()
-                    batch_np = _prepare_sft_batch_np(
-                        batch_np,
-                        config=config,
-                        sft_pack=sft_pack,
-                        sft_gather_loss=sft_gather_loss,
-                        sft_bucket_multiple=sft_bucket_multiple,
-                    )
-                    if profiler.enabled and sft_pack:
-                        profiler.add("sft_pack", now() - pack_start)
-                    use_varlen_step = sft_pack and config.attention_backend == "mfa-varlen"
+                    if prefetcher is None:
+                        if profiler.enabled and sft_pack:
+                            pack_start = now()
+                        batch_np = prepare_sft_batch(batch_np)
+                        if profiler.enabled and sft_pack:
+                            profiler.add("sft_pack", now() - pack_start)
                     varlen_cu_key = (
-                        tuple(int(v) for v in batch_np[5])
+                        batch_np[5].tobytes()
                         if use_varlen_step and len(batch_np) >= 6
                         else None
                     )

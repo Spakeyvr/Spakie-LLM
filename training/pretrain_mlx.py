@@ -754,6 +754,8 @@ def pretrain_mlx(
     )
     vmap_accum_step = None
     vmap_group_size = 0
+    vmap_n_groups = 0
+    vmap_sync_warmup = 0
     if use_vmap_accum_step:
         if config.pretrain_grad_accum_steps < 2:
             raise ValueError("use_vmap_accum_step requires pretrain_grad_accum_steps >= 2")
@@ -766,10 +768,13 @@ def pretrain_mlx(
             grad_accum=grad_accum,
             budget_frac=float(getattr(config, "pretrain_vmap_mem_budget_frac", 0.70)),
         )
-        n_groups = math.ceil(grad_accum / vmap_group_size)
+        vmap_n_groups = math.ceil(grad_accum / vmap_group_size)
+        vmap_sync_warmup = int(
+            getattr(config, "pretrain_vmap_sync_warmup_steps", 0) or 0
+        )
         print(
             f"vmap accumulation: grad_accum={grad_accum}, group_size={vmap_group_size}, "
-            f"groups/step={n_groups} (peak ~ group_size lanes resident; "
+            f"groups/step={vmap_n_groups} (peak ~ group_size lanes resident; "
             f"a full-G vmap would hold all {grad_accum} lanes and can panic the "
             f"macOS kernel when it exceeds physical RAM)"
         )
@@ -825,7 +830,6 @@ def pretrain_mlx(
     committed_sampler = ResumableBatchSamplerMLX.from_state_dict(
         train_sampler.state_dict(copy_indices=False)
     )
-    committed_iter = iter(committed_sampler)
     if use_prefetch:
         prefetcher = BatchPrefetcher(train_dataset, train_sampler)
     else:
@@ -878,9 +882,7 @@ def pretrain_mlx(
 
                 step_start = now() if profiler.enabled else None
                 grad_accum = config.pretrain_grad_accum_steps
-                n_groups = math.ceil(grad_accum / vmap_group_size)
-                sync_warmup = int(getattr(config, "pretrain_vmap_sync_warmup_steps", 0) or 0)
-                for gi in range(n_groups):
+                for gi in range(vmap_n_groups):
                     lo = gi * vmap_group_size
                     hi = min(lo + vmap_group_size, grad_accum)
                     group_loss, group_grads = vmap_accum_step(
@@ -897,8 +899,8 @@ def pretrain_mlx(
                     # the groups overlap and peak memory returns to the full-G
                     # (kernel-panicking) footprint. The final group may async_eval
                     # to overlap with the optimizer, except during sync warmup.
-                    is_last = gi == n_groups - 1
-                    if is_last and global_step >= sync_warmup:
+                    is_last = gi == vmap_n_groups - 1
+                    if is_last and global_step >= vmap_sync_warmup:
                         mx.async_eval(accum_grads, accum_loss)
                     else:
                         mx.eval(accum_grads, accum_loss)
@@ -985,15 +987,14 @@ def pretrain_mlx(
                 else:
                     raise
 
-            mx.eval(model.parameters(), optimizer.state_trees(), accum_loss)
+            mx.eval(*optimizer.evaluation_state(), accum_loss)
             accum_loss_val = None
             if profiler.enabled:
                 profiler.add("opt_step", now() - opt_start)
 
             global_step += 1
             tokens_processed += step_tokens
-            for _ in range(consumed_microbatches):
-                next(committed_iter)
+            committed_sampler.advance_batches(consumed_microbatches)
             window_steps += 1
             pbar.update(1)
             if status_writer.due():

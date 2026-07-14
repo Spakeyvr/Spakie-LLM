@@ -80,6 +80,22 @@ class ResumableBatchSampler:
             self.position = next_position
             yield batch
 
+    def advance_batches(self, count: int) -> None:
+        """Advance sampler state without constructing discarded index lists."""
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        while count:
+            remaining = self.indices.numel() - self.position
+            if remaining < self.batch_size:
+                if not self.drop_last and remaining > 0:
+                    self._refresh_indices()
+                    count -= 1
+                else:
+                    self._refresh_indices()
+                continue
+            self.position += self.batch_size
+            count -= 1
+
     def state_dict(self) -> dict[str, object]:
         return {
             "generator_state": self.generator.get_state(),
@@ -219,18 +235,23 @@ def get_lr(step: int, config: SpakieConfig) -> float:
 @torch.no_grad()
 def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, runtime: RuntimeSettings) -> float:
     model.eval()
-    total_loss = 0.0
-    count = 0
+    losses = []
+    non_blocking = runtime.device.type == "cuda"
     for i, (x, y) in enumerate(val_loader):
         if i >= config.pretrain_eval_batches:
             break
-        x, y = x.to(runtime.device), y.to(runtime.device)
+        x = x.to(runtime.device, non_blocking=non_blocking)
+        y = y.to(runtime.device, non_blocking=non_blocking)
         with autocast_context(runtime):
             _, loss = model(x, y)
-        total_loss += loss.item()
-        count += 1
+        losses.append(loss.detach())
     model.train()
-    return total_loss / max(count, 1)
+    if not losses:
+        return 0.0
+    total_loss = 0.0
+    for value in torch.stack(losses).tolist():
+        total_loss += value
+    return total_loss / len(losses)
 
 
 def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
@@ -248,6 +269,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
         weight_decay=config.pretrain_weight_decay,
     )
     scaler = create_grad_scaler(runtime)
+    parameters = tuple(model.parameters())
+    non_blocking = runtime.device.type == "cuda"
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     train_sampler = getattr(train_loader, "batch_sampler", None)
@@ -257,7 +280,6 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     # independent cursor advances only after an optimizer step commits, so a
     # checkpoint never skips prefetched-but-untrained examples.
     committed_sampler = ResumableBatchSampler.from_state_dict(train_sampler.state_dict())
-    committed_iter = iter(committed_sampler)
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -331,7 +353,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     train_iter = iter(train_loader)
                     x, y = next(train_iter)
 
-                x, y = x.to(runtime.device), y.to(runtime.device)
+                x = x.to(runtime.device, non_blocking=non_blocking)
+                y = y.to(runtime.device, non_blocking=non_blocking)
                 with autocast_context(runtime):
                     _, loss = model(x, y)
                     loss = loss / config.pretrain_grad_accum_steps
@@ -346,7 +369,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
 
             scaler.unscale_(optimizer)
             if config.pretrain_grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.pretrain_grad_clip)
+                torch.nn.utils.clip_grad_norm_(parameters, config.pretrain_grad_clip)
 
             # Update LR
             lr = get_lr(global_step, config)
@@ -355,7 +378,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             # MPS bug: addcmul_/addcdiv_ silently fails on non-contiguous tensors (AdamW internals),
             # causing weights to stop updating. Force contiguous before the step.
             if runtime.device.type == "mps":
-                for p in model.parameters():
+                for p in parameters:
                     if p.grad is not None and not p.grad.is_contiguous():
                         p.grad = p.grad.contiguous()
 
@@ -386,8 +409,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             scaler.update()
             global_step += 1
             tokens_processed += step_tokens
-            for _ in range(consumed_microbatches):
-                next(committed_iter)
+            committed_sampler.advance_batches(consumed_microbatches)
             pbar.update(1)
             elapsed = time.time() - start_time
             status_writer.update(

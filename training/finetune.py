@@ -27,23 +27,56 @@ from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers import configure_torch_optimizer, set_optimizer_lr
 
 
-def _ensure_contiguous_mps_grads(model: SpakieGPT, runtime: RuntimeSettings) -> None:
+def _parameter_iter(model_or_parameters):
+    if hasattr(model_or_parameters, "parameters"):
+        return model_or_parameters.parameters()
+    return iter(model_or_parameters)
+
+
+def _ensure_contiguous_mps_grads(model_or_parameters, runtime: RuntimeSettings) -> None:
     if runtime.device.type != "mps":
         return
-    for param in model.parameters():
+    for param in _parameter_iter(model_or_parameters):
         if param.grad is not None and not param.grad.is_contiguous():
             param.grad = param.grad.contiguous()
 
 
-def _scale_partial_sft_grads(model: SpakieGPT, config: SpakieConfig, microbatches_in_step: int) -> None:
+def _scale_partial_sft_grads(model_or_parameters, config: SpakieConfig, microbatches_in_step: int) -> None:
     if microbatches_in_step <= 0:
         raise ValueError("microbatches_in_step must be positive")
     if microbatches_in_step == config.sft_grad_accum_steps:
         return
     scale = config.sft_grad_accum_steps / microbatches_in_step
-    for param in model.parameters():
+    for param in _parameter_iter(model_or_parameters):
         if param.grad is not None:
             param.grad.mul_(scale)
+
+
+def _consume_logged_losses(losses, total: float, scale: int) -> tuple[float, int]:
+    """Materialize a group of loss scalars with one accelerator synchronization."""
+    if not losses:
+        return total, 0
+    values = torch.stack(losses).tolist()
+    for value in values:
+        total += value * scale
+    losses.clear()
+    return total, len(values)
+
+
+def _consume_weighted_losses(
+    losses,
+    token_counts,
+    total_loss: float,
+    supervised_tokens: int,
+) -> tuple[float, int]:
+    if not losses:
+        return total_loss, supervised_tokens
+    for value, token_count in zip(torch.stack(losses).tolist(), token_counts):
+        total_loss += value * token_count
+        supervised_tokens += token_count
+    losses.clear()
+    token_counts.clear()
+    return total_loss, supervised_tokens
 
 
 @torch.no_grad()
@@ -52,15 +85,32 @@ def _evaluate_sft_loss(model, val_loader, runtime: RuntimeSettings) -> float:
     model.eval()
     total_loss = 0.0
     supervised_tokens = 0
+    losses = []
+    token_counts = []
+    non_blocking = runtime.device.type == "cuda"
     for x, y in val_loader:
-        x, y = x.to(runtime.device), y.to(runtime.device)
         token_count = int((y != -100).sum().item())
         if token_count == 0:
             continue
+        x = x.to(runtime.device, non_blocking=non_blocking)
+        y = y.to(runtime.device, non_blocking=non_blocking)
         with autocast_context(runtime):
             _, loss = model(x, y)
-        total_loss += loss.item() * token_count
-        supervised_tokens += token_count
+        losses.append(loss.detach())
+        token_counts.append(token_count)
+        if len(losses) == 32:
+            total_loss, supervised_tokens = _consume_weighted_losses(
+                losses,
+                token_counts,
+                total_loss,
+                supervised_tokens,
+            )
+    total_loss, supervised_tokens = _consume_weighted_losses(
+        losses,
+        token_counts,
+        total_loss,
+        supervised_tokens,
+    )
     return total_loss / max(supervised_tokens, 1)
 
 
@@ -75,16 +125,19 @@ def _sft_optimizer_step(
     microbatches_in_step: int,
     allow_adamw_fallback: bool,
     scaler: torch.amp.GradScaler,
+    parameters=None,
 ) -> object:
+    if parameters is None:
+        parameters = tuple(model.parameters())
     scaler.unscale_(optimizer)
-    _scale_partial_sft_grads(model, config, microbatches_in_step)
+    _scale_partial_sft_grads(parameters, config, microbatches_in_step)
     if config.sft_grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.sft_grad_clip)
+        torch.nn.utils.clip_grad_norm_(parameters, config.sft_grad_clip)
 
     progress = global_step / max(total_steps, 1)
     lr = config.sft_lr * 0.1 + 0.5 * config.sft_lr * 0.9 * (1 + math.cos(math.pi * progress))
     set_optimizer_lr(optimizer, lr)
-    _ensure_contiguous_mps_grads(model, runtime)
+    _ensure_contiguous_mps_grads(parameters, runtime)
 
     try:
         scaler.step(optimizer)
@@ -102,7 +155,7 @@ def _sft_optimizer_step(
                 weight_decay=config.sft_weight_decay,
             )
             set_optimizer_lr(optimizer, lr)
-            _ensure_contiguous_mps_grads(model, runtime)
+            _ensure_contiguous_mps_grads(parameters, runtime)
             optimizer.step()
         else:
             raise
@@ -143,6 +196,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
         weight_decay=config.sft_weight_decay,
     )
     scaler = create_grad_scaler(runtime)
+    parameters = tuple(model.parameters())
+    non_blocking = runtime.device.type == "cuda"
 
     steps_per_epoch = math.ceil(len(train_loader) / config.sft_grad_accum_steps)
     total_steps = steps_per_epoch * config.sft_epochs
@@ -171,11 +226,13 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             optimizer.zero_grad(set_to_none=True)
             pending_grads = False
             pending_microbatches = 0
+            pending_losses = []
 
             pbar = tqdm(train_loader, desc=f"SFT Epoch {epoch + 1}/{config.sft_epochs}")
             try:
                 for batch_idx, (x, y) in enumerate(pbar):
-                    x, y = x.to(runtime.device), y.to(runtime.device)
+                    x = x.to(runtime.device, non_blocking=non_blocking)
+                    y = y.to(runtime.device, non_blocking=non_blocking)
                     with autocast_context(runtime):
                         _, loss = model(x, y)
                         loss = loss / config.sft_grad_accum_steps
@@ -183,10 +240,15 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     scaler.scale(loss).backward()
                     pending_grads = True
                     pending_microbatches += 1
-                    epoch_loss += loss.item() * config.sft_grad_accum_steps
-                    n_batches += 1
+                    pending_losses.append(loss.detach())
 
                     if (batch_idx + 1) % config.sft_grad_accum_steps == 0:
+                        epoch_loss, recorded = _consume_logged_losses(
+                            pending_losses,
+                            epoch_loss,
+                            config.sft_grad_accum_steps,
+                        )
+                        n_batches += recorded
                         optimizer = _sft_optimizer_step(
                             model,
                             optimizer,
@@ -197,6 +259,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                             microbatches_in_step=pending_microbatches,
                             allow_adamw_fallback=allow_adamw_fallback,
                             scaler=scaler,
+                            parameters=parameters,
                         )
                         optimizer.zero_grad(set_to_none=True)
                         pending_grads = False
@@ -210,12 +273,17 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                             total_steps=total_steps,
                             train_loss=epoch_loss / max(n_batches, 1),
                         )
-
-                    pbar.set_postfix(loss=f"{epoch_loss / n_batches:.4f}")
+                        pbar.set_postfix(loss=f"{epoch_loss / n_batches:.4f}")
             finally:
                 pbar.close()
 
             if pending_grads:
+                epoch_loss, recorded = _consume_logged_losses(
+                    pending_losses,
+                    epoch_loss,
+                    config.sft_grad_accum_steps,
+                )
+                n_batches += recorded
                 optimizer = _sft_optimizer_step(
                     model,
                     optimizer,
@@ -226,6 +294,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     microbatches_in_step=pending_microbatches,
                     allow_adamw_fallback=allow_adamw_fallback,
                     scaler=scaler,
+                    parameters=parameters,
                 )
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1

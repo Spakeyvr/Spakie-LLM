@@ -3,10 +3,18 @@ import unittest
 import torch
 
 from configs.default import SpakieConfig
-from training.finetune import _scale_partial_sft_grads
+from training.finetune import _consume_logged_losses, _scale_partial_sft_grads
 
 
 class TorchSFTAccumulationTests(unittest.TestCase):
+    def test_grouped_loss_materialization_preserves_scalar_order(self):
+        losses = [torch.tensor(0.125), torch.tensor(0.375), torch.tensor(0.25)]
+        total, count = _consume_logged_losses(losses, total=1.0, scale=4)
+
+        self.assertEqual(total, 4.0)
+        self.assertEqual(count, 3)
+        self.assertEqual(losses, [])
+
     def test_partial_tail_gradients_are_rescaled_to_actual_microbatch_count(self):
         config = SpakieConfig()
         config.sft_grad_accum_steps = 4
