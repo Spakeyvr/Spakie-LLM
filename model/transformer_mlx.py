@@ -70,6 +70,34 @@ def _gelu_fast(x: mx.array) -> mx.array:
     return x * mx.sigmoid(1.702 * x)
 
 
+def apply_rotary_emb(
+    x: mx.array,
+    position_ids: mx.array,
+    theta: float,
+) -> mx.array:
+    """Apply Llama-style half-rotation RoPE to ``[B, T, H, D]`` Q/K tensors."""
+    head_dim = x.shape[-1]
+    if head_dim % 2 != 0:
+        raise ValueError("RoPE requires an even attention head dimension")
+    half_dim = head_dim // 2
+    positions = position_ids
+    if positions.ndim == 1:
+        positions = positions[None, :]
+    inv_freq = mx.exp(
+        -math.log(theta)
+        * mx.arange(half_dim, dtype=mx.float32)
+        / half_dim
+    )
+    angles = positions.astype(mx.float32)[..., None] * inv_freq
+    cos = mx.cos(angles).astype(x.dtype)[:, :, None, :]
+    sin = mx.sin(angles).astype(x.dtype)[:, :, None, :]
+    first, second = x[..., :half_dim], x[..., half_dim:]
+    return mx.concatenate(
+        (first * cos - second * sin, second * cos + first * sin),
+        axis=-1,
+    )
+
+
 def _lower_right_causal_mask(query_length: int, key_length: int) -> mx.array:
     """Boolean causal mask aligned to the lower-right of a rectangular score matrix."""
     offset = key_length - query_length
@@ -143,6 +171,8 @@ class CausalSelfAttentionMLX(nn.Module):
         assert self.n_heads % self.n_kv_heads == 0
         self.head_dim = config.d_model // config.n_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.position_encoding = config.position_encoding
+        self.rope_theta = config.rope_theta
 
         if self.n_kv_heads == self.n_heads:
             self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
@@ -181,6 +211,7 @@ class CausalSelfAttentionMLX(nn.Module):
         varlen_cu_seqlens: mx.array | None = None,
         valid_indices: mx.array | None = None,
         valid_mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
         *,
         return_cache: bool = False,
     ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
@@ -262,6 +293,11 @@ class CausalSelfAttentionMLX(nn.Module):
             if self.q_norm is not None:
                 q = self.q_norm(q)
                 k = self.k_norm(k)
+            if self.position_encoding == "rope":
+                if position_ids is None:
+                    position_ids = mx.arange(T, dtype=mx.int32)
+                q = apply_rotary_emb(q, position_ids, self.rope_theta)
+                k = apply_rotary_emb(k, position_ids, self.rope_theta)
             q = q.transpose(0, 2, 1, 3)
             k = k.transpose(0, 2, 1, 3)
             v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -541,6 +577,7 @@ class TransformerBlockMLX(nn.Module):
         varlen_cu_seqlens: mx.array | None = None,
         valid_indices: mx.array | None = None,
         valid_mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
         *,
         return_cache: bool = False,
     ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
@@ -560,6 +597,7 @@ class TransformerBlockMLX(nn.Module):
             varlen_cu_seqlens=varlen_cu_seqlens,
             valid_indices=valid_indices if self.compact_valid_projections else None,
             valid_mask=valid_mask if self.compact_valid_projections else None,
+            position_ids=position_ids,
             return_cache=return_cache,
         )
         mlp = self._checkpoint_mlp if self.mlp_checkpointing and cache is None and not return_cache else self.mlp
@@ -618,7 +656,11 @@ class SpakieGPTMLX(nn.Module):
         super().__init__()
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
+        self.pos_emb = (
+            nn.Embedding(config.max_seq_len, config.d_model)
+            if config.position_encoding == "learned"
+            else None
+        )
         self.drop = nn.Dropout(config.dropout)
         self.blocks = [TransformerBlockMLX(config) for _ in range(config.n_layers)]
         # Wrap blocks for activation checkpointing only when the preset asks
@@ -649,7 +691,8 @@ class SpakieGPTMLX(nn.Module):
         # Collect per-submodule overrides in one pass for clarity.
         overrides = {}
         overrides["tok_emb.weight"] = _normal(self.tok_emb.weight.shape, 0.02)
-        overrides["pos_emb.weight"] = _normal(self.pos_emb.weight.shape, 0.02)
+        if self.pos_emb is not None:
+            overrides["pos_emb.weight"] = _normal(self.pos_emb.weight.shape, 0.02)
         overrides["ln_f.weight"] = mx.ones_like(self.ln_f.weight)
         if getattr(self.ln_f, "bias", None) is not None:
             overrides["ln_f.bias"] = mx.zeros_like(self.ln_f.bias)
@@ -742,7 +785,10 @@ class SpakieGPTMLX(nn.Module):
         )
 
         pos = position_ids if position_ids is not None else mx.arange(cache_offset, cache_offset + T)
-        x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
+        x = self.tok_emb(idx)
+        if self.pos_emb is not None:
+            x = x + self.pos_emb(pos)
+        x = self.drop(x)
         attention_mask = (
             _block_causal_attention_mask(segment_ids, dtype=x.dtype)
             if segment_ids is not None
@@ -763,6 +809,7 @@ class SpakieGPTMLX(nn.Module):
                     varlen_cu_seqlens,
                     valid_indices,
                     valid_mask,
+                    pos,
                     return_cache=False,
                 )[0]
             else:
@@ -774,6 +821,7 @@ class SpakieGPTMLX(nn.Module):
                     varlen_cu_seqlens=varlen_cu_seqlens,
                     valid_indices=valid_indices,
                     valid_mask=valid_mask,
+                    position_ids=pos,
                     return_cache=return_cache,
                 )
                 if return_cache and new_caches is not None:

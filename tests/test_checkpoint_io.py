@@ -21,6 +21,7 @@ from runtime.checkpoint_io import (
     UnsafeCheckpointError,
     atomic_torch_save,
     discard_training_state,
+    config_from_checkpoint_payload,
     load_mlx_checkpoint_config,
     load_mlx_model_weights_strict,
     load_torch_checkpoint,
@@ -138,6 +139,18 @@ class CheckpointIOTests(unittest.TestCase):
         del payload["n_layers"]
         with self.assertRaisesRegex(ValueError, "missing fields: n_layers"):
             config_from_dict(payload)
+
+    def test_schema_v1_config_migrates_to_learned_positions(self):
+        payload = config_to_dict(self._tiny_config())
+        del payload["position_encoding"]
+        del payload["rope_theta"]
+        restored = config_from_checkpoint_payload(
+            payload,
+            source="legacy.pt",
+            schema_version=1,
+        )
+        self.assertEqual(restored.position_encoding, "learned")
+        self.assertEqual(restored.rope_theta, 100_000.0)
 
     def test_mlx_metadata_roundtrip_and_legacy_refusal(self):
         config = self._tiny_config()

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "selected_checkpoint": "checkpoints/180m/sft_instruction_v3_e6_selective_best.safetensors",
+  "selected_checkpoint_sha256": "b6b7d23c37291a73faeae20d36dd0a5e4eafc2d50a027ddf3d78fd9dc97c3a8e",
+  "source_checkpoint": "checkpoints/180m/sft_fresh_balanced_e3_epoch2.safetensors",
+  "training": {
+    "backend": "mlx",
+    "precision": "bf16",
+    "optimizer": "muon",
+    "epochs": 1,
+    "batch_size": 32,
+    "gradient_accumulation": 1,
+    "learning_rate": 1e-05,
+    "optimizer_updates": 829,
+    "system_prompt": false,
+    "pretokenized": true,
+    "trainable_scope": {
+      "transformer_block_start": 8,
+      "transformer_block_end": 15,
+      "include_final_norm": true,
+      "trainable_tensor_count": 57
+    },
+    "mean_optimizer_step_loss": 0.8784395433534378,
+    "validation_loss": 0.9903637296990241,
+    "loss_log": "evaluations/sft_instruction_v2_20260718/e6_selective_training_loss.csv"
+  },
+  "mixture": {
+    "path": "data/chat_raw/experiment_180m_sft_20260718/instruction_reasoning_v3_e3.jsonl",
+    "rows": 27944,
+    "sha256": "b8e2624acc35b217abf0b27e2c283569b0fdf442fbd810846ec9a65493ae61a5",
+    "manifest": "data/chat_raw/experiment_180m_sft_20260718/instruction_reasoning_v3_e3.jsonl.manifest.json",
+    "sources": [
+      {"path": "data/chat_raw/experiment_180m_sft_20260718/foundation_without_deepseek_e3.jsonl", "selected_rows": 8000, "weight": 1},
+      {"path": "data/chat_raw/compound_instruction_following_v2.jsonl", "rows": 1997, "weight": 1},
+      {"path": "data/chat_raw/math_reasoning_curriculum_v2.jsonl", "rows": 3253, "weight": 1},
+      {"path": "data/chat_raw/structured_coding_curriculum_v2.jsonl", "rows": 2081, "weight": 1},
+      {"path": "data/chat_raw/grounded_multitask_curriculum_v2.jsonl", "rows": 1813, "weight": 1},
+      {"path": "data/chat_raw/complete_multi_part_answers_v3.jsonl", "rows": 5400, "weight": 2}
+    ]
+  },
+  "excluded_datasets": [
+    {"path": "data/chat_exclude/DeepSeek-distill-V2_excluded_for_180m_sft.jsonl", "reason": "prior-cycle evidence of broad capability harm and verbose complex mixture interference"},
+    {"path": "data/chat_exclude/structured_instruction_following_scaled_mislabeled.jsonl", "reason": "systematic wrong labels; replaced by corrected source"}
+  ],
+  "evaluation": {
+    "generation": {"system_prompt": "", "max_new_tokens": 96, "temperature": 0.1, "top_k": 1, "top_p": 1.0, "repetition_penalty": 1.2},
+    "core": {"atomic_passed": 78, "atomic_total": 272, "strict_passed": 11, "strict_total": 96, "starting_atomic_passed": 46, "relative_improvement_percent": 69.56521739130434},
+    "fresh": {"atomic_passed": 28, "atomic_total": 136, "strict_passed": 3, "strict_total": 48, "starting_atomic_passed": 17, "relative_improvement_percent": 64.70588235294117},
+    "legacy_regression": {"clean_core_semantic": "5/64", "starting_clean_core_semantic": "10/64", "stable_supplement_semantic": "3/36", "old_fresh_semantic": "1/27"}
+  },
+  "target_reached": true,
+  "no_major_regression_gate_reached": false,
+  "experiment_log": "evaluations/sft_instruction_v2_20260718/experiment_log.md"
+}

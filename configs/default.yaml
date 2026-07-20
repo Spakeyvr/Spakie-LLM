@@ -28,6 +28,10 @@ defaults:
   gelu_variant: fast
   norm_type: rmsnorm
   qk_norm: false
+  # Existing checkpoints use learned absolute position embeddings. New v2
+  # presets opt into RoPE without changing the tensor structure of old models.
+  position_encoding: learned
+  rope_theta: 100000.0
   loss_layout: custom
   residual_type: serial
   # Hidden size for SwiGLU MLPs. 0 uses d_ff. Only used when mlp_type=swiglu.
@@ -161,18 +165,23 @@ presets:
     sft_lr: 4.0e-5
     sft_epochs: 6
 
+  # Deeper, honestly sized 180M-class architecture. RoPE is applied to Q/K
+  # after per-head QK RMSNorm; no learned position table is allocated.
   180m:
-    n_layers: 16
-    d_model: 896
-    n_heads: 14
-    n_kv_heads: 2
-    d_ff: 3584
+    n_layers: 24
+    d_model: 768
+    n_heads: 12
+    n_kv_heads: 4
+    d_ff: 3072
     mlp_type: swiglu
-    swiglu_hidden: 2048
+    swiglu_hidden: 2304
+    qk_norm: true
+    position_encoding: rope
+    rope_theta: 100000.0
     activation_checkpointing: false
-    pretrain_batch_size: 96
-    pretrain_grad_accum_steps: 2
-    sft_batch_size: 64
+    pretrain_batch_size: 48
+    pretrain_grad_accum_steps: 4
+    sft_batch_size: 32
     sft_grad_accum_steps: 4
     sft_lr: 3.0e-5
     sft_epochs: 4
@@ -213,19 +222,27 @@ presets:
     sft_lr: 3.0e-5
     sft_epochs: 4
 
+  # Balanced 300M-class architecture with a parameter-matched SwiGLU
+  # feed-forward network, RoPE, and per-head QK RMSNorm.
   300m:
-    n_layers: 10
-    d_model: 1280
-    n_heads: 20
+    n_layers: 24
+    d_model: 1024
+    n_heads: 16
     n_kv_heads: 4
-    d_ff: 9088
+    d_ff: 4096
+    mlp_type: swiglu
+    swiglu_hidden: 3072
+    qk_norm: true
+    position_encoding: rope
+    rope_theta: 100000.0
     activation_checkpointing: false
     pretrain_batch_size: 64
     pretrain_grad_accum_steps: 3
+    # Use memory-safe chunked vmap accumulation. Group size 0 runs the MLX
+    # memory probe and selects the largest safe group automatically.
     pretrain_vmap_accum_step: true
     pretrain_vmap_sync_warmup_steps: 10
-    pretrain_lr: 6.0e-4
-    pretrain_grad_clip: 0.0
+    pretrain_vmap_group_size: 0
     sft_batch_size: 16
     sft_grad_accum_steps: 2
     sft_grad_clip: 0.0
@@ -246,7 +263,9 @@ sft_source_limits:
   # uncapped for local raw JSONL sources during prepare; downloaded sources
   # should keep a positive limit to avoid accidental full-dataset pulls.
   DeepSeek-distill-V2:
-    enabled: true
+    # Excluded for the 180M SFT mix after broad evaluation showed that its
+    # long, complex answers degraded concise instruction behavior.
+    enabled: false
     limit: 0
   custom:
     enabled: true

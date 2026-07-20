@@ -241,11 +241,36 @@ def finetune_mlx(
     max_steps: int = 0,
     loss_log_path: str | None = None,
     allow_adamw_fallback: bool = False,
+    trainable_block_start: int = -1,
 ) -> float:
     # The caller may have loaded BF16 checkpoint arrays. Explicit FP32 must
     # cast those weights too, so always apply the resolved runtime dtype.
     model.set_dtype(runtime.dtype)
     model.train()
+
+    training_scope: dict | None = None
+    if trainable_block_start >= 0:
+        if trainable_block_start >= len(model.blocks):
+            raise ValueError(
+                f"trainable_block_start={trainable_block_start} must be below "
+                f"the model's {len(model.blocks)} blocks"
+            )
+        model.freeze()
+        for block in model.blocks[trainable_block_start:]:
+            block.unfreeze()
+        model.ln_f.unfreeze()
+        trainable_names = [name for name, _ in tree_flatten(model.trainable_parameters())]
+        training_scope = {
+            "kind": "upper_transformer_blocks",
+            "block_start": trainable_block_start,
+            "block_end": len(model.blocks) - 1,
+            "include_final_norm": True,
+            "trainable_tensor_count": len(trainable_names),
+        }
+        print(
+            f"Selective SFT: blocks {trainable_block_start}-{len(model.blocks) - 1} "
+            f"plus final norm ({len(trainable_names)} tensors trainable)"
+        )
 
     optimizer = configure_mlx_optimizer(
         model,
@@ -254,6 +279,18 @@ def finetune_mlx(
         learning_rate=config.sft_lr,
         weight_decay=config.sft_weight_decay,
     )
+
+    def save_checkpoint(path: str, meta: dict, *, include_optimizer: bool = False) -> None:
+        scoped_meta = dict(meta)
+        if training_scope is not None:
+            scoped_meta["training_scope"] = training_scope
+        _save_sft_checkpoint(
+            path,
+            model,
+            meta=scoped_meta,
+            config=config,
+            optimizer=optimizer if include_optimizer else None,
+        )
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     lengths = sequence_lengths(train_dataset)
@@ -606,9 +643,8 @@ def finetune_mlx(
                 ckpt_path = os.path.join(config.checkpoint_dir, best_checkpoint_name)
                 if profiler.enabled:
                     checkpoint_start = now()
-                    _save_sft_checkpoint(
+                    save_checkpoint(
                         ckpt_path,
-                        model,
                         meta={
                             "epoch": epoch + 1,
                             "val_loss": val_loss,
@@ -619,13 +655,11 @@ def finetune_mlx(
                             else "",
                             "muon_verified": config.muon_verified,
                         },
-                        config=config,
                     )
                     profiler.add("checkpoint", now() - checkpoint_start)
                 else:
-                    _save_sft_checkpoint(
+                    save_checkpoint(
                         ckpt_path,
-                        model,
                         meta={
                             "epoch": epoch + 1,
                             "val_loss": val_loss,
@@ -636,7 +670,6 @@ def finetune_mlx(
                             else "",
                             "muon_verified": config.muon_verified,
                         },
-                        config=config,
                     )
                 status_writer.update(
                     force=True,
@@ -670,9 +703,8 @@ def finetune_mlx(
         interrupt_path = os.path.join(config.checkpoint_dir, interrupt_checkpoint_name)
         if profiler.enabled:
             checkpoint_start = now()
-            _save_sft_checkpoint(
+            save_checkpoint(
                 interrupt_path,
-                model,
                 meta={
                     "step": global_step,
                     "best_val_loss": best_val_loss,
@@ -683,14 +715,12 @@ def finetune_mlx(
                     else "",
                     "muon_verified": config.muon_verified,
                 },
-                config=config,
-                optimizer=optimizer,
+                include_optimizer=True,
             )
             profiler.add("checkpoint", now() - checkpoint_start)
         else:
-            _save_sft_checkpoint(
+            save_checkpoint(
                 interrupt_path,
-                model,
                 meta={
                     "step": global_step,
                     "best_val_loss": best_val_loss,
@@ -701,8 +731,7 @@ def finetune_mlx(
                     else "",
                     "muon_verified": config.muon_verified,
                 },
-                config=config,
-                optimizer=optimizer,
+                include_optimizer=True,
             )
         status_writer.finish(
             "interrupted",
@@ -721,9 +750,8 @@ def finetune_mlx(
         else:
             final_checkpoint_name = "sft_final.safetensors"
         final_path = os.path.join(config.checkpoint_dir, final_checkpoint_name)
-        _save_sft_checkpoint(
+        save_checkpoint(
             final_path,
-            model,
             meta={
                 "step": global_step,
                 "best_val_loss": best_val_loss,
@@ -731,7 +759,6 @@ def finetune_mlx(
                 "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
                 "muon_verified": config.muon_verified,
             },
-            config=config,
         )
         print(f"Final SFT checkpoint: {final_path}")
 

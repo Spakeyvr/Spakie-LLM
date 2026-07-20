@@ -213,10 +213,10 @@ def config_from_checkpoint_payload(
         return payload
     if not isinstance(payload, dict):
         raise ValueError(f"Checkpoint '{source}' is missing full configuration metadata")
-    if schema_version != CHECKPOINT_CONFIG_SCHEMA_VERSION:
+    if schema_version not in {1, CHECKPOINT_CONFIG_SCHEMA_VERSION}:
         raise ValueError(
             f"Checkpoint '{source}' uses unsupported config schema {schema_version!r}; "
-            f"expected {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
+            f"supported schemas are 1 and {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
         )
     return config_from_dict(payload)
 
@@ -238,10 +238,10 @@ def load_mlx_checkpoint_config(
     if payload is None:
         return None
     version = meta.get("config_schema_version") if meta else None
-    if version != CHECKPOINT_CONFIG_SCHEMA_VERSION:
+    if version not in {1, CHECKPOINT_CONFIG_SCHEMA_VERSION}:
         raise ValueError(
             f"MLX checkpoint '{path}' uses unsupported config schema {version!r}; "
-            f"expected {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
+            f"supported schemas are 1 and {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
         )
     return config_from_dict(payload)
 

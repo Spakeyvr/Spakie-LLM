@@ -64,6 +64,10 @@ class SpakieConfig:
     # Stabilizes attention logits — especially valuable under Muon, which is more
     # prone to attention-logit growth than AdamW. Off by default for back-compat.
     qk_norm: bool = _D.get("qk_norm", False)
+    # Learned absolute embeddings preserve existing checkpoint structure. RoPE
+    # rotates Q/K inside attention and therefore allocates no position table.
+    position_encoding: str = _D.get("position_encoding", "learned")
+    rope_theta: float = _D.get("rope_theta", 100000.0)
     loss_layout: str = _D.get("loss_layout", "flat")
     residual_type: str = _D.get("residual_type", "serial")
     attention_backend: str = _D.get("attention_backend", "sdpa")
@@ -221,6 +225,13 @@ class SpakieConfig:
         self.norm_type = (self.norm_type or "layernorm").lower()
         if self.norm_type not in {"layernorm", "rmsnorm"}:
             raise ValueError("norm_type must be 'layernorm' or 'rmsnorm'")
+        self.position_encoding = (self.position_encoding or "learned").lower()
+        if self.position_encoding not in {"learned", "rope"}:
+            raise ValueError("position_encoding must be 'learned' or 'rope'")
+        if self.rope_theta <= 0:
+            raise ValueError("rope_theta must be positive")
+        if self.position_encoding == "rope" and (self.d_model // self.n_heads) % 2 != 0:
+            raise ValueError("RoPE requires an even attention head dimension")
         self.loss_layout = (self.loss_layout or "flat").lower()
         if self.loss_layout not in {"flat", "3d", "custom"}:
             raise ValueError("loss_layout must be 'flat', '3d', or 'custom'")
@@ -235,6 +246,11 @@ class SpakieConfig:
             raise ValueError(
                 "attention_backend='mfa-varlen' does not support GQA; use sdpa/mfa "
                 "or set n_kv_heads == n_heads"
+            )
+        if self.attention_backend == "mfa-varlen" and self.position_encoding == "rope":
+            raise ValueError(
+                "attention_backend='mfa-varlen' does not support RoPE; use sdpa/mfa "
+                "or position_encoding='learned'"
             )
         self.muon_route = (self.muon_route or "all").lower()
         if self.muon_route not in {"all", "mlp", "attn", "none"}:
@@ -354,7 +370,11 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
     return config
 
 
-CHECKPOINT_CONFIG_SCHEMA_VERSION = 1
+CHECKPOINT_CONFIG_SCHEMA_VERSION = 2
+_LEGACY_CONFIG_DEFAULTS = {
+    "position_encoding": "learned",
+    "rope_theta": 100000.0,
+}
 
 
 def config_to_dict(config: SpakieConfig) -> dict:
@@ -375,11 +395,13 @@ def config_from_dict(payload: dict) -> SpakieConfig:
     unknown = sorted(set(payload) - known_fields)
     if unknown:
         raise ValueError(f"checkpoint config contains unknown fields: {', '.join(unknown)}")
-    missing = sorted(known_fields - set(payload))
+    values = dict(payload)
+    for name, value in _LEGACY_CONFIG_DEFAULTS.items():
+        values.setdefault(name, value)
+    missing = sorted(known_fields - set(values))
     if missing:
         raise ValueError(f"checkpoint config is missing fields: {', '.join(missing)}")
 
-    values = dict(payload)
     if "muon_ns_coefficients" in values:
         values["muon_ns_coefficients"] = tuple(values["muon_ns_coefficients"])
     saved_derived = {
@@ -428,6 +450,10 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
     if not has_value("mlp_type"):
         config.mlp_type = "gelu"
         config.swiglu_hidden = 0
+    if not has_value("position_encoding"):
+        config.position_encoding = "learned"
+    if not has_value("rope_theta"):
+        config.rope_theta = _LEGACY_CONFIG_DEFAULTS["rope_theta"]
     for field_name in (
         "vocab_size",
         "n_layers",
@@ -446,6 +472,8 @@ def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig
         "bias",
         "activation_checkpointing",
         "qk_norm",
+        "position_encoding",
+        "rope_theta",
     ):
         if has_value(field_name):
             setattr(config, field_name, get_value(field_name))
@@ -458,6 +486,11 @@ def inherit_attention_shape_from_tensors(config: SpakieConfig, tensors: dict) ->
     # QK-norm leaves per-head q_norm/k_norm gains in the checkpoint; detect them
     # so chat/finetune rebuild the matching module structure.
     config.qk_norm = any(name.endswith(".attn.q_norm.weight") for name in tensors)
+    config.position_encoding = (
+        "learned"
+        if any(name.endswith("pos_emb.weight") for name in tensors)
+        else "rope"
+    )
     if any(name.endswith(".attn.qkv.weight") for name in tensors):
         config.n_kv_heads = 0
         return config

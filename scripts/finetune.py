@@ -509,6 +509,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         max_steps=args.max_steps,
         loss_log_path=args.loss_log,
         allow_adamw_fallback=config.allow_adamw_fallback,
+        trainable_block_start=args.mlx_trainable_block_start,
     )
 
 
@@ -641,6 +642,12 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Skip microbatch async_eval on the final microbatch before optimizer sync",
+    )
+    parser.add_argument(
+        "--mlx-trainable-block-start",
+        type=int,
+        default=-1,
+        help="Freeze embeddings/lower blocks and train blocks from this zero-based index plus final norm (-1 = train all)",
     )
     parser.add_argument(
         "--sft-bucket-multiple",

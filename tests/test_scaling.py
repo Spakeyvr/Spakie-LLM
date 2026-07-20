@@ -4,6 +4,7 @@ import numpy as np
 import sys
 import tempfile
 import unittest
+import torch
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from configs.default import SpakieConfig, get_preset_config
+from model.transformer import SpakieGPT, apply_rotary_emb
 import scripts.download_pretrain_corpus as download_pretrain_corpus
 import scripts.prepare_data as prepare_data
 
@@ -79,8 +81,69 @@ class ScalingConfigTests(unittest.TestCase):
         self.assertEqual((baseline.max_seq_len, gqa4.max_seq_len, deep.max_seq_len), (512, 512, 512))
         self.assertEqual(gqa4.n_kv_heads, 4)
         self.assertEqual(gqa4.n_heads % gqa4.n_kv_heads, 0)
-        self.assertGreater(deep.n_layers, baseline.n_layers)
-        self.assertLess(deep.d_model, baseline.d_model)
+        self.assertEqual((deep.n_layers, deep.d_model), (24, 768))
+        self.assertLess(deep.swiglu_hidden, baseline.swiglu_hidden)
+
+    def test_default_presets_have_recommended_architecture_and_parameter_counts(self):
+        expected = {
+            "180m": {
+                "shape": (24, 768, 12, 4, 2304),
+                "parameters": 177_774_336,
+            },
+            "300m": {
+                "shape": (24, 1024, 16, 4, 3072),
+                "parameters": 306_237_440,
+            },
+        }
+        for preset, spec in expected.items():
+            with self.subTest(preset=preset):
+                config = get_preset_config(preset)
+                self.assertEqual(
+                    (
+                        config.n_layers,
+                        config.d_model,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.swiglu_hidden,
+                    ),
+                    spec["shape"],
+                )
+                self.assertEqual(config.mlp_type, "swiglu")
+                self.assertEqual(config.position_encoding, "rope")
+                self.assertTrue(config.qk_norm)
+                with torch.device("meta"):
+                    model = SpakieGPT(config)
+                self.assertIsNone(model.pos_emb)
+                self.assertEqual(
+                    sum(parameter.numel() for parameter in model.parameters()),
+                    spec["parameters"],
+                )
+
+    def test_300m_keeps_memory_safe_vmap_accumulation_enabled(self):
+        config = get_preset_config("300m")
+        self.assertTrue(config.pretrain_vmap_accum_step)
+        self.assertEqual(config.pretrain_vmap_sync_warmup_steps, 10)
+        self.assertEqual(config.pretrain_vmap_group_size, 0)
+
+    def test_rope_rotation_preserves_norm_and_position_zero(self):
+        values = torch.arange(2 * 3 * 2 * 8, dtype=torch.float32).reshape(2, 3, 2, 8)
+        positions = torch.tensor([[0, 1, 2], [2, 1, 0]])
+        rotated = apply_rotary_emb(values, positions, theta=100_000.0)
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(rotated, dim=-1),
+            torch.linalg.vector_norm(values, dim=-1),
+        )
+        torch.testing.assert_close(rotated[0, 0], values[0, 0])
+        torch.testing.assert_close(rotated[1, 2], values[1, 2])
+
+    def test_rope_rejects_odd_head_dimensions(self):
+        with self.assertRaisesRegex(ValueError, "even attention head dimension"):
+            SpakieConfig(
+                n_heads=2,
+                n_kv_heads=1,
+                d_model=14,
+                position_encoding="rope",
+            )
 
     def test_code_documents_do_not_use_prose_only_filters(self):
         config = SpakieConfig(min_doc_chars=1, source_min_doc_chars={"python_edu": 1})

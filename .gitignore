@@ -17,6 +17,10 @@ checkpoints/
 # Benchmark outputs
 bench_results/
 
+# Bulky generated evaluation outputs (keep reports and experiment logs)
+evaluations/**/results/
+evaluations/**/*_training_loss.csv
+
 # Tokenizer model (generated)
 tokenizer/spakie.model
 tokenizer/spakie.vocab

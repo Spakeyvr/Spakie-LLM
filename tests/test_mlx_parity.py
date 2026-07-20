@@ -72,10 +72,12 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         from mlx.utils import tree_unflatten
 
         state = {k: v.detach().cpu().numpy() for k, v in torch_model.state_dict().items()}
-        # tok_emb and pos_emb names match directly.
+        # Shared embedding names match directly. RoPE models intentionally have
+        # no learned position table.
         overrides: dict[str, mx.array] = {}
         overrides["tok_emb.weight"] = mx.array(state["tok_emb.weight"])
-        overrides["pos_emb.weight"] = mx.array(state["pos_emb.weight"])
+        if "pos_emb.weight" in state:
+            overrides["pos_emb.weight"] = mx.array(state["pos_emb.weight"])
         overrides["ln_f.weight"] = mx.array(state["ln_f.weight"])
         if "ln_f.bias" in state:
             overrides["ln_f.bias"] = mx.array(state["ln_f.bias"])
@@ -236,12 +238,92 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         max_abs = np.max(np.abs(torch_logits_np - mlx_logits_np))
         self.assertLess(max_abs, 1e-3, f"max abs logit diff = {max_abs}")
 
+    def test_forward_logits_match_with_rope_and_qk_norm(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        config.position_encoding = "rope"
+        config.rope_theta = 100_000.0
+        config.qk_norm = True
+        config.refresh_derived_fields()
+
+        torch.manual_seed(7)
+        torch_model = SpakieGPT(config)
+        torch_model.eval()
+        mlx_model = SpakieGPTMLX(config)
+        mlx_model.eval()
+        self._copy_torch_weights_into_mlx(torch_model, mlx_model)
+
+        ids = np.array([[3, 7, 11, 1, 5, 9, 2, 4]], dtype=np.int32)
+        positions = np.array([[0, 1, 2, 0, 1, 2, 3, 4]], dtype=np.int32)
+        with torch.no_grad():
+            torch_logits, _ = torch_model(
+                torch.from_numpy(ids.astype(np.int64)),
+                position_ids=torch.from_numpy(positions.astype(np.int64)),
+            )
+        mlx_logits, _, _ = mlx_model(
+            mx.array(ids),
+            position_ids=mx.array(positions),
+        )
+        mx.eval(mlx_logits)
+
+        max_abs = np.max(
+            np.abs(
+                torch_logits.detach().cpu().numpy()
+                - np.asarray(mlx_logits.astype(mx.float32))
+            )
+        )
+        self.assertLess(max_abs, 1e-3, f"max abs logit diff = {max_abs}")
+
+    def test_rope_cached_decode_matches_full_forward(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        config.position_encoding = "rope"
+        config.qk_norm = True
+        config.refresh_derived_fields()
+        model = SpakieGPTMLX(config)
+        model.eval()
+
+        prompt = np.array([[3, 7, 11, 5]], dtype=np.int32)
+        next_token = np.array([[9]], dtype=np.int32)
+        combined = np.concatenate([prompt, next_token], axis=1)
+        full_logits, _, _ = model(mx.array(combined))
+        _, _, cache = model(mx.array(prompt), return_cache=True)
+        cached_logits, _, next_cache = model(
+            mx.array(next_token),
+            cache=cache,
+            cache_offset=prompt.shape[1],
+            return_cache=True,
+        )
+        mx.eval(
+            full_logits,
+            cached_logits,
+            *[tensor for pair in next_cache for tensor in pair],
+        )
+        max_abs = float(
+            np.max(
+                np.abs(
+                    np.asarray(cached_logits[:, -1, :].astype(mx.float32))
+                    - np.asarray(full_logits[:, -1, :].astype(mx.float32))
+                )
+            )
+        )
+        self.assertLess(max_abs, 1e-3)
+
     def test_return_cache_disabled_returns_no_cache_payload(self):
         import mlx.core as mx
 
         from model.transformer_mlx import SpakieGPTMLX
 
         config = self._tiny_config()
+        config.position_encoding = "rope"
+        config.qk_norm = True
+        config.refresh_derived_fields()
         mlx_model = SpakieGPTMLX(config)
         mlx_model.eval()
 
@@ -485,6 +567,9 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         from model.transformer_mlx import SpakieGPTMLX
 
         config = self._tiny_config()
+        config.position_encoding = "rope"
+        config.qk_norm = True
+        config.refresh_derived_fields()
         mlx_model = SpakieGPTMLX(config)
         mlx_model.eval()
 

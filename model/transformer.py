@@ -12,6 +12,31 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 
 
+def apply_rotary_emb(
+    x: torch.Tensor,
+    position_ids: torch.Tensor,
+    theta: float,
+) -> torch.Tensor:
+    """Apply Llama-style half-rotation RoPE to ``[B, T, H, D]`` Q/K tensors."""
+    head_dim = x.shape[-1]
+    if head_dim % 2 != 0:
+        raise ValueError("RoPE requires an even attention head dimension")
+    half_dim = head_dim // 2
+    positions = position_ids
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0)
+    inv_freq = torch.exp(
+        -math.log(theta)
+        * torch.arange(half_dim, dtype=torch.float32, device=x.device)
+        / half_dim
+    )
+    angles = positions.to(device=x.device, dtype=torch.float32).unsqueeze(-1) * inv_freq
+    cos = angles.cos().to(dtype=x.dtype).unsqueeze(2)
+    sin = angles.sin().to(dtype=x.dtype).unsqueeze(2)
+    first, second = x[..., :half_dim], x[..., half_dim:]
+    return torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
@@ -20,6 +45,8 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_heads = config.n_kv_heads or config.n_heads
         assert self.n_heads % self.n_kv_heads == 0
         self.head_dim = config.d_model // config.n_heads
+        self.position_encoding = config.position_encoding
+        self.rope_theta = config.rope_theta
 
         if self.n_kv_heads == self.n_heads:
             self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
@@ -41,7 +68,11 @@ class CausalSelfAttention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B, T, C = x.shape
         if self.qkv is not None:
             qkv = self.qkv(x)
@@ -56,6 +87,11 @@ class CausalSelfAttention(nn.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        if self.position_encoding == "rope":
+            if position_ids is None:
+                position_ids = torch.arange(T, dtype=torch.long, device=x.device)
+            q = apply_rotary_emb(q, position_ids, self.rope_theta)
+            k = apply_rotary_emb(k, position_ids, self.rope_theta)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -124,9 +160,13 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(config)
         self.residual_type = config.residual_type
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         h = self.ln1(x)
-        attn_out = self.attn(h)
+        attn_out = self.attn(h, position_ids)
         if self.residual_type == "parallel":
             return x + attn_out + self.mlp(h)
         x = x + attn_out
@@ -139,7 +179,11 @@ class SpakieGPT(nn.Module):
         super().__init__()
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
+        self.pos_emb = (
+            nn.Embedding(config.max_seq_len, config.d_model)
+            if config.position_encoding == "learned"
+            else None
+        )
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
         self.ln_f = (
@@ -173,18 +217,31 @@ class SpakieGPT(nn.Module):
             if getattr(module, "bias", None) is not None:
                 nn.init.zeros_(module.bias)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        *,
+        position_ids: torch.Tensor | None = None,
+    ):
         B, T = idx.shape
         assert T <= self.config.max_seq_len, f"Sequence length {T} exceeds max {self.config.max_seq_len}"
 
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
+        pos = (
+            position_ids
+            if position_ids is not None
+            else torch.arange(0, T, dtype=torch.long, device=idx.device)
+        )
+        x = self.tok_emb(idx)
+        if self.pos_emb is not None:
+            x = x + self.pos_emb(pos)
+        x = self.drop(x)
 
         for block in self.blocks:
             if self.training and self.config.activation_checkpointing:
-                x = checkpoint(block, x, use_reentrant=False)
+                x = checkpoint(block, x, pos, use_reentrant=False)
             else:
-                x = block(x)
+                x = block(x, pos)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)

@@ -361,10 +361,10 @@ The repo currently supports these presets:
 | Preset | Layers | `d_model` | Q heads | KV heads | MLP | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
 | `92m` | 12 | 768 | 12 | 4 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
-| `180m` | 16 | 896 | 14 | 2 | SwiGLU hidden 2048 | 96 | 2 | 64 | 4 | Mid-size MLX-optimized preset |
+| `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 48 | 4 | 32 | 4 | ~178M parameters, RoPE + QK norm |
 | `180m_gqa4` | 16 | 896 | 16 | 4 | SwiGLU hidden 2048 | 96 | 2 | 64 | 4 | Short-run 4-KV-head architecture ablation |
 | `180m_deep` | 24 | 768 | 12 | 4 | SwiGLU hidden 1536 | 72 | 2 | 48 | 4 | Short-run deep/thin architecture ablation |
-| `300m` | 10 | 1280 | 20 | 4 | GELU `d_ff=9088` | 64 | 3 | 16 | 2 | Config and pipeline default preset; MLX SFT uses sortish length buckets with padding trim |
+| `300m` | 24 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 64 | 3 | 16 | 2 | ~306M parameters, RoPE + QK norm; memory-safe chunked-vmap pretraining default |
 
 Shared model defaults:
 
@@ -372,7 +372,7 @@ Shared model defaults:
 - `max_seq_len = 512`
 - `dropout = 0.0`
 - `bias = false`
-- learned positional embeddings
+- RoPE (`theta=100000`) with QK norm for the `180m` and `300m` presets; learned positional embeddings remain available for legacy configurations
 - weight-tied LM head
 - GELU or SwiGLU MLPs, depending on preset
 - scaled dot-product attention, with grouped-query attention where configured
@@ -409,6 +409,7 @@ Before a full run, compare the architecture variants at the same token budget:
 python3 scripts/train.py --preset 180m --backend mlx --target-tokens 300000000
 python3 scripts/train.py --preset 180m_gqa4 --backend mlx --target-tokens 300000000
 python3 scripts/train.py --preset 180m_deep --backend mlx --target-tokens 300000000
+python3 scripts/train.py --preset 300m --backend mlx --target-tokens 300000000
 ```
 
 Use `scripts/eval_general_capability.py` after each matched run. Its fixed suite
