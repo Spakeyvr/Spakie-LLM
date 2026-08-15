@@ -25,7 +25,7 @@ class FakeTokenizer:
     encode_calls = 0
 
     def __init__(self, _model_path: str):
-        self.vocab_size = 8192
+        self.vocab_size = 24_576
         self.eos_id = 1
 
     def encode(self, text: str) -> list[int]:
@@ -53,7 +53,7 @@ class ScalingConfigTests(unittest.TestCase):
         entry = SpakieConfig().sft_source_limits[
             "nemotron_instruction_following_chat_v3"
         ]
-        self.assertEqual(entry["limit"], 5_000)
+        self.assertEqual(entry["limit"], 10_000)
         self.assertGreater(entry["download_limit"], entry["limit"])
 
     def test_balanced_corpus_mix_and_fixed_context(self):
@@ -69,16 +69,27 @@ class ScalingConfigTests(unittest.TestCase):
             by_kind[kind] = by_kind.get(kind, 0) + int(entry["target_tokens"])
 
         self.assertEqual(config.target_train_tokens, 10_000_000_000)
-        self.assertEqual(config.max_seq_len, 512)
-        self.assertAlmostEqual(by_kind["synthetic_education"] / total, 0.05)
-        self.assertGreaterEqual(by_kind["math"] / total, 0.12)
-        self.assertGreaterEqual(by_kind["code"] / total, 0.10)
+        self.assertEqual(config.vocab_size, 24_576)
+        self.assertEqual(config.max_seq_len, 2_048)
+        self.assertAlmostEqual(by_kind["web"] / total, 0.45)
+        self.assertAlmostEqual((by_kind["reference"] + by_kind["books"]) / total, 0.15)
+        self.assertAlmostEqual(by_kind["math"] / total, 0.15)
+        self.assertAlmostEqual(by_kind["code"] / total, 0.15)
+        self.assertAlmostEqual(
+            (by_kind["technical"] + by_kind["synthetic_education"]) / total,
+            0.10,
+        )
+        self.assertEqual(config.sft_optimizer, "adamw")
+        self.assertEqual(config.sft_epochs, 1)
 
     def test_180m_architecture_ablation_presets(self):
         baseline = get_preset_config("180m")
         gqa4 = get_preset_config("180m_gqa4")
         deep = get_preset_config("180m_deep")
-        self.assertEqual((baseline.max_seq_len, gqa4.max_seq_len, deep.max_seq_len), (512, 512, 512))
+        self.assertEqual(
+            (baseline.max_seq_len, gqa4.max_seq_len, deep.max_seq_len),
+            (2048, 2048, 2048),
+        )
         self.assertEqual(gqa4.n_kv_heads, 4)
         self.assertEqual(gqa4.n_heads % gqa4.n_kv_heads, 0)
         self.assertEqual((deep.n_layers, deep.d_model), (24, 768))
@@ -88,11 +99,11 @@ class ScalingConfigTests(unittest.TestCase):
         expected = {
             "180m": {
                 "shape": (24, 768, 12, 4, 2304),
-                "parameters": 177_774_336,
+                "parameters": 184_065_792,
             },
             "300m": {
                 "shape": (24, 1024, 16, 4, 3072),
-                "parameters": 306_237_440,
+                "parameters": 314_626_048,
             },
         }
         for preset, spec in expected.items():
@@ -153,6 +164,57 @@ class ScalingConfigTests(unittest.TestCase):
             "python_edu",
         )
         self.assertTrue(keep, reason)
+        self.assertIsNone(
+            prepare_data.language_filter_sample(
+                "print('hello')\n" * 100, config, "python_edu"
+            )
+        )
+
+    def test_math_and_code_use_domain_specific_filter_profiles(self):
+        config = SpakieConfig(
+            min_doc_chars=1,
+            source_min_doc_chars={"fineweb-edu": 1, "finemath": 1},
+        )
+        repeated_math = (
+            "Solve the equation and explain each step.\n"
+            + "x + x = 2x\n" * 3
+            + "Combine the two matching terms.\n"
+            + "Each term has coefficient one.\n"
+            + "Add the two coefficients together.\n"
+            + "The variable remains unchanged.\n"
+            + "The resulting coefficient is two.\n"
+            + "Therefore the simplified expression is 2x.\n"
+        )
+        prose_keep, prose_reason = prepare_data.should_keep_document(
+            repeated_math, config, "fineweb-edu"
+        )
+        math_keep, math_reason = prepare_data.should_keep_document(
+            repeated_math, config, "finemath"
+        )
+        self.assertFalse(prose_keep, prose_reason)
+        self.assertTrue(math_keep, math_reason)
+
+    def test_full_corpus_quality_gate_reports_quota_shortfall(self):
+        config = SpakieConfig(
+            corpus_source_plan={
+                "finemath": {
+                    "kind": "math",
+                    "target_tokens": 100,
+                    "target_raw_chars": 400,
+                    "enabled": True,
+                }
+            }
+        )
+        report = {
+            "target_processed_tokens": 100,
+            "processed_tokens": 30,
+            "source_targets": config.scaled_corpus_source_plan(
+                target_processed_tokens=100
+            ),
+            "source_stats": {"finemath": {"tokens_kept": 30}},
+        }
+        failures = prepare_data.corpus_quality_gate_failures(report, config)
+        self.assertTrue(any("30.0% of token quota" in item for item in failures))
 
     def test_default_source_plan_matches_processed_target(self):
         config = SpakieConfig()
@@ -161,6 +223,25 @@ class ScalingConfigTests(unittest.TestCase):
             sum(int(entry["target_tokens"]) for entry in source_plan.values()),
             config.target_processed_tokens,
         )
+
+    def test_prepare_data_requires_configured_tokenizer_vocab(self):
+        class OldTokenizer:
+            vocab_size = 16_384
+
+            def __init__(self, _path):
+                pass
+
+        config = SpakieConfig(vocab_size=24_576)
+        with (
+            patch.object(prepare_data, "SpakieTokenizer", OldTokenizer),
+            patch.object(
+                prepare_data,
+                "tokenizer_contract",
+                return_value={"sha256": "old", "vocab_size": 16_384},
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Tokenizer vocabulary mismatch"):
+                prepare_data.prepare_data(config=config, dry_run=True)
         self.assertEqual(
             config.target_processed_tokens,
             math.ceil(config.target_train_tokens / config.train_split_fraction),
@@ -219,7 +300,7 @@ class ScalingConfigTests(unittest.TestCase):
                 patch.object(
                     prepare_data,
                     "tokenizer_contract",
-                    return_value={"sha256": "fake", "vocab_size": 8192},
+                    return_value={"sha256": "fake", "vocab_size": 24_576},
                 ),
             ):
                 report = prepare_data.prepare_data(config=config, dry_run=True)
@@ -272,7 +353,7 @@ class ScalingConfigTests(unittest.TestCase):
                 patch.object(
                     prepare_data,
                     "tokenizer_contract",
-                    return_value={"sha256": "fake", "vocab_size": 8192},
+                    return_value={"sha256": "fake", "vocab_size": 24_576},
                 ),
                 patch.object(prepare_data, "should_keep_document", side_effect=KeyboardInterrupt),
             ):
@@ -345,7 +426,7 @@ class ScalingConfigTests(unittest.TestCase):
                 patch.object(
                     prepare_data,
                     "tokenizer_contract",
-                    return_value={"sha256": "fake", "vocab_size": 8192},
+                    return_value={"sha256": "fake", "vocab_size": 24_576},
                 ),
             ):
                 FakeTokenizer.encode_batch_calls = 0
@@ -420,7 +501,7 @@ class ScalingConfigTests(unittest.TestCase):
                 patch.object(
                     prepare_data,
                     "tokenizer_contract",
-                    return_value={"sha256": "fake", "vocab_size": 8192},
+                    return_value={"sha256": "fake", "vocab_size": 24_576},
                 ),
             ):
                 full_report = prepare_data.prepare_data(

@@ -20,7 +20,7 @@ from runtime.checkpoint_io import (
     validate_checkpoint_processed_data,
     validate_checkpoint_tokenizer,
 )
-from runtime.processed_data import validate_processed_data
+from runtime.processed_data import tokenizer_contract, validate_processed_data
 from training.muon_core import (
     MUON_ADJUST_LR_CHOICES,
     MUON_OPTIMIZER_SCHEMA_VERSION,
@@ -125,6 +125,13 @@ def require_processed_data(config, args) -> None:
             "tokenizer/data mismatches can corrupt training."
         )
         return
+    current_tokenizer = tokenizer_contract(config.tokenizer_prefix + ".model")
+    if int(current_tokenizer["vocab_size"]) != config.vocab_size:
+        raise RuntimeError(
+            f"Tokenizer vocabulary mismatch: config expects {config.vocab_size:,} pieces, "
+            f"but the tokenizer contains {int(current_tokenizer['vocab_size']):,}. "
+            "Retrain the tokenizer and rebuild processed data before pretraining."
+        )
     ready, reason = validate_processed_data(
         Path(config.processed_data_dir),
         tokenizer_path=Path(config.tokenizer_prefix + ".model"),
@@ -157,6 +164,8 @@ def resume_sampler_mismatches(
 
 def apply_pretrain_cli_overrides(config, args) -> None:
     apply_optimizer_args(config, args)
+    if args.pretrain_lr > 0:
+        config.pretrain_lr = args.pretrain_lr
     if args.lr_schedule:
         config.pretrain_lr_schedule = args.lr_schedule
     if args.trapezoid_decay_frac >= 0:
@@ -615,6 +624,12 @@ def main():
         type=int,
         default=0,
         help="Override pretraining LR warmup steps",
+    )
+    parser.add_argument(
+        "--pretrain-lr",
+        type=float,
+        default=0.0,
+        help="Override the peak pretraining learning rate",
     )
     parser.add_argument(
         "--additional-steps",

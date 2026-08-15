@@ -16,7 +16,7 @@ corpus_source_aliases:
 
 defaults:
   # Model
-  vocab_size: 16384
+  vocab_size: 24576
   n_layers: 12
   n_heads: 12
   # Number of key/value heads for grouped-query attention. 0 means full
@@ -36,7 +36,7 @@ defaults:
   residual_type: serial
   # Hidden size for SwiGLU MLPs. 0 uses d_ff. Only used when mlp_type=swiglu.
   swiglu_hidden: 0
-  max_seq_len: 512
+  max_seq_len: 2048
   dropout: 0.0
   bias: false
   activation_checkpointing: false
@@ -47,7 +47,7 @@ defaults:
   loss_chunk_size: 0
 
   # Pretraining
-  pretrain_batch_size: 128
+  pretrain_batch_size: 32
   pretrain_grad_accum_steps: 2
   pretrain_lr: 6.0e-4
   pretrain_target_tokens: 0
@@ -71,15 +71,19 @@ defaults:
   pretrain_trapezoid_decay_frac: 0.2
 
   # SFT
-  sft_batch_size: 32
+  sft_batch_size: 8
   sft_grad_accum_steps: 2
-  sft_lr: 4.0e-5
-  sft_epochs: 3
-  sft_weight_decay: 0.05
+  sft_lr: 1.5e-5
+  sft_epochs: 1
+  sft_weight_decay: 0.01
   sft_grad_clip: 1.0
   sft_patience: 5
-  sft_download_max_examples: 72000
-  sft_optimizer: muon
+  sft_download_max_examples: 100000
+  sft_optimizer: adamw
+  # Unknown files are excluded until they are deliberately added below. This
+  # prevents ad-hoc benchmark curricula from silently entering the main mix.
+  sft_allow_unconfigured_sources: false
+  sft_refusal_sources: [safety_refusal, uncertainty_calibration]
 
   # Optimizer (Muon)
   allow_adamw_fallback: false
@@ -134,6 +138,11 @@ defaults:
 
   # Tier 2 quality filter
   max_url_email_line_ratio: 0.30
+  # Full-corpus preparation is fail-closed when a required source misses its
+  # planned token quota. Scoped/dry-run preparation remains available for
+  # diagnostics and ablations.
+  minimum_source_completion_ratio: 0.95
+  maximum_source_mix_deviation: 0.02
   train_split_fraction: 0.95
   estimated_chars_per_token: 4.0
 
@@ -157,13 +166,13 @@ presets:
     n_kv_heads: 4
     d_ff: 3072
     activation_checkpointing: false
-    pretrain_batch_size: 92
+    pretrain_batch_size: 23
     pretrain_grad_accum_steps: 1
     pretrain_lr: 6.0e-4
-    sft_batch_size: 92
+    sft_batch_size: 23
     sft_grad_accum_steps: 2
-    sft_lr: 4.0e-5
-    sft_epochs: 6
+    sft_lr: 1.5e-5
+    sft_epochs: 1
 
   # Deeper, honestly sized 180M-class architecture. RoPE is applied to Q/K
   # after per-head QK RMSNorm; no learned position table is allocated.
@@ -179,12 +188,12 @@ presets:
     position_encoding: rope
     rope_theta: 100000.0
     activation_checkpointing: false
-    pretrain_batch_size: 48
+    pretrain_batch_size: 12
     pretrain_grad_accum_steps: 4
-    sft_batch_size: 32
+    sft_batch_size: 8
     sft_grad_accum_steps: 4
-    sft_lr: 3.0e-5
-    sft_epochs: 4
+    sft_lr: 1.5e-5
+    sft_epochs: 1
 
   # Near-matched-shape 4-KV-head ablation. Sixteen query heads are required
   # because grouped-query attention requires query heads divisible by KV heads.
@@ -197,15 +206,15 @@ presets:
     mlp_type: swiglu
     swiglu_hidden: 2048
     activation_checkpointing: false
-    pretrain_batch_size: 96
+    pretrain_batch_size: 24
     pretrain_grad_accum_steps: 2
-    sft_batch_size: 64
+    sft_batch_size: 16
     sft_grad_accum_steps: 4
-    sft_lr: 3.0e-5
-    sft_epochs: 4
+    sft_lr: 1.5e-5
+    sft_epochs: 1
 
   # Deep/thin, approximately matched-budget architecture ablation. Context
-  # remains 512 so the comparison does not increase attention memory.
+  # uses the canonical 2K window; batch size is reduced to preserve tokens/step.
   180m_deep:
     n_layers: 24
     d_model: 768
@@ -215,12 +224,12 @@ presets:
     mlp_type: swiglu
     swiglu_hidden: 1536
     activation_checkpointing: false
-    pretrain_batch_size: 72
+    pretrain_batch_size: 18
     pretrain_grad_accum_steps: 2
-    sft_batch_size: 48
+    sft_batch_size: 12
     sft_grad_accum_steps: 4
-    sft_lr: 3.0e-5
-    sft_epochs: 4
+    sft_lr: 1.5e-5
+    sft_epochs: 1
 
   # Balanced 300M-class architecture with a parameter-matched SwiGLU
   # feed-forward network, RoPE, and per-head QK RMSNorm.
@@ -236,16 +245,16 @@ presets:
     position_encoding: rope
     rope_theta: 100000.0
     activation_checkpointing: false
-    pretrain_batch_size: 64
+    pretrain_batch_size: 16
     pretrain_grad_accum_steps: 3
     # Use memory-safe chunked vmap accumulation. Group size 0 runs the MLX
     # memory probe and selects the largest safe group automatically.
     pretrain_vmap_accum_step: true
     pretrain_vmap_sync_warmup_steps: 10
     pretrain_vmap_group_size: 0
-    sft_batch_size: 16
+    sft_batch_size: 4
     sft_grad_accum_steps: 2
-    sft_grad_clip: 0.0
+    sft_grad_clip: 1.0
 
 source_min_doc_chars:
   wikipedia_snapshot: 200
@@ -257,6 +266,47 @@ source_min_doc_chars:
   python_edu: 80
   open_corpus: 180
   dictionary: 80
+
+# Domain-aware quality profiles. Prose keeps strict Gopher-style heuristics;
+# mathematical notation and source code are allowed to repeat structure and
+# use symbols without being misclassified as web spam.
+filter_profiles:
+  prose:
+    apply_word_length: true
+    apply_stopwords: true
+    apply_language_id: true
+    max_symbol_word_ratio: 0.10
+    max_noise_ratio: 0.35
+    max_repeated_line_ratio: 0.25
+    max_url_email_line_ratio: 0.30
+    max_top_2gram_char_share: 0.20
+    max_top_3gram_char_share: 0.18
+    max_dup_5gram_char_share: 0.15
+    max_top_char_share: 0.30
+  math:
+    apply_word_length: false
+    apply_stopwords: false
+    apply_language_id: true
+    max_symbol_word_ratio: 0.45
+    max_noise_ratio: 0.50
+    max_repeated_line_ratio: 0.45
+    max_url_email_line_ratio: 0.35
+    max_top_2gram_char_share: 0.35
+    max_top_3gram_char_share: 0.32
+    max_dup_5gram_char_share: 0.35
+    max_top_char_share: 0.40
+  code:
+    apply_word_length: false
+    apply_stopwords: false
+    apply_language_id: false
+    max_symbol_word_ratio: 1.0
+    max_noise_ratio: 0.60
+    max_repeated_line_ratio: 0.60
+    max_url_email_line_ratio: 0.50
+    max_top_2gram_char_share: 0.50
+    max_top_3gram_char_share: 0.48
+    max_dup_5gram_char_share: 0.45
+    max_top_char_share: 0.50
 
 sft_source_limits:
   # `enabled` controls whether download/prepare uses a source. `limit: 0` means
@@ -282,53 +332,79 @@ sft_source_limits:
   factual_repairs:
     enabled: true
     limit: 0
+  safety_refusal:
+    enabled: true
+    limit: 3000
+  uncertainty_calibration:
+    enabled: true
+    limit: 3000
+  format_compliance_curriculum:
+    # This source was generated against evaluator wording. Keep the artifact
+    # for research, but never include it in the canonical training mixture.
+    enabled: false
+    limit: 0
   nemotron_instruction_following_chat_v3:
     enabled: true
     # Most raw rows are removed by language, artifact, identity, and context
     # filters. Oversample upstream so the final usable cap can actually fill.
-    download_limit: 100000
-    limit: 5000
+    download_limit: 200000
+    limit: 10000
+  openhermes_2_5:
+    enabled: true
+    # Backbone breadth source (~1M ShareGPT rows aggregating many GPT-4
+    # distilled sets). Draw the full dataset and let the length/English/
+    # artifact filters in prepare_sft decide what survives.
+    download_limit: 1000000
+    limit: 10000
   alpaca:
     enabled: false
     limit: 12000
   no_robots:
-    enabled: true
+    enabled: false
+    limit: 8000
+  general_assistant_instruction_qa_smoltalk_expansion:
+    # Exact duplicate of the downloaded SmolTalk expansion in the live data.
+    enabled: false
     limit: 8000
   smoltalk:
     enabled: true
     # Draw a larger upstream sample so the English/quality/context filters can
     # still produce a broad 180M-friendly final mixture.
-    download_limit: 150000
-    limit: 40000
+    download_limit: 400000
+    limit: 35000
   squad:
     enabled: true
-    limit: 5000
+    limit: 10000
   triviaqa:
     enabled: true
-    limit: 3000
+    limit: 5000
   sciq:
+    # SciQ train has ~11.7k rows total; this cap effectively takes all of it.
     enabled: true
-    limit: 6000
+    limit: 8000
   arc_challenge:
-    enabled: false
-    limit: 2000
+    # ARC-Challenge train has ~1.1k rows; the cap already covers the full set.
+    enabled: true
+    limit: 1200
   openbookqa:
-    enabled: false
+    # OpenBookQA main train has ~5k rows; the cap already covers the full set.
+    enabled: true
     limit: 5000
   boolq:
+    # BoolQ train has ~9.4k rows; this cap effectively takes all of it.
     enabled: true
-    limit: 3000
+    limit: 7000
 
 corpus_source_plan:
   # Weights below are relative; scaled_corpus_source_plan() normalizes them to
   # target_processed_tokens (~10.53B) at runtime. The weights define a balanced
-  # 10B-token training mix: 32% educational web, 16% general web, 17%
-  # reference, 12% math, 10% code, 6% books, 2% other technical, and 5%
-  # synthetic education.
+  # 10B-token training mix: 45% quality educational web, 15% reference/books,
+  # 15% math, 15% educational code, and 10% technical/synthetic education.
+  # Preparation refuses to publish a skewed shortfall.
   fineweb-edu:
     kind: web
-    target_tokens: 3200000000
-    target_raw_chars: 12800000000
+    target_tokens: 4000000000
+    target_raw_chars: 16000000000
     enabled: true
   dolma:
     kind: web
@@ -337,33 +413,33 @@ corpus_source_plan:
     enabled: false
   refinedweb:
     kind: web
-    target_tokens: 500000000
-    target_raw_chars: 2000000000
+    target_tokens: 250000000
+    target_raw_chars: 1000000000
     enabled: true
   fineweb_sample:
     kind: web
-    target_tokens: 700000000
-    target_raw_chars: 2800000000
+    target_tokens: 250000000
+    target_raw_chars: 1000000000
     enabled: true
   c4_en:
     kind: web
-    target_tokens: 400000000
-    target_raw_chars: 1600000000
-    enabled: true
+    target_tokens: 0
+    target_raw_chars: 0
+    enabled: false
   gutenberg:
     kind: books
-    target_tokens: 600000000
-    target_raw_chars: 2400000000
+    target_tokens: 500000000
+    target_raw_chars: 2000000000
     enabled: true
   wikipedia_snapshot:
     kind: reference
-    target_tokens: 1700000000
-    target_raw_chars: 6800000000
+    target_tokens: 1000000000
+    target_raw_chars: 4000000000
     enabled: true
   stackexchange:
     kind: technical
-    target_tokens: 100000000
-    target_raw_chars: 400000000
+    target_tokens: 250000000
+    target_raw_chars: 1000000000
     enabled: true
   openwebmath:
     kind: math
@@ -372,18 +448,18 @@ corpus_source_plan:
     enabled: true
   arxiv:
     kind: technical
-    target_tokens: 100000000
-    target_raw_chars: 400000000
+    target_tokens: 250000000
+    target_raw_chars: 1000000000
     enabled: true
   finemath:
     kind: math
-    target_tokens: 900000000
-    target_raw_chars: 3600000000
+    target_tokens: 1200000000
+    target_raw_chars: 4800000000
     enabled: true
   python_edu:
     kind: code
-    target_tokens: 1000000000
-    target_raw_chars: 4000000000
+    target_tokens: 1500000000
+    target_raw_chars: 6000000000
     enabled: true
   cosmopedia_v2:
     kind: synthetic_education

@@ -27,6 +27,13 @@ def default_sft_source_limits() -> dict[str, int | dict[str, int | bool]]:
     return limits
 
 
+def default_filter_profiles() -> dict[str, dict[str, float | bool]]:
+    return {
+        profile_name: dict(profile)
+        for profile_name, profile in _CFG["filter_profiles"].items()
+    }
+
+
 def normalize_corpus_source(source_name: str) -> str:
     source = (source_name or "").strip().lower()
     return CORPUS_SOURCE_ALIASES.get(source, source)
@@ -132,6 +139,12 @@ class SpakieConfig:
     sft_patience: int = _D["sft_patience"]
     sft_download_max_examples: int = _D["sft_download_max_examples"]
     sft_optimizer: str = _D["sft_optimizer"]
+    sft_allow_unconfigured_sources: bool = _D.get(
+        "sft_allow_unconfigured_sources", False
+    )
+    sft_refusal_sources: tuple[str, ...] = tuple(
+        _D.get("sft_refusal_sources", ())
+    )
 
     # Optimizer
     allow_adamw_fallback: bool = _D["allow_adamw_fallback"]
@@ -181,6 +194,12 @@ class SpakieConfig:
     max_dup_5gram_char_share: float = _D["max_dup_5gram_char_share"]
     max_top_char_share: float = _D["max_top_char_share"]
     max_url_email_line_ratio: float = _D["max_url_email_line_ratio"]
+    minimum_source_completion_ratio: float = _D.get(
+        "minimum_source_completion_ratio", 0.95
+    )
+    maximum_source_mix_deviation: float = _D.get(
+        "maximum_source_mix_deviation", 0.02
+    )
     train_split_fraction: float = _D["train_split_fraction"]
     estimated_chars_per_token: float = _D["estimated_chars_per_token"]
 
@@ -196,6 +215,9 @@ class SpakieConfig:
     langid_model_path: str = _D["langid_model_path"]
     langid_model_url: str = _D["langid_model_url"]
     corpus_source_plan: dict[str, dict[str, int | str | bool]] = field(default_factory=default_corpus_source_plan)
+    filter_profiles: dict[str, dict[str, float | bool]] = field(
+        default_factory=default_filter_profiles
+    )
     sft_source_limits: dict[str, int | dict[str, int | bool]] = field(
         default_factory=default_sft_source_limits
     )
@@ -206,6 +228,15 @@ class SpakieConfig:
             normalize_corpus_source(source_name): dict(plan)
             for source_name, plan in self.corpus_source_plan.items()
         }
+        self.filter_profiles = {
+            str(profile_name).lower(): dict(profile)
+            for profile_name, profile in self.filter_profiles.items()
+        }
+        self.sft_refusal_sources = tuple(
+            str(source_name).strip()
+            for source_name in self.sft_refusal_sources
+            if str(source_name).strip()
+        )
         if not self.checkpoint_dir:
             self.checkpoint_dir = os.path.join(self.checkpoint_root_dir, self.preset_name)
         self.refresh_derived_fields()
@@ -257,6 +288,10 @@ class SpakieConfig:
             raise ValueError("muon_route must be 'all', 'mlp', 'attn', or 'none'")
         if self.swiglu_hidden < 0:
             raise ValueError("swiglu_hidden must be >= 0")
+        if not 0 <= self.minimum_source_completion_ratio <= 1:
+            raise ValueError("minimum_source_completion_ratio must be between 0 and 1")
+        if not 0 <= self.maximum_source_mix_deviation <= 1:
+            raise ValueError("maximum_source_mix_deviation must be between 0 and 1")
         self.target_processed_tokens = derive_processed_token_target(self.target_train_tokens, self.train_split_fraction)
         if self.pretrain_target_tokens <= 0:
             self.pretrain_target_tokens = self.target_train_tokens
@@ -268,10 +303,19 @@ class SpakieConfig:
     def sft_source_enabled(self, source_name: str) -> bool:
         entry = self.sft_source_limits.get(source_name)
         if entry is None:
-            return True
+            return self.sft_allow_unconfigured_sources
         if isinstance(entry, dict):
             return bool(entry.get("enabled", True))
         return int(entry) > 0
+
+    def corpus_source_kind(self, source_name: str) -> str:
+        entry = self.corpus_source_plan.get(normalize_corpus_source(source_name), {})
+        return str(entry.get("kind", "prose")).lower()
+
+    def filter_profile_for_source(self, source_name: str) -> dict[str, float | bool]:
+        kind = self.corpus_source_kind(source_name)
+        profile_name = kind if kind in self.filter_profiles else "prose"
+        return dict(self.filter_profiles.get(profile_name, {}))
 
     def sft_source_limit(self, source_name: str) -> int:
         entry = self.sft_source_limits.get(source_name, 0)

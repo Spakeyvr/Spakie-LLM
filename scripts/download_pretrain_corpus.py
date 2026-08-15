@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-import gzip
 import hashlib
 import html
 import itertools
@@ -23,6 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from xml.etree import ElementTree as ET
+
+# Hugging Face reads this at import time. Its 10-second default is too brittle
+# for multi-gigabyte streaming Parquet shards on consumer connections.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 
 import datasets
 import requests
@@ -38,7 +41,7 @@ datasets.disable_progress_bars()
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
-from runtime.langid import is_probably_english, load_langid_model
+from runtime.langid import is_probably_english, language_id_sample, load_langid_model
 
 
 def _silence_resource_tracker_shutdown_race() -> None:
@@ -86,7 +89,6 @@ HEADERS = {"User-Agent": "SpakieLLM/1.0 (educational language model project)"}
 GUTENDEX_API = "https://gutendex.com/books"
 ARXIV_API = "https://export.arxiv.org/api/query"
 STACKEXCHANGE_API = "https://api.stackexchange.com/2.3"
-SOFTWARE_HERITAGE_CONTENT_URL = "https://softwareheritage.s3.amazonaws.com/content"
 COMPACT_SEEN_HEX_LENGTH = 32
 LEGACY_SEEN_IDS_MAX_BYTES = 256 * 1024 * 1024
 LEGACY_CURSOR_DEFER_MIN_TOKENS = 10_000_000
@@ -98,9 +100,11 @@ JSONL_BUFFER_BYTES = 1024 * 1024
 DOWNLOAD_PROGRESS_BAR_FORMAT = (
     "{percentage:.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]"
 )
-PYTHON_EDU_FETCH_AHEAD = 4
-DEFAULT_ITEM_WORKERS = min(32, max(8, (os.cpu_count() or 8) * 2))
 DEFAULT_HF_WORKERS = 4
+DEFAULT_SOURCE_RETRIES = 3
+PYTHON_EDU_DATASET = "Avelina/python-edu-cleaned"
+PYTHON_EDU_REVISION = "3fedf55e02e72dd1fd68963f991f5e91adcb0f8d"
+PYTHON_EDU_FILTER_SCHEMA_VERSION = 2
 
 
 _HTTP_CLIENTS = threading.local()
@@ -275,7 +279,13 @@ HF_DATASETS: dict[str, dict] = {
     },
     "python_edu": {
         "variants": [
-            {"path": "HuggingFaceTB/smollm-corpus", "name": "python-edu", "split": "train"},
+            {
+                "path": PYTHON_EDU_DATASET,
+                "name": None,
+                "split": "train",
+                "revision": PYTHON_EDU_REVISION,
+                "materialized": True,
+            },
         ],
         "text_fields": ("text", "content"),
         "id_fields": ("blob_id", "repo_name", "path"),
@@ -575,6 +585,22 @@ def progress_reaches_budget(progress: dict, budget: SourceBudget) -> bool:
     )
 
 
+def remaining_source_tokens(progress: dict, budget: SourceBudget) -> int:
+    """Return unfinished estimated tokens without letting old overshoot hide it."""
+    return max(
+        int(budget.target_tokens_estimate)
+        - int(progress.get("estimated_tokens", 0)),
+        0,
+    )
+
+
+def source_completion_ratio(progress: dict, budget: SourceBudget) -> float:
+    target = int(budget.target_tokens_estimate)
+    if target <= 0:
+        return 1.0
+    return int(progress.get("estimated_tokens", 0)) / target
+
+
 class JsonlShardWriter:
     def __init__(self, source_dir: Path, source_name: str, shard_char_limit: int, progress: dict):
         self.source_dir = source_dir
@@ -662,9 +688,27 @@ class SourceState:
         self.config = config or SpakieConfig()
         self.progress = self._load_progress()
         self.writer = JsonlShardWriter(source_dir, budget.source_name, shard_char_limit=5_000_000, progress=self.progress)
+        if (
+            resume
+            and budget.source_name == "python_edu"
+            and self.seen_ids_path.exists()
+        ):
+            log(
+                "  python_edu: loading exact resume ID index "
+                f"({self.seen_ids_path.stat().st_size / (1024 * 1024):.0f} MiB)"
+            )
         self.seen_ids = self._load_seen_ids()
-        self.seen_urls = self._load_seen(self.seen_urls_path, namespace="url")
-        self.seen_titles = self._load_seen(self.seen_titles_path, namespace="title")
+        if resume and budget.source_name == "python_edu":
+            log(f"  python_edu: loaded {len(self.seen_ids):,} accepted blob IDs")
+        # The pinned Python-Edu rows have stable blob IDs. Loading a second
+        # three-million-entry title index doubles startup memory/time without
+        # adding identity protection.
+        if budget.source_name == "python_edu":
+            self.seen_urls = set()
+            self.seen_titles = set()
+        else:
+            self.seen_urls = self._load_seen(self.seen_urls_path, namespace="url")
+            self.seen_titles = self._load_seen(self.seen_titles_path, namespace="title")
         self.new_seen_ids: set[str] = set()
         self.new_seen_urls: set[str] = set()
         self.new_seen_titles: set[str] = set()
@@ -769,6 +813,10 @@ class SourceState:
         progress["target_tokens_estimate"] = self.budget.target_tokens_estimate
         progress["remaining_tokens_estimate"] = max(self.budget.target_tokens_estimate - int(progress.get("estimated_tokens", 0)), 0)
         progress["remaining_chars"] = max(self.budget.target_chars - int(progress.get("chars_written", 0)), 0)
+        if self.budget.source_name == "python_edu":
+            progress["python_edu_dataset"] = PYTHON_EDU_DATASET
+            progress["python_edu_revision"] = PYTHON_EDU_REVISION
+            progress["python_edu_filter_schema_version"] = PYTHON_EDU_FILTER_SCHEMA_VERSION
 
     def save(self) -> None:
         # The progress cursor must never get ahead of buffered JSONL output.
@@ -804,6 +852,12 @@ class SourceState:
     def identity_keys(
         self, doc_id: object = "", title: object = "", url: object = ""
     ) -> tuple[str, str, str]:
+        if self.budget.source_name == "python_edu":
+            return (
+                self._seen_key(str(doc_id or ""), namespace="id"),
+                "",
+                "",
+            )
         return (
             self._seen_key(str(doc_id or ""), namespace="id"),
             self._seen_key(str(title or "").strip().lower(), namespace="title"),
@@ -830,8 +884,12 @@ class SourceState:
         )
         if len(text) < MIN_DOCUMENT_CHARS or looks_navigation_heavy(text):
             return False
-        if english_only and not is_probably_english(text, self.config):
-            return False
+        if english_only:
+            language_sample = language_id_sample(text, self.budget.kind)
+            if language_sample is not None and not is_probably_english(
+                language_sample, self.config
+            ):
+                return False
 
         doc_id = str(record.get("id", "") or "").strip()
         title = str(record.get("title", "") or "").strip().lower()
@@ -851,7 +909,15 @@ class SourceState:
             # counter here avoids delayed batches being mistaken for download
             # throughput; the bar is explicitly labelled as accepted tokens.
             with self.progress_lock:
-                self.progress_bar.update(token_delta)
+                # Each source accepts whole documents, so the true aggregate
+                # can overshoot the exact target slightly. Keep tqdm clamped
+                # while retaining the real overshoot in progress manifests.
+                remaining = max(
+                    int(self.progress_bar.total or 0) - int(self.progress_bar.n),
+                    0,
+                )
+                if remaining:
+                    self.progress_bar.update(min(token_delta, remaining))
         if doc_id_key:
             self.seen_ids.add(doc_id_key)
             self.new_seen_ids.add(doc_id_key)
@@ -915,52 +981,13 @@ def load_hf_stream(source_name: str, preferred_variant: int | None = None):
             }
             if variant.get("name"):
                 kwargs["name"] = variant["name"]
+            if variant.get("revision"):
+                kwargs["revision"] = variant["revision"]
             dataset = load_dataset(**kwargs)
             return dataset, variant, variant_index
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"Unable to stream dataset for {source_name}: {last_error}")
-
-
-def materialize_python_edu_row(row: dict) -> dict | None:
-    """Fetch the file body referenced by a SmolLM Python-Edu metadata row."""
-    blob_id = str(row.get("blob_id", "")).strip()
-    if not blob_id:
-        return None
-    url = f"{SOFTWARE_HERITAGE_CONTENT_URL}/{blob_id}"
-    last_error: Exception | None = None
-    for attempt in range(5):
-        if STOP_EVENT.is_set():
-            return None
-        try:
-            with _http_session().get(url, timeout=(10, 60)) as response:
-                if response.status_code == 404:
-                    return None
-                if response.status_code == 429 or response.status_code >= 500:
-                    last_error = requests.HTTPError(
-                        f"{response.status_code} {response.reason} for {url}",
-                        response=response,
-                    )
-                else:
-                    response.raise_for_status()
-                    text = gzip.decompress(response.content).decode(
-                        "utf-8", errors="ignore"
-                    )
-                    materialized = dict(row)
-                    materialized["text"] = text
-                    return materialized
-        except (requests.RequestException, EOFError, gzip.BadGzipFile) as exc:
-            last_error = exc
-
-        if attempt < 4 and not STOP_EVENT.wait(min(2 ** attempt, 8)):
-            continue
-        break
-
-    if STOP_EVENT.is_set():
-        return None
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError(f"Failed request to {url}")
 
 
 def format_hf_record(source_name: str, row: dict, variant: dict) -> dict | None:
@@ -994,87 +1021,6 @@ def format_hf_record(source_name: str, row: dict, variant: dict) -> dict | None:
     }
 
 
-def _iter_batches(values, size: int):
-    iterator = iter(values)
-    while True:
-        batch = list(itertools.islice(iterator, size))
-        if not batch:
-            return
-        yield batch
-
-
-class DaemonOrderedMapper:
-    """Reuse daemon fetch workers while yielding results in input order."""
-
-    def __init__(self, function: Callable, workers: int, name: str = "item-fetch"):
-        self.function = function
-        self.stop_event = threading.Event()
-        self.tasks: queue.Queue[tuple[int, object] | None] = queue.Queue()
-        self.results: queue.Queue[tuple[int, object, Exception | None]] = queue.Queue()
-        self.threads = [
-            threading.Thread(
-                target=self._work,
-                name=f"{name}-{index}",
-                daemon=True,
-            )
-            for index in range(max(1, workers))
-        ]
-        for thread in self.threads:
-            thread.start()
-
-    def _work(self) -> None:
-        while not self.stop_event.is_set() and not STOP_EVENT.is_set():
-            task = self.tasks.get()
-            if task is None:
-                return
-            index, value = task
-            try:
-                self.results.put((index, self.function(value), None))
-            except Exception as exc:
-                self.results.put((index, None, exc))
-
-    def map_ordered(self, values: list[dict]):
-        for index, value in enumerate(values):
-            self.tasks.put((index, value))
-
-        buffered: dict[int, tuple[object, Exception | None]] = {}
-        next_index = 0
-        while next_index < len(values):
-            if STOP_EVENT.is_set() or self.stop_event.is_set():
-                return
-            if next_index not in buffered:
-                try:
-                    index, value, error = self.results.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-                buffered[index] = (value, error)
-                continue
-            value, error = buffered.pop(next_index)
-            if error is not None:
-                raise error
-            yield value
-            next_index += 1
-
-    def close(self) -> None:
-        self.stop_event.set()
-        for _ in self.threads:
-            self.tasks.put(None)
-        # Normal completion joins immediately. On Ctrl+C or a stuck request,
-        # cap the total wait because these are daemon threads by design.
-        deadline = time.monotonic() + 0.5
-        for thread in self.threads:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            thread.join(timeout=remaining)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, _exc_type, _exc, _traceback) -> None:
-        self.close()
-
-
 @dataclass
 class _HFStreamItem:
     worker_index: int
@@ -1082,6 +1028,29 @@ class _HFStreamItem:
     stream_state: dict | None = None
     error: Exception | None = None
     done: bool = False
+
+
+_HF_CURSOR_KEYS = {
+    "index",
+    "shard_idx",
+    "shard_example_idx",
+    "batch_idx",
+    "num_chunks_since_previous_state",
+    "cropped_chunk_length",
+}
+
+
+def hf_state_has_progress(value: object, parent_key: str = "") -> bool:
+    """Return whether an HF state snapshot represents a non-zero cursor."""
+    if isinstance(value, dict):
+        return any(hf_state_has_progress(item, str(key)) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(hf_state_has_progress(item, parent_key) for item in value)
+    return (
+        parent_key in _HF_CURSOR_KEYS
+        and isinstance(value, (int, float))
+        and value > 0
+    )
 
 
 def iter_parallel_hf_rows(dataset, state: SourceState, workers: int):
@@ -1095,6 +1064,12 @@ def iter_parallel_hf_rows(dataset, state: SourceState, workers: int):
         raise RuntimeError("HF parallel resume state does not match its saved worker count")
     state.progress["hf_parallel_workers"] = worker_count
     state.progress["hf_parallel_states"] = saved_states
+    saved_row_counts = list(
+        state.progress.get("hf_parallel_rows_seen", [0] * worker_count)
+    )
+    if len(saved_row_counts) != worker_count:
+        raise RuntimeError("HF parallel row counters do not match the saved worker count")
+    state.progress["hf_parallel_rows_seen"] = saved_row_counts
 
     # Keep enough decoded rows ready that local filtering/writes don't make the
     # network producers repeatedly go idle. The cap remains modest for sources
@@ -1118,7 +1093,20 @@ def iter_parallel_hf_rows(dataset, state: SourceState, workers: int):
             stream = dataset.shard(worker_count, worker_index, contiguous=False)
             if saved_states[worker_index]:
                 stream.load_state_dict(saved_states[worker_index])
-            for row in stream:
+            row_iterator = iter(stream)
+            # Some HF Parquet streams have returned a zero cursor even after
+            # yielding rows. The committed per-worker count is a deterministic
+            # fallback: replay only that worker's shard and skip its exact
+            # consumed prefix.
+            if saved_row_counts[worker_index] and not hf_state_has_progress(
+                saved_states[worker_index]
+            ):
+                for _ in itertools.islice(
+                    row_iterator, int(saved_row_counts[worker_index])
+                ):
+                    if stop.is_set() or STOP_EVENT.is_set():
+                        return
+            for row in row_iterator:
                 if stop.is_set() or STOP_EVENT.is_set():
                     break
                 if not emit(_HFStreamItem(worker_index, row=row, stream_state=stream.state_dict())):
@@ -1155,7 +1143,6 @@ def ingest_hf_source(
     source_name: str,
     state: SourceState,
     english_only: bool,
-    item_workers: int = DEFAULT_ITEM_WORKERS,
     hf_workers: int = DEFAULT_HF_WORKERS,
 ) -> None:
     if state.should_stop():
@@ -1180,79 +1167,6 @@ def ingest_hf_source(
             if STOP_EVENT.is_set():
                 return
 
-    if source_name == "python_edu":
-        state.hf_dataset = dataset
-        pending_rows = list(state.progress.get("hf_pending_rows", []))
-        source_rows = itertools.chain(pending_rows, dataset)
-        batch_size = max(1, item_workers * PYTHON_EDU_FETCH_AHEAD)
-        with DaemonOrderedMapper(
-            materialize_python_edu_row,
-            item_workers,
-            name="python-edu-fetch",
-        ) as mapper:
-            for batch in _iter_batches(source_rows, batch_size):
-                # The stream cursor may already point beyond this prefetched
-                # batch. Persist uncommitted metadata so Ctrl+C cannot create a
-                # gap, even though content fetches happen concurrently.
-                state.progress["hf_pending_rows"] = batch
-
-                scheduled_ids: set[str] = set()
-                fetch_flags: list[bool] = []
-                fetch_rows: list[dict] = []
-                for row in batch:
-                    length_bytes = row.get("length_bytes")
-                    too_short = False
-                    if length_bytes is not None:
-                        try:
-                            too_short = int(length_bytes) < MIN_DOCUMENT_CHARS
-                        except (TypeError, ValueError):
-                            pass
-
-                    blob_id = str(row.get("blob_id", "") or "").strip()
-                    repo_name = str(row.get("repo_name", "") or "").strip()
-                    source_path = str(row.get("path", "") or "").strip()
-                    namespaced_path = (
-                        f"{repo_name}:{source_path}" if repo_name and source_path else source_path
-                    )
-                    keys = state.identity_keys(blob_id, namespaced_path, "")
-                    duplicate = state.has_seen_identity_keys(keys)
-                    if keys[0] and keys[0] in scheduled_ids:
-                        duplicate = True
-                    should_fetch = bool(blob_id) and not too_short and not duplicate
-                    fetch_flags.append(should_fetch)
-                    if should_fetch:
-                        scheduled_ids.add(keys[0])
-                        fetch_rows.append(row)
-
-                fetched_rows = iter(mapper.map_ordered(fetch_rows))
-                for index, should_fetch in enumerate(fetch_flags):
-                    if state.should_stop():
-                        state.progress["hf_pending_rows"] = batch[index:]
-                        return
-                    if should_fetch:
-                        try:
-                            row = next(fetched_rows)
-                        except StopIteration:
-                            # Ctrl+C stops the mapper before it yields the rest;
-                            # retain the uncommitted suffix for exact resume.
-                            state.progress["hf_pending_rows"] = batch[index:]
-                            return
-                    else:
-                        row = None
-                        state.progress["python_edu_prefiltered_rows"] = (
-                            int(state.progress.get("python_edu_prefiltered_rows", 0)) + 1
-                        )
-
-                    state.progress["hf_rows_seen"] += 1
-                    state.progress["hf_pending_rows"] = batch[index + 1:]
-                    if row is not None:
-                        record = format_hf_record(source_name, row, variant)
-                        if record is not None:
-                            state.accept(record, english_only=english_only)
-                    state.maybe_save()
-                state.progress.pop("hf_pending_rows", None)
-        return
-
     if not saved_stream_state and (parallel_state or (rows_seen <= 0 and hf_workers > 1)):
         parallel_rows = iter_parallel_hf_rows(dataset, state, hf_workers)
         try:
@@ -1266,6 +1180,7 @@ def ingest_hf_source(
                 if record is not None:
                     state.accept(record, english_only=english_only)
                 state.progress["hf_parallel_states"][worker_index] = stream_state
+                state.progress["hf_parallel_rows_seen"][worker_index] += 1
                 state.maybe_save()
         finally:
             parallel_rows.close()
@@ -1490,7 +1405,6 @@ def run_source(
     resume: bool,
     progress_bar: tqdm,
     progress_lock: threading.Lock,
-    item_workers: int = DEFAULT_ITEM_WORKERS,
     hf_workers: int = DEFAULT_HF_WORKERS,
 ) -> int:
     """Download a single source end to end. Runs in its own worker thread."""
@@ -1506,7 +1420,6 @@ def run_source(
                 source_name,
                 state,
                 english_only=english_only,
-                item_workers=item_workers,
                 hf_workers=hf_workers,
             )
         else:
@@ -1518,12 +1431,98 @@ def run_source(
     return int(state.progress["estimated_tokens"])
 
 
+def run_source_with_retries(
+    source_name: str,
+    budget: SourceBudget,
+    config: SpakieConfig,
+    english_only: bool,
+    resume: bool,
+    progress_bar: tqdm,
+    progress_lock: threading.Lock,
+    hf_workers: int,
+    source_retries: int,
+) -> Exception | None:
+    """Retry a failed source from its durable cursor instead of abandoning it."""
+    for attempt in range(source_retries + 1):
+        try:
+            run_source(
+                source_name,
+                budget,
+                config,
+                english_only,
+                resume or attempt > 0,
+                progress_bar,
+                progress_lock,
+                hf_workers,
+            )
+            return None
+        except Exception as exc:
+            if STOP_EVENT.is_set() or attempt >= source_retries:
+                return exc
+            delay = min(2 ** attempt, 30)
+            log(
+                f"  {source_name}: source attempt {attempt + 1} failed "
+                f"({type(exc).__name__}: {exc}); resuming in {delay}s "
+                f"[retry {attempt + 1}/{source_retries}]"
+            )
+            if STOP_EVENT.wait(delay):
+                return exc
+    return None
+
+
 def read_source_progress(root: Path, source_name: str) -> dict:
     path = root / source_name / "progress.json"
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def migrate_python_edu_to_materialized(
+    root: Path,
+    *,
+    resume: bool,
+) -> None:
+    """Migrate Python-Edu source/filter contracts without losing output."""
+    if not resume:
+        return
+
+    progress_path = root / "python_edu" / "progress.json"
+    if not progress_path.exists():
+        return
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    if (
+        progress.get("python_edu_dataset") == PYTHON_EDU_DATASET
+        and progress.get("python_edu_revision") == PYTHON_EDU_REVISION
+        and int(progress.get("python_edu_filter_schema_version", 0))
+        == PYTHON_EDU_FILTER_SCHEMA_VERSION
+    ):
+        return
+
+    # Stream states are dataset-specific. Keep all committed output, token
+    # counts, and seen-ID indexes, but replay the new bulk stream from its
+    # beginning; accepted blob IDs make that replay duplicate-safe.
+    progress["hf_variant_index"] = 0
+    progress["hf_rows_seen"] = 0
+    progress["python_edu_dataset"] = PYTHON_EDU_DATASET
+    progress["python_edu_revision"] = PYTHON_EDU_REVISION
+    progress["python_edu_filter_schema_version"] = PYTHON_EDU_FILTER_SCHEMA_VERSION
+    progress.pop("hf_stream_state", None)
+    progress.pop("hf_parallel_states", None)
+    progress.pop("hf_parallel_workers", None)
+    progress.pop("hf_parallel_rows_seen", None)
+    progress.pop("hf_pending_rows", None)
+    temp_path = progress_path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(progress, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, progress_path)
+    log(
+        "  python_edu: starting one-time code-filter replay from the pinned "
+        f"Parquet cursor; kept {int(progress.get('estimated_tokens', 0)):,} "
+        "accepted est tokens"
+    )
 
 
 def has_direct_hf_cursor(progress: dict) -> bool:
@@ -1568,15 +1567,6 @@ def main() -> int:
     )
     parser.add_argument("--workers", type=int, default=0, help="Concurrent source downloads (0 = one per source)")
     parser.add_argument(
-        "--item-workers",
-        type=int,
-        default=DEFAULT_ITEM_WORKERS,
-        help=(
-            "Concurrent per-document fetches for sources whose rows reference "
-            f"external content (default: {DEFAULT_ITEM_WORKERS})"
-        ),
-    )
-    parser.add_argument(
         "--hf-workers-per-source",
         type=int,
         default=DEFAULT_HF_WORKERS,
@@ -1586,11 +1576,22 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--source-retries",
+        type=int,
+        default=DEFAULT_SOURCE_RETRIES,
+        help=(
+            "Retries for a failed source, resumed from its durable cursor "
+            f"(default: {DEFAULT_SOURCE_RETRIES})"
+        ),
+    )
+    parser.add_argument(
         "--no-redistribute-shortfall",
         action="store_true",
         help="Do not fill exhausted/failed source budgets from another requested streaming source",
     )
     args = parser.parse_args()
+    if args.source_retries < 0:
+        parser.error("--source-retries must be >= 0")
     STOP_EVENT.clear()
 
     config = SpakieConfig()
@@ -1600,6 +1601,11 @@ def main() -> int:
     reset_sources = {normalize_corpus_source(part) for part in args.reset_source.split(",") if part.strip()}
     target_tokens = args.target_tokens_estimate or config.target_processed_tokens
     sources = parse_sources(args.sources, config)
+    if "python_edu" in sources:
+        migrate_python_edu_to_materialized(
+            root,
+            resume=args.resume,
+        )
     source_plan = config.scaled_corpus_source_plan(
         target_processed_tokens=target_tokens,
         requested_sources=sources,
@@ -1617,12 +1623,10 @@ def main() -> int:
             reset_source_dir(source_dir)
         budgets[source_name] = build_budget(source_name, source_plan[source_name], args.max_docs)
 
-    total_target_tokens = sum(b.target_tokens_estimate for b in budgets.values())
     progress_by_source = {
         name: read_source_progress(root, name) if args.resume else {}
         for name in sources
     }
-    already_done = sum(int(progress.get("estimated_tokens", 0)) for progress in progress_by_source.values())
     completed_sources = {
         name
         for name in sources
@@ -1647,6 +1651,12 @@ def main() -> int:
     log(f"Downloading {len(active_sources)} source(s) with {workers} concurrent worker(s)")
     if completed_sources:
         log(f"  already complete: {', '.join(sorted(completed_sources))}")
+    remaining_by_source = {
+        name: remaining_source_tokens(progress_by_source[name], budgets[name])
+        for name in sources
+    }
+    for name in active_sources:
+        log(f"  {name}: {remaining_by_source[name]:,} est tokens remaining")
     for name in sorted(deferred_legacy_sources):
         progress = progress_by_source[name]
         remaining = max(
@@ -1657,15 +1667,21 @@ def main() -> int:
             f"its {remaining:,}-token tail will be filled from a direct-cursor source"
         )
 
-    # Load the langid model only when work remains, and once up front so source
-    # workers share it instead of racing on their first document.
-    if args.english_only and active_sources:
+    # Load the model only when an active source actually classifies prose.
+    # Code intentionally bypasses prose language ID.
+    language_filtered_sources = [
+        name for name in active_sources
+        if budgets[name].kind != "code"
+    ]
+    if args.english_only and language_filtered_sources:
         load_langid_model(config, logger=log)
 
     progress_lock = threading.Lock()
+    total_remaining_tokens = sum(remaining_by_source.values())
     progress_bar = tqdm(
-        total=total_target_tokens or None,
-        initial=already_done,
+        total=total_remaining_tokens,
+        initial=0,
+        desc="Remaining corpus",
         unit=" est tok",
         unit_scale=True,
         # Omit tqdm's update-triggered rate: it remains stale during retries or
@@ -1690,12 +1706,17 @@ def main() -> int:
                     return
                 error = None
                 try:
-                    run_source(
-                        name, budgets[name], config, args.english_only, args.resume,
-                        progress_bar, progress_lock, args.item_workers, args.hf_workers_per_source,
+                    error = run_source_with_retries(
+                        name,
+                        budgets[name],
+                        config,
+                        args.english_only,
+                        args.resume,
+                        progress_bar,
+                        progress_lock,
+                        args.hf_workers_per_source,
+                        args.source_retries,
                     )
-                except Exception as exc:
-                    error = exc
                 finally:
                     source_results.put((name, error))
 
@@ -1718,6 +1739,19 @@ def main() -> int:
                 if exc is not None:
                     failures.append((source_name, str(exc)))
                     log(f"  source failed: {source_name} -> {exc}")
+                if pending_sources == {"python_edu"}:
+                    progress = read_source_progress(root, "python_edu")
+                    remaining = max(
+                        budgets["python_edu"].target_tokens_estimate
+                        - int(progress.get("estimated_tokens", 0)),
+                        0,
+                    )
+                    log(
+                        f"  python_edu is the final active source "
+                        f"({remaining:,} est tokens remaining); streaming pinned "
+                        f"materialized Parquet with "
+                        f"{args.hf_workers_per_source} shard workers"
+                    )
         except KeyboardInterrupt:
             interrupted = True
             STOP_EVENT.set()
@@ -1745,20 +1779,30 @@ def main() -> int:
                 )
 
         if not interrupted and not args.no_redistribute_shortfall and args.max_docs <= 0:
-            accepted_tokens = sum(
-                int(json.loads((root / name / "progress.json").read_text()).get("estimated_tokens", 0))
+            latest_progress = {
+                name: read_source_progress(root, name)
                 for name in sources
-                if (root / name / "progress.json").exists()
+            }
+            # Sum per-source deficits. A large overshoot from an older source
+            # must never hide an unfinished source in a newly balanced plan.
+            shortfall = sum(
+                remaining_source_tokens(latest_progress[name], budgets[name])
+                for name in sources
             )
-            shortfall = max(total_target_tokens - accepted_tokens, 0)
             fallback_order = (
                 "stackexchange", "arxiv", "gutenberg", "openwebmath", "finemath",
                 "fineweb_sample", "wikipedia_snapshot", "cosmopedia_v2", "refinedweb",
                 "c4_en", "fineweb-edu", "python_edu",
             )
+            failed_source_names = {name.split(" (", 1)[0] for name, _ in failures}
             eligible_fallbacks = [
                 name for name in fallback_order
-                if name in sources and name in HF_DATASETS and name not in deferred_legacy_sources
+                if (
+                    name in sources
+                    and name in HF_DATASETS
+                    and name not in deferred_legacy_sources
+                    and name not in failed_source_names
+                )
             ]
             fallback = next(
                 (
@@ -1775,12 +1819,18 @@ def main() -> int:
                 budget = budgets[fallback]
                 budget.target_tokens_estimate += shortfall
                 budget.target_chars += shortfall * 4
-                try:
-                    run_source(
-                        fallback, budget, config, args.english_only, True,
-                        progress_bar, progress_lock, args.item_workers, args.hf_workers_per_source,
-                    )
-                except Exception as exc:
+                exc = run_source_with_retries(
+                    fallback,
+                    budget,
+                    config,
+                    args.english_only,
+                    True,
+                    progress_bar,
+                    progress_lock,
+                    args.hf_workers_per_source,
+                    args.source_retries,
+                )
+                if exc is not None:
                     failures.append((f"{fallback} (shortfall fill)", str(exc)))
                     log(f"  shortfall fill failed: {fallback} -> {exc}")
     finally:
@@ -1790,22 +1840,29 @@ def main() -> int:
     if interrupted:
         return 130
 
-    final_accepted_tokens = sum(
-        int(json.loads((root / name / "progress.json").read_text()).get("estimated_tokens", 0))
+    final_progress = {
+        name: read_source_progress(root, name)
         for name in sources
-        if (root / name / "progress.json").exists()
-    )
-    target_reached = final_accepted_tokens >= total_target_tokens
+    }
+    incomplete_sources = {
+        name: source_completion_ratio(final_progress[name], budgets[name])
+        for name in sources
+        if source_completion_ratio(final_progress[name], budgets[name])
+        < config.minimum_source_completion_ratio
+    }
+    target_reached = not incomplete_sources
     if failures:
         heading = "Recovered source failures" if target_reached else "Completed with source failures"
         log(f"\n{heading}:")
         for source_name, message in failures:
             log(f"  - {source_name}: {message}")
     if (failures or args.max_docs <= 0) and not target_reached:
-        log(
-            f"\nCorpus target not reached: {final_accepted_tokens:,} / "
-            f"{total_target_tokens:,} est tokens"
-        )
+        log("\nCorpus source targets not reached:")
+        for source_name, completion in sorted(incomplete_sources.items()):
+            progress = final_progress[source_name]
+            target = budgets[source_name].target_tokens_estimate
+            actual = int(progress.get("estimated_tokens", 0))
+            log(f"  - {source_name}: {completion:.1%} ({actual:,}/{target:,} est tokens)")
         return 1
     return 0
 

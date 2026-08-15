@@ -35,7 +35,7 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig, normalize_corpus_source
-from runtime.langid import is_probably_english
+from runtime.langid import is_probably_english, language_id_sample
 from runtime.processed_data import (
     invalidate_processed_data,
     publish_processed_data_manifest,
@@ -53,7 +53,7 @@ DEFAULT_TOKENIZE_BATCH_CHARS = 8_000_000
 MAX_RECOMMENDED_TOKENIZER_THREADS = 16
 SHARD_RUN_MANIFEST = "shard_run_manifest.json"
 SHARD_RESUME_JOURNAL = "accepted_documents.bin"
-PREPARATION_SCHEMA_VERSION = 3
+PREPARATION_SCHEMA_VERSION = 4
 _JOURNAL_HEADER = struct.Struct("<HIIQH")
 
 
@@ -873,7 +873,9 @@ def preparation_contract(
         "max_noise_ratio", "mean_word_length_min", "mean_word_length_max",
         "min_stopword_count", "max_symbol_word_ratio", "max_top_2gram_char_share",
         "max_top_3gram_char_share", "max_dup_5gram_char_share", "max_top_char_share",
-        "max_url_email_line_ratio", "near_dup_jaccard_threshold", "near_dup_num_perm",
+        "max_url_email_line_ratio", "filter_profiles",
+        "minimum_source_completion_ratio", "maximum_source_mix_deviation",
+        "near_dup_jaccard_threshold", "near_dup_num_perm",
         "near_dup_shingle_size", "train_split_fraction", "token_shard_size",
     )
     return {
@@ -1248,35 +1250,67 @@ def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[
     words_lower = _SHINGLE_WORD_RE.findall(lowered)
     word_count = len(words_lower)
     text_len = len(text)
-    is_code = source == "python_edu"
+    profile = config.filter_profile_for_source(source)
+    source_kind = config.corpus_source_kind(source)
 
     mwl = _mean_word_length_from_words(words_lower)
-    if not is_code and (mwl < config.mean_word_length_min or mwl > config.mean_word_length_max):
+    if bool(profile.get("apply_word_length", True)) and (
+        mwl < config.mean_word_length_min or mwl > config.mean_word_length_max
+    ):
         return False, "bad_word_length"
-    if not is_code and _stopword_hit_count_from_words(words_lower[:200]) < config.min_stopword_count:
+    if bool(profile.get("apply_stopwords", True)) and (
+        _stopword_hit_count_from_words(words_lower[:200]) < config.min_stopword_count
+    ):
         return False, "low_stopwords"
-    if not is_code and _symbol_word_ratio_from_words(text, word_count) > config.max_symbol_word_ratio:
+    if _symbol_word_ratio_from_words(text, word_count) > float(
+        profile.get("max_symbol_word_ratio", config.max_symbol_word_ratio)
+    ):
         return False, "symbol_heavy"
     # Single Counter pass yields both the noise ratio (checked now) and the
     # top-char share (checked below) without walking every character twice.
     noise, top_share = noise_and_top_char_share(text)
-    if noise > (0.60 if is_code else config.max_noise_ratio):
+    if noise > float(profile.get("max_noise_ratio", config.max_noise_ratio)):
         return False, "too_noisy"
-    if repeated_line_ratio(text) > config.max_repeated_line_ratio:
+    if repeated_line_ratio(text) > float(
+        profile.get("max_repeated_line_ratio", config.max_repeated_line_ratio)
+    ):
         return False, "repeated_lines"
-    if url_email_line_ratio(text) > config.max_url_email_line_ratio:
+    if url_email_line_ratio(text) > float(
+        profile.get("max_url_email_line_ratio", config.max_url_email_line_ratio)
+    ):
         return False, "link_farm"
-    if _top_ngram_char_share_from_words(words_lower, 2, text_len) > config.max_top_2gram_char_share:
+    if _top_ngram_char_share_from_words(words_lower, 2, text_len) > float(
+        profile.get("max_top_2gram_char_share", config.max_top_2gram_char_share)
+    ):
         return False, "repetitive_2gram"
-    if _top_ngram_char_share_from_words(words_lower, 3, text_len) > config.max_top_3gram_char_share:
+    if _top_ngram_char_share_from_words(words_lower, 3, text_len) > float(
+        profile.get("max_top_3gram_char_share", config.max_top_3gram_char_share)
+    ):
         return False, "repetitive_3gram"
-    if _dup_ngram_char_share_from_words(words_lower, 5, text_len) > config.max_dup_5gram_char_share:
+    if _dup_ngram_char_share_from_words(words_lower, 5, text_len) > float(
+        profile.get("max_dup_5gram_char_share", config.max_dup_5gram_char_share)
+    ):
         return False, "duplicate_5gram"
-    if top_share > config.max_top_char_share:
+    if top_share > float(profile.get("max_top_char_share", config.max_top_char_share)):
         return False, "char_repetition"
-    if looks_boilerplate_heavy(text):
+    if source_kind != "code" and looks_boilerplate_heavy(text):
         return False, "boilerplate"
     return True, "kept"
+
+
+def language_filter_sample(
+    text: str, config: SpakieConfig, source: str
+) -> str | None:
+    """Return text suitable for language ID, or None when it must be skipped.
+
+    Whole-file prose classification is actively harmful for source code and
+    symbol-heavy mathematics. Code is language-neutral here; math is classified
+    only from its natural-language words, never from formulas themselves.
+    """
+    profile = config.filter_profile_for_source(source)
+    if not bool(profile.get("apply_language_id", True)):
+        return None
+    return language_id_sample(text, config.corpus_source_kind(source))
 
 
 class TokenizerPipeline:
@@ -1384,6 +1418,35 @@ def build_report(
     }
 
 
+def corpus_quality_gate_failures(report: dict, config: SpakieConfig) -> list[str]:
+    """Return actionable reasons a full corpus must not be published."""
+    failures: list[str] = []
+    target_total = max(int(report.get("target_processed_tokens", 0)), 1)
+    actual_total = max(int(report.get("processed_tokens", 0)), 1)
+    source_stats = report.get("source_stats", {})
+    for source, target in report.get("source_targets", {}).items():
+        target_tokens = int(target.get("target_tokens", 0))
+        if not target.get("enabled", True) or target_tokens <= 0:
+            continue
+        stats = source_stats.get(source, {})
+        actual_tokens = int(stats.get("tokens_kept", 0))
+        completion = actual_tokens / target_tokens
+        if completion < config.minimum_source_completion_ratio:
+            failures.append(
+                f"{source}: {completion:.1%} of token quota "
+                f"({actual_tokens:,}/{target_tokens:,})"
+            )
+        target_share = target_tokens / target_total
+        actual_share = actual_tokens / actual_total
+        deviation = abs(actual_share - target_share)
+        if deviation > config.maximum_source_mix_deviation:
+            failures.append(
+                f"{source}: actual share {actual_share:.1%} differs from "
+                f"target {target_share:.1%} by {deviation:.1%}"
+            )
+    return failures
+
+
 def prepare_data(
     config: SpakieConfig | None = None,
     *,
@@ -1399,6 +1462,7 @@ def prepare_data(
     tokenize_batch_size: int = DEFAULT_TOKENIZE_BATCH_SIZE,
     tokenize_batch_chars: int = DEFAULT_TOKENIZE_BATCH_CHARS,
     workers: int | None = None,
+    enforce_quality_gates: bool = True,
 ) -> dict:
     if resume and dry_run:
         raise ValueError("--resume cannot be combined with --dry_run")
@@ -1412,6 +1476,12 @@ def prepare_data(
     source_plan = config.scaled_corpus_source_plan(target_processed_tokens=target_tokens)
     tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
     tokenizer_provenance = tokenizer_contract(config.tokenizer_prefix + ".model")
+    if tokenizer.vocab_size != config.vocab_size:
+        raise RuntimeError(
+            f"Tokenizer vocabulary mismatch: config expects {config.vocab_size:,} pieces, "
+            f"but {config.tokenizer_prefix}.model contains {tokenizer.vocab_size:,}. "
+            "Retrain tokenizer/train_tokenizer.py before rebuilding processed data."
+        )
     token_dtype = pick_token_dtype(tokenizer)
     tokenizer_threads = tokenizer_threads or recommended_tokenizer_threads()
     tokenize_batch_size = max(1, tokenize_batch_size)
@@ -1733,7 +1803,10 @@ def prepare_data(
             # and old downloads may predate --english_only. Very short custom
             # documents are left alone because lid.176 is unreliable there;
             # production source minima are already at or above this threshold.
-            if len(text) >= 400 and not is_probably_english(text, config):
+            language_sample = language_filter_sample(text, config, source)
+            if language_sample is not None and not is_probably_english(
+                language_sample, config
+            ):
                 stats["documents_dropped"] += 1
                 stats["drop_reasons"]["non_english"] += 1
                 continue
@@ -1917,6 +1990,13 @@ def prepare_data(
     )
     report["target_tokens_requested"] = target_tokens
     report["resume"] = resume
+    gate_failures = corpus_quality_gate_failures(report, config)
+    report["quality_gate"] = {
+        "minimum_source_completion_ratio": config.minimum_source_completion_ratio,
+        "maximum_source_mix_deviation": config.maximum_source_mix_deviation,
+        "passed": not gate_failures,
+        "failures": gate_failures,
+    }
     if resume:
         report["resume_existing_shards"] = len(existing_shard_paths)
         report["resume_existing_tokens"] = resume_tokens
@@ -1950,6 +2030,20 @@ def prepare_data(
         print(f"Estimated processed tokens: {total_tokens:,}")
         print(f"Gap to target: {max(target_tokens - total_tokens, 0):,}")
         return report
+
+    full_corpus_run = (
+        target_tokens == config.target_processed_tokens
+        and not source_glob
+        and not source_dirs
+    )
+    if enforce_quality_gates and full_corpus_run and gate_failures:
+        invalidate_processed_data(processed_dir)
+        formatted = "\n  - ".join(gate_failures)
+        raise RuntimeError(
+            "Corpus quality gates failed; processed arrays were not published. "
+            "Download/refill the missing sources or explicitly use "
+            "--allow-incomplete-corpus for a diagnostic run:\n  - " + formatted
+        )
 
     if not shard_paths:
         raise RuntimeError("No token shards were produced")
@@ -2032,6 +2126,14 @@ def parse_args() -> argparse.Namespace:
             "Results are consumed in deterministic input-file order."
         ),
     )
+    parser.add_argument(
+        "--allow-incomplete-corpus",
+        action="store_true",
+        help=(
+            "Allow a full run to publish despite source quota/mix failures. "
+            "Intended only for diagnostics and ablations."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2051,6 +2153,7 @@ def main() -> None:
         tokenize_batch_size=args.tokenize_batch_size,
         tokenize_batch_chars=args.tokenize_batch_chars,
         workers=args.workers or None,
+        enforce_quality_gates=not args.allow_incomplete_corpus,
     )
 
 

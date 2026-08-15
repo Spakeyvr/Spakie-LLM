@@ -25,23 +25,23 @@ PyTorch is the main dependency for the torch backend. On Apple Silicon, MLX is i
 
 ## Quick Start
 
-1. Train a tokenizer from files under `data/raw/`:
-
-```bash
-python3 tokenizer/train_tokenizer.py
-```
-
-Tokenizer samples are streamed in deterministic round-robin order across
-discovered corpus sources, so the five-million-example cap cannot exclude
-later source directories merely because of lexical path order.
-
-2. Download or add pretraining data:
+1. Download or add pretraining data:
 
 ```bash
 python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
 ```
 
-3. Prepare pretraining arrays:
+2. Train the 24K tokenizer from cleaned files under `data/raw/`:
+
+```bash
+python3 tokenizer/train_tokenizer.py
+```
+
+Tokenizer samples pass the canonical domain-aware filters and are streamed in
+deterministic weighted-fair order using the final corpus plan. The five-million
+sample cap therefore follows the intended mix instead of lexical path order.
+
+3. Prepare fresh pretraining arrays:
 
 ```bash
 python3 scripts/prepare_data.py
@@ -111,27 +111,31 @@ python3 scripts/download_pretrain_corpus.py --sources all --resume --english_onl
 ```
 
 The downloader streams Gutenberg, Stack Exchange, and arXiv from bulk corpus
-snapshots rather than rate-limited public APIs. Python-Edu metadata is resolved
-through persistent concurrent HTTPS connections to Software Heritage's public
-S3 bucket; rows that are too short or already accepted are rejected before the
-content request. By default, each Hugging Face source keeps four input shards
-active (`--hf-workers-per-source`) and Python-Edu uses up to thirty-two persistent
-content fetchers (`--item-workers`, scaled down on smaller machines). New progress
-files store exact Hugging Face stream state, so `--resume` continues at the saved
-input shard instead of replaying every earlier row. Near-complete progress files
-from the old row-counter format skip their multi-million-row replay and fill the
-small remaining tail from a source with a direct cursor. Progress is labelled
-`Accepted corpus`; the displayed rate is accepted estimated tokens over the
-last 15 seconds, so retries, filtering, and other zero-progress time reduce it
-instead of leaving an earlier burst rate on screen. If a requested source is
-exhausted or unavailable, its shortfall is filled from another requested
-streaming source; use `--no-redistribute-shortfall` to preserve strict
-per-source quotas instead. Ctrl+C gives active workers five seconds to flush
-their checkpoints, then exits without waiting for blocked HTTP retries; pressing
-Ctrl+C again skips the grace period. Sources already at their saved target are
-skipped before their potentially large resume indexes are loaded.
+snapshots rather than rate-limited public APIs. Python-Edu uses a pinned
+pre-materialized Parquet copy of the original corpus, avoiding millions of
+individual Software Heritage requests. Migrating an older `--resume` run keeps
+committed output and token accounting, resets only the obsolete input cursor,
+and skips replayed documents through their blob IDs. By default, each Hugging
+Face source keeps four input shards active
+(`--hf-workers-per-source`). Hugging Face transfers use a 60-second timeout
+unless `HF_HUB_DOWNLOAD_TIMEOUT` is already set. A failed source is resumed
+from its durable cursor up to three times (`--source-retries`). New progress
+files store exact Hugging Face stream state, so `--resume` continues at the
+saved input shard instead of replaying every earlier row. Near-complete progress
+files from the old row-counter format
+skip their multi-million-row replay and fill the small remaining tail from a
+source with a direct cursor. Progress is labelled `Accepted corpus`; the
+displayed rate is accepted estimated tokens over the last 15 seconds, so
+retries, filtering, and other zero-progress time reduce it instead of leaving
+an earlier burst rate on screen. If a requested source is exhausted or
+unavailable, its shortfall is filled from another requested streaming source;
+use `--no-redistribute-shortfall` to preserve strict per-source quotas instead.
+Ctrl+C gives active workers five seconds to flush their checkpoints, then exits
+without waiting for blocked HTTP retries; pressing Ctrl+C again skips the grace
+period. Sources already at their saved target are skipped before their
+potentially large resume indexes are loaded.
 
-`scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies quality filters, fastText language ID, and MinHash/LSH near-deduplication, tokenizes in deterministic input order, writes token shards under `data/processed/shards/`, and transactionally merges them into `data/processed/train.npy` and `data/processed/val.npy`. A `processed_data_manifest.json` commit marker is published only after both arrays are complete and durable. It records the exact tokenizer, preparation settings, raw-input generation, token-ID bounds, and array file identity; training refuses stale or unverifiable arrays by default.
+`scripts/prepare_data.py` streams documents from `data/raw/`, including `data/raw/large_corpus/<source>/`, applies separate prose/math/code filters, source-appropriate language ID, and MinHash/LSH near-deduplication, tokenizes in deterministic input order, writes token shards under `data/processed/shards/`, and transactionally merges them into `data/processed/train.npy` and `data/processed/val.npy`. A `processed_data_manifest.json` commit marker is published only after both arrays are complete and durable. Full-corpus runs also refuse publication when a required source is below 95% of quota or the source mix drifts by more than two percentage points. It records the exact tokenizer, preparation settings, raw-input generation, token-ID bounds, and array file identity; training refuses stale or unverifiable arrays by default.
 
 Useful prepare commands:
 
@@ -141,6 +145,8 @@ python3 scripts/prepare_data.py --dry_run
 python3 scripts/prepare_data.py --target_train_tokens 100000000
 python3 scripts/prepare_data.py --source_dirs large_corpus,wiki
 python3 scripts/prepare_data.py --workers 1
+# Diagnostic/ablation escape hatch; do not use for a canonical full run:
+python3 scripts/prepare_data.py --allow-incomplete-corpus
 ```
 
 Resume requires the shard-generation provenance and accepted-document journal
@@ -256,14 +262,13 @@ python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
 The default SFT download uses the enabled sources in `configs/default.yaml`.
-The current downloadable defaults target the 180M model: up to 40,000
-quality-stratified SmolTalk rows from a 150,000-row raw sample, 8,000 No Robots,
-6,000 SciQ, 5,000 SQuAD, 3,000 BoolQ, 5,000 Nemotron instruction-following chat,
-and 3,000 TriviaQA rows, plus uncapped local `DeepSeek-distill-V2` and `custom`
-files. Preparation removes non-English, conflicting-identity, refusal, review-
-annotation, and over-context examples. Advanced Nemotron math is intentionally
-not part of this SFT pipeline. Limits are
-applied to usable converted examples rather than raw rows. To download only selected sources:
+The canonical merge is capped at 100,000 examples and uses concise
+`smol-smoltalk`, grounded QA/science sources, and small capped Nemotron and
+OpenHermes samples. Unconfigured files are disabled by default, so ad-hoc or
+benchmark-derived curricula cannot silently enter training. Every exported row
+records canonical source provenance, a stable example ID, and rendered token
+length. Refusals are accepted only from explicitly configured safety sources.
+Limits are applied to usable converted examples rather than raw rows.
 
 `build_sft_seed_data.py` writes the small permanent local sources separately so
 they remain easy to inspect and version: `spakie_180m_identity.jsonl`,
@@ -304,7 +309,8 @@ text or invent a human occupation.
 
 ## Optimizer
 
-The default optimizer is Muon, with AdamW fallback only when explicitly allowed:
+Pretraining defaults to Muon. SFT deliberately defaults to one gentler AdamW
+epoch at `1.5e-5` to reduce catastrophic forgetting:
 
 ```bash
 python3 scripts/train.py --optimizer muon
@@ -313,6 +319,14 @@ python3 scripts/verify_muon.py
 ```
 
 Muon options include `--muon-adjust-lr-fn {match_rms_adamw,original,none}`, `--muon-ns-steps`, `--muon-momentum`, `--muon-nesterov / --no-muon-nesterov`, and `--muon-qkv-split / --no-muon-qkv-split`.
+
+Before committing to a long pretraining run, preview the fair 100M-token
+cosine-vs-trapezoid sweep across three learning rates, then execute it:
+
+```bash
+python3 scripts/run_pretrain_ablations.py --preset 300m --backend mlx
+python3 scripts/run_pretrain_ablations.py --preset 300m --backend mlx --execute
+```
 
 ## Checkpoints and Chat
 
@@ -360,16 +374,16 @@ The repo currently supports these presets:
 
 | Preset | Layers | `d_model` | Q heads | KV heads | MLP | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
-| `92m` | 12 | 768 | 12 | 4 | GELU `d_ff=3072` | 92 | 1 | 92 | 2 | Smallest preset, good for smoke tests and quicker iteration |
-| `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 48 | 4 | 32 | 4 | ~178M parameters, RoPE + QK norm |
-| `180m_gqa4` | 16 | 896 | 16 | 4 | SwiGLU hidden 2048 | 96 | 2 | 64 | 4 | Short-run 4-KV-head architecture ablation |
-| `180m_deep` | 24 | 768 | 12 | 4 | SwiGLU hidden 1536 | 72 | 2 | 48 | 4 | Short-run deep/thin architecture ablation |
-| `300m` | 24 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 64 | 3 | 16 | 2 | ~306M parameters, RoPE + QK norm; memory-safe chunked-vmap pretraining default |
+| `92m` | 12 | 768 | 12 | 4 | GELU `d_ff=3072` | 23 | 1 | 23 | 2 | Smallest preset, good for smoke tests and quicker iteration |
+| `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 12 | 4 | 8 | 4 | ~184M parameters, RoPE + QK norm |
+| `180m_gqa4` | 16 | 896 | 16 | 4 | SwiGLU hidden 2048 | 24 | 2 | 16 | 4 | Short-run 4-KV-head architecture ablation |
+| `180m_deep` | 24 | 768 | 12 | 4 | SwiGLU hidden 1536 | 18 | 2 | 12 | 4 | Short-run deep/thin architecture ablation |
+| `300m` | 24 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 16 | 3 | 4 | 2 | ~315M parameters, RoPE + QK norm; memory-safe chunked-vmap pretraining default |
 
 Shared model defaults:
 
-- `vocab_size = 16384`
-- `max_seq_len = 512`
+- `vocab_size = 24576`
+- `max_seq_len = 2048`
 - `dropout = 0.0`
 - `bias = false`
 - RoPE (`theta=100000`) with QK norm for the `180m` and `300m` presets; learned positional embeddings remain available for legacy configurations
@@ -381,19 +395,16 @@ Shared model defaults:
 ## Balanced Pretraining Corpus
 
 The default corpus target is 10B training tokens (about 10.53B processed with
-the 95/5 split), with `max_seq_len=512`. The source plan is intentionally
+the 95/5 split), with `max_seq_len=2048`. The source plan is intentionally
 balanced by capability domain:
 
 | Domain | Target share |
 |---|---:|
-| FineWeb-Edu | 32% |
-| General filtered web | 16% |
-| Wikipedia/reference | 17% |
-| Math (`FineMath-4+` + OpenWebMath) | 12% |
-| Educational Python code | 10% |
-| Books | 6% |
-| arXiv + StackExchange | 2% |
-| Cosmopedia synthetic education | 5% |
+| FineWeb-Edu + filtered-web supplements | 45% |
+| Wikipedia + books | 15% |
+| Math (`FineMath-4+` + OpenWebMath) | 15% |
+| Educational Python code (score 4+) | 15% |
+| arXiv + StackExchange + Cosmopedia | 10% |
 
 Download and prepare a fresh generation; existing processed arrays retain the
 old mixture until rebuilt:

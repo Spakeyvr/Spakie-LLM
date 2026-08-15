@@ -1,5 +1,4 @@
 import _thread
-import gzip
 import io
 import json
 import sys
@@ -20,6 +19,27 @@ import tokenizer.train_tokenizer as train_tokenizer
 
 
 class CompactResumeIndexTests(unittest.TestCase):
+    def test_remaining_progress_is_per_source_not_hidden_by_overshoot(self):
+        completed = download_pretrain_corpus.SourceBudget(
+            "web", "web", 400, 0, 100
+        )
+        unfinished = download_pretrain_corpus.SourceBudget(
+            "code", "code", 400, 0, 100
+        )
+
+        self.assertEqual(
+            download_pretrain_corpus.remaining_source_tokens(
+                {"estimated_tokens": 500}, completed
+            ),
+            0,
+        )
+        self.assertEqual(
+            download_pretrain_corpus.remaining_source_tokens(
+                {"estimated_tokens": 40}, unfinished
+            ),
+            60,
+        )
+
     def test_download_progress_uses_compact_rate_and_readable_eta(self):
         self.assertEqual(
             download_pretrain_corpus.AcceptedRateMonitor._format_rate(4_410_000),
@@ -33,6 +53,37 @@ class CompactResumeIndexTests(unittest.TestCase):
             download_pretrain_corpus.AcceptedRateMonitor._format_duration(185),
             "3min 5s",
         )
+
+    def test_download_progress_clamps_whole_document_overshoot(self):
+        class FakeProgress:
+            total = 100
+            n = 99
+
+            def update(self, amount):
+                self.n += amount
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            progress = FakeProgress()
+            state = download_pretrain_corpus.SourceState(
+                Path(tmpdir),
+                download_pretrain_corpus.SourceBudget(
+                    "python_edu", "code", 10_000, 0, 100
+                ),
+                resume=False,
+                progress_bar=progress,
+                progress_lock=threading.Lock(),
+            )
+            state.accept(
+                {
+                    "id": "doc",
+                    "text": "def useful_example():\n    return 42\n" * 30,
+                },
+                english_only=False,
+            )
+            state.close()
+
+        self.assertEqual(progress.n, 100)
+        self.assertGreater(state.progress["estimated_tokens"], 1)
 
     def test_interrupt_exit_flushes_then_terminates_without_thread_shutdown_wait(self):
         stdout = io.StringIO()
@@ -126,47 +177,47 @@ class CompactResumeIndexTests(unittest.TestCase):
             "https://example.test/item",
         )
 
-    def test_python_edu_materializes_public_s3_blob(self):
-        compressed = io.BytesIO()
-        with gzip.GzipFile(fileobj=compressed, mode="wb") as handle:
-            handle.write(b"def answer():\n    return 42\n")
-        payload = compressed.getvalue()
+    def test_source_failure_retries_from_resume_mode(self):
+        calls: list[bool] = []
 
-        class FakeResponse:
-            status_code = 200
-            reason = "OK"
-            content = payload
+        def fail_once(*_args, **_kwargs):
+            calls.append(_args[4])
+            if len(calls) == 1:
+                raise TimeoutError("transient stream failure")
+            return 123
 
-            def __enter__(self):
-                return self
+        with (
+            patch.object(download_pretrain_corpus, "run_source", side_effect=fail_once),
+            patch.object(download_pretrain_corpus.STOP_EVENT, "wait", return_value=False),
+        ):
+            error = download_pretrain_corpus.run_source_with_retries(
+                "fineweb-edu",
+                download_pretrain_corpus.SourceBudget(
+                    "fineweb-edu", "web", 1_000, 0, 250
+                ),
+                SpakieConfig(),
+                False,
+                False,
+                None,
+                threading.Lock(),
+                1,
+                3,
+            )
 
-            def __exit__(self, *_args):
-                return None
+        self.assertIsNone(error)
+        self.assertEqual(calls, [False, True])
 
-            def raise_for_status(self):
-                return None
-
-        class FakeSession:
-            def get(self, url, **kwargs):
-                self.url = url
-                self.kwargs = kwargs
-                return FakeResponse()
-
-        session = FakeSession()
-        with patch.object(download_pretrain_corpus, "_http_session", return_value=session):
-            row = download_pretrain_corpus.materialize_python_edu_row({"blob_id": "abc123"})
-
-        self.assertEqual(row["text"], "def answer():\n    return 42\n")
-        self.assertEqual(
-            session.url,
-            "https://softwareheritage.s3.amazonaws.com/content/abc123",
-        )
-        self.assertEqual(session.kwargs, {"timeout": (10, 60)})
-
-    def test_python_edu_prefilters_short_and_seen_rows_before_content_fetch(self):
+    def test_materialized_python_edu_streams_text_directly(self):
         class FakeStream:
-            def __init__(self, rows):
-                self.rows = rows
+            def __init__(self):
+                self.rows = [
+                    {
+                        "blob_id": "already-materialized",
+                        "repo_name": "example/repo",
+                        "path": "/lesson.py",
+                        "text": "def educational_example():\n    return 42\n" * 30,
+                    }
+                ]
                 self.index = 0
 
             def __iter__(self):
@@ -181,62 +232,109 @@ class CompactResumeIndexTests(unittest.TestCase):
             def load_state_dict(self, state):
                 self.index = int(state["index"])
 
-        rows = [
-            {"blob_id": "short", "path": "/short.py", "length_bytes": 120},
-            {"blob_id": "seen", "path": "/seen.py", "length_bytes": 800},
-            {"blob_id": "fetch", "path": "/fetch.py", "length_bytes": 800},
-        ]
         variant = {
-            "path": "fake/python-edu",
-            "name": "python-edu",
+            "path": "Avelina/python-edu-cleaned",
             "split": "train",
+            "materialized": True,
         }
-        fetched: list[str] = []
-
-        def materialize(row):
-            fetched.append(row["blob_id"])
-            return {**row, "text": "def useful_example():\n    return 42\n" * 30}
-
         with tempfile.TemporaryDirectory() as tmpdir:
             state = download_pretrain_corpus.SourceState(
                 Path(tmpdir),
                 download_pretrain_corpus.SourceBudget(
-                    "python_edu", "code", 100_000, 0, 100_000
+                    "python_edu", "code", 100_000, 1, 100_000
                 ),
                 resume=False,
             )
-            state.seen_ids.add(state.identity_keys("seen", "", "")[0])
-            stream = FakeStream(rows)
-            with (
-                patch.object(
-                    download_pretrain_corpus,
-                    "load_hf_stream",
-                    return_value=(stream, variant, 0),
-                ),
-                patch.object(
-                    download_pretrain_corpus,
-                    "materialize_python_edu_row",
-                    side_effect=materialize,
-                ),
+            with patch.object(
+                download_pretrain_corpus,
+                "load_hf_stream",
+                return_value=(FakeStream(), variant, 0),
             ):
                 download_pretrain_corpus.ingest_hf_source(
                     "python_edu",
                     state,
                     english_only=False,
-                    item_workers=2,
+                    hf_workers=1,
                 )
             state.close()
 
-            written = [
-                json.loads(line)["id"]
-                for shard in sorted(Path(tmpdir).glob("shard-*.jsonl"))
-                for line in shard.read_text().splitlines()
-            ]
+        self.assertEqual(state.progress["docs_written"], 1)
 
-        self.assertEqual(fetched, ["fetch"])
-        self.assertEqual(written, ["fetch"])
-        self.assertEqual(state.progress["hf_rows_seen"], 3)
-        self.assertEqual(state.progress["python_edu_prefiltered_rows"], 2)
+    def test_python_edu_materialized_migration_keeps_output_accounting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "python_edu"
+            source_dir.mkdir()
+            progress_path = source_dir / "progress.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "source": "python_edu",
+                        "estimated_tokens": 123,
+                        "docs_written": 2,
+                        "hf_rows_seen": 99,
+                        "hf_variant_index": 0,
+                        "python_edu_dataset": download_pretrain_corpus.PYTHON_EDU_DATASET,
+                        "python_edu_revision": download_pretrain_corpus.PYTHON_EDU_REVISION,
+                        "python_edu_filter_schema_version": 1,
+                        "hf_stream_state": {"index": 99},
+                        "hf_parallel_states": [{"index": 99}],
+                        "hf_parallel_rows_seen": [99],
+                        "hf_pending_rows": [{"blob_id": "pending"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            download_pretrain_corpus.migrate_python_edu_to_materialized(
+                root,
+                resume=True,
+            )
+            migrated = json.loads(progress_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(migrated["estimated_tokens"], 123)
+        self.assertEqual(migrated["docs_written"], 2)
+        self.assertEqual(migrated["hf_variant_index"], 0)
+        self.assertEqual(migrated["hf_rows_seen"], 0)
+        self.assertEqual(
+            migrated["python_edu_revision"],
+            download_pretrain_corpus.PYTHON_EDU_REVISION,
+        )
+        self.assertEqual(
+            migrated["python_edu_filter_schema_version"],
+            download_pretrain_corpus.PYTHON_EDU_FILTER_SCHEMA_VERSION,
+        )
+        self.assertNotIn("hf_stream_state", migrated)
+        self.assertNotIn("hf_parallel_states", migrated)
+        self.assertNotIn("hf_parallel_rows_seen", migrated)
+        self.assertNotIn("hf_pending_rows", migrated)
+
+    def test_python_code_bypasses_prose_language_id(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = download_pretrain_corpus.SourceState(
+                Path(tmpdir),
+                download_pretrain_corpus.SourceBudget(
+                    "python_edu", "code", 10_000, 0, 10_000
+                ),
+                resume=False,
+            )
+            with patch.object(
+                download_pretrain_corpus,
+                "is_probably_english",
+                return_value=False,
+            ) as classify:
+                accepted = state.accept(
+                    {
+                        "id": "blob-id",
+                        "title": "repo:path.py",
+                        "text": "def useful_function(value):\n    return value + 1\n" * 20,
+                    },
+                    english_only=True,
+                )
+            state.close()
+
+        self.assertTrue(accepted)
+        classify.assert_not_called()
 
     def test_completed_source_is_skipped_before_resume_indexes_load(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -472,6 +570,52 @@ class CompactResumeIndexTests(unittest.TestCase):
         self.assertEqual(sorted(ids), ["doc-0", "doc-1", "doc-2", "doc-3"])
         self.assertEqual(len(ids), len(set(ids)))
 
+    def test_parallel_hf_zero_state_uses_committed_worker_counts(self):
+        class ZeroStateShard:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def __iter__(self):
+                yield from self.rows
+
+            def state_dict(self):
+                return {"index": 0}
+
+            def load_state_dict(self, _state):
+                pass
+
+        class FakeDataset:
+            num_shards = 2
+
+            def __init__(self):
+                self.rows = [{"id": f"doc-{index}"} for index in range(6)]
+
+            def shard(self, num_shards, index, contiguous=False):
+                return ZeroStateShard(self.rows[index::num_shards])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = download_pretrain_corpus.SourceState(
+                Path(tmpdir),
+                download_pretrain_corpus.SourceBudget(
+                    "fineweb-edu", "web", 100_000, 0, 100_000
+                ),
+                resume=False,
+            )
+            state.progress["hf_parallel_workers"] = 2
+            state.progress["hf_parallel_states"] = [{"index": 0}, {"index": 0}]
+            state.progress["hf_parallel_rows_seen"] = [1, 1]
+            rows = list(
+                download_pretrain_corpus.iter_parallel_hf_rows(
+                    FakeDataset(), state, workers=2
+                )
+            )
+            state.close()
+
+        self.assertEqual(
+            sorted(row["id"] for row, _worker, _cursor in rows),
+            ["doc-2", "doc-3", "doc-4", "doc-5"],
+        )
+
     def test_cosmopedia_oversized_legacy_ids_are_archived_without_loading(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source_dir = Path(tmpdir)
@@ -552,6 +696,8 @@ class CompactResumeIndexTests(unittest.TestCase):
                 "fineweb-edu",
                 "--workers",
                 "1",
+                "--source-retries",
+                "0",
             ]
             with (
                 patch.object(sys, "argv", argv),
@@ -610,6 +756,81 @@ class TokenizerSamplingTests(unittest.TestCase):
         self.assertTrue(chunks)
         self.assertTrue(all(len(chunk.encode("utf-8")) <= 40 for chunk in chunks))
         self.assertIn("é", "".join(chunks))
+
+    def test_training_texts_follow_corpus_weights(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for source in ("aaa", "zzz"):
+                path = root / "large_corpus" / source / "data.jsonl"
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    "".join(
+                        json.dumps({"text": f"{source}-{index}"}) + "\n"
+                        for index in range(100)
+                    ),
+                    encoding="utf-8",
+                )
+            rows = list(
+                train_tokenizer.iter_training_texts(
+                    str(root), source_weights={"aaa": 3, "zzz": 1}
+                )
+            )[:40]
+
+        self.assertEqual(sum(row.startswith("aaa-") for row in rows), 30)
+        self.assertEqual(sum(row.startswith("zzz-") for row in rows), 10)
+
+    def test_training_text_callback_reports_source_and_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = root / "large_corpus" / "aaa" / "data.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"text": "alpha beta"}) + "\n")
+            observed = []
+
+            samples = list(
+                train_tokenizer.iter_training_texts(
+                    str(root),
+                    on_sample=lambda source, size: observed.append((source, size)),
+                )
+            )
+
+        self.assertEqual(samples, ["alpha beta"])
+        self.assertEqual(observed, [("aaa", len("alpha beta".encode("utf-8")))])
+
+    def test_interrupted_tokenizer_collection_removes_own_temp_file(self):
+        real_named_temporary_file = tempfile.NamedTemporaryFile
+
+        def interrupted_samples(*_args, **kwargs):
+            callback = kwargs.get("on_sample")
+            if callback is not None:
+                callback("fineweb-edu", 12)
+            yield "useful text"
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpakieConfig(
+                tokenizer_prefix=str(Path(tmpdir) / "tokenizer" / "spakie")
+            )
+            with (
+                patch.object(
+                    train_tokenizer.tempfile,
+                    "NamedTemporaryFile",
+                    side_effect=lambda **kwargs: real_named_temporary_file(
+                        dir=tmpdir, **kwargs
+                    ),
+                ),
+                patch.object(
+                    train_tokenizer,
+                    "iter_training_texts",
+                    side_effect=interrupted_samples,
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    train_tokenizer.train_tokenizer(config, max_sentences=10)
+
+            leftovers = list(Path(tmpdir).glob("spakie-tokenizer-*.txt"))
+
+        self.assertEqual(leftovers, [])
 
 
 class PretrainCleaningTests(unittest.TestCase):
@@ -686,6 +907,7 @@ class CanonicalLanguageFilterTests(unittest.TestCase):
                 encoding="utf-8",
             )
             config = SpakieConfig(
+                vocab_size=100,
                 raw_data_dir=str(root / "raw"),
                 processed_data_dir=str(root / "processed"),
                 corpus_report_path=str(root / "processed" / "report.json"),
@@ -709,7 +931,7 @@ class CanonicalLanguageFilterTests(unittest.TestCase):
                 patch.object(
                     prepare_data,
                     "tokenizer_contract",
-                    return_value={"sha256": "fake", "vocab_size": 8192},
+                    return_value={"sha256": "fake", "vocab_size": 100},
                 ),
                 patch.object(prepare_data, "should_keep_document", return_value=(True, "")),
                 patch.object(

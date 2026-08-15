@@ -1,14 +1,17 @@
-"""Train a SentencePiece BPE tokenizer and provide a wrapper class."""
+"""Train a cleaned, source-weighted SentencePiece tokenizer and provide a wrapper."""
 
+import argparse
+import hashlib
 import json
 import os
 import re
 import tempfile
-from collections import deque
+from collections import Counter
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import sentencepiece as spm
+from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -110,13 +113,19 @@ def _source_name(root: Path, path: Path) -> str:
     return parts[0] if len(parts) > 1 else "__root__"
 
 
-def iter_training_texts(raw_root: str):
-    """Yield a deterministic round-robin sample across corpus sources.
+def iter_training_texts(
+    raw_root: str,
+    *,
+    source_weights: dict[str, int] | None = None,
+    text_transform: Callable[[str, str], str | None] | None = None,
+    on_sample: Callable[[str, int], None] | None = None,
+):
+    """Yield a deterministic weighted sample across corpus sources.
 
     The tokenizer cap must not mean "the first five million records in lexical
-    path order": on the real corpus that excluded every later source. Keep one
-    streaming iterator per source and interleave them, which bounds open files
-    and memory by source count while giving every discovered source coverage.
+    path order": on the real corpus that excluded every later source. Weighted
+    fair scheduling follows the final corpus plan while keeping memory bounded
+    by source count and retaining deterministic output.
     """
     root = Path(raw_root)
     grouped: dict[str, list[Path]] = {}
@@ -127,20 +136,67 @@ def iter_training_texts(raw_root: str):
 
     def source_chunks(source: str) -> Iterator[str]:
         for text in _iter_path_texts(grouped[source]):
+            if text_transform is not None:
+                text = text_transform(source, text)
+                if not text:
+                    continue
             yield from iter_sentencepiece_chunks(text)
 
-    active = deque(source_chunks(source) for source in sorted(grouped))
+    weights = {
+        source: max(1, int((source_weights or {}).get(source, 1)))
+        for source in grouped
+    }
+    active = {source: source_chunks(source) for source in sorted(grouped)}
+    credit = {source: 0.0 for source in active}
     while active:
-        iterator = active.popleft()
+        total_weight = sum(weights[source] for source in active)
+        for source in active:
+            credit[source] += weights[source] / total_weight
+        source = max(sorted(active), key=lambda name: credit[name])
         try:
-            yield next(iterator)
+            sample = next(active[source])
+            if on_sample is not None:
+                on_sample(source, len(sample.encode("utf-8")))
+            yield sample
+            credit[source] -= 1.0
         except StopIteration:
-            continue
-        active.append(iterator)
+            del active[source]
+            del credit[source]
+
+
+def _clean_tokenizer_texts(config: SpakieConfig) -> Callable[[str, str], str | None]:
+    """Build the canonical clean/filter gate for tokenizer samples."""
+    # Lazy imports avoid a module cycle: prepare_data imports SpakieTokenizer.
+    from runtime.langid import is_probably_english
+    from scripts.prepare_data import (
+        clean_text,
+        language_filter_sample,
+        should_keep_document,
+    )
+
+    seen: set[bytes] = set()
+
+    def transform(source: str, raw_text: str) -> str | None:
+        text = clean_text(raw_text, source)
+        keep, _reason = should_keep_document(text, config, source)
+        if not keep:
+            return None
+        language_sample = language_filter_sample(text, config, source)
+        if language_sample is not None and not is_probably_english(
+            language_sample, config
+        ):
+            return None
+        digest = hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
+        if digest in seen:
+            return None
+        seen.add(digest)
+        return text
+
+    return transform
 
 
 def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_000_000):
-    """Train a SentencePiece BPE tokenizer from raw text files.
+    """Train SentencePiece from cleaned text weighted to the corpus plan.
 
     Args:
         config: SpakieConfig. Uses defaults if None.
@@ -148,26 +204,73 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
                        multi-GB temp files when training on large corpora.
     """
     config = config or SpakieConfig()
+    max_sentences = max(1, int(max_sentences))
+    count = 0
+    bytes_written = 0
+    source_counts: Counter[str] = Counter()
+    current_source = ""
+    output_prefix = Path(config.tokenizer_prefix)
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="spakie-tokenizer-",
+        suffix=".txt",
+        delete=False,
+        encoding="utf-8",
+    )
+    tmp_path = tmp_file.name
+    temporary_prefix = output_prefix.parent / (
+        f".{output_prefix.name}.{os.getpid()}.tmp"
+    )
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
-        count = 0
-        for sentence in iter_training_texts(config.raw_data_dir):
-            tmp.write(sentence)
-            tmp.write("\n")
-            count += 1
-            if count >= max_sentences:
-                break
-        tmp_path = tmp.name
-
-    if count == 0:
-        raise FileNotFoundError(f"No training texts found in {config.raw_data_dir!r}")
-
-    print(f"Training tokenizer on {count:,} sentences …")
+    def note_sample(source: str, _sample_bytes: int) -> None:
+        nonlocal current_source
+        current_source = source
+        source_counts[source] += 1
 
     try:
+        source_weights = {
+            source: int(plan.get("target_tokens", 0))
+            for source, plan in config.corpus_source_plan.items()
+            if plan.get("enabled", True) and int(plan.get("target_tokens", 0)) > 0
+        }
+        with tmp_file as tmp, tqdm(
+            total=max_sentences,
+            desc="Collecting tokenizer samples",
+            unit="sample",
+            dynamic_ncols=True,
+        ) as progress:
+            for sentence in iter_training_texts(
+                config.raw_data_dir,
+                source_weights=source_weights,
+                text_transform=_clean_tokenizer_texts(config),
+                on_sample=note_sample,
+            ):
+                tmp.write(sentence)
+                tmp.write("\n")
+                count += 1
+                bytes_written += len(sentence.encode("utf-8")) + 1
+                progress.update(1)
+                if count % 1_000 == 0:
+                    progress.set_postfix_str(
+                        f"{bytes_written / (1024 ** 3):.2f} GiB, {current_source}",
+                        refresh=False,
+                    )
+                if count >= max_sentences:
+                    break
+
+        if count == 0:
+            raise FileNotFoundError(f"No training texts found in {config.raw_data_dir!r}")
+
+        mix = ", ".join(
+            f"{source}={amount / count:.1%}"
+            for source, amount in source_counts.most_common()
+        )
+        print(f"Collected {count:,} samples ({bytes_written / (1024 ** 3):.2f} GiB): {mix}")
+        print(f"Training {config.vocab_size:,}-piece SentencePiece tokenizer …", flush=True)
         spm.SentencePieceTrainer.train(
             input=tmp_path,
-            model_prefix=config.tokenizer_prefix,
+            model_prefix=str(temporary_prefix),
             vocab_size=config.vocab_size,
             model_type="bpe",
             pad_id=0,
@@ -183,8 +286,24 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
             max_sentence_length=TOKENIZER_MAX_SENTENCE_BYTES,
             num_threads=os.cpu_count(),
         )
+        os.replace(
+            str(temporary_prefix) + ".vocab",
+            str(output_prefix) + ".vocab",
+        )
+        os.replace(
+            str(temporary_prefix) + ".model",
+            str(output_prefix) + ".model",
+        )
     finally:
-        os.unlink(tmp_path)
+        for path in (
+            Path(tmp_path),
+            Path(str(temporary_prefix) + ".model"),
+            Path(str(temporary_prefix) + ".vocab"),
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
     print(f"Saved: {config.tokenizer_prefix}.model  ({config.vocab_size:,} vocab tokens)")
 
@@ -379,5 +498,23 @@ class SpakieTokenizer:
         return len(text) / n if n else 0.0
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train a cleaned, corpus-weighted SentencePiece tokenizer"
+    )
+    parser.add_argument(
+        "--max-sentences",
+        type=int,
+        default=5_000_000,
+        help="Maximum cleaned SentencePiece samples (default: 5,000,000)",
+    )
+    args = parser.parse_args()
+    train_tokenizer(max_sentences=max(1, args.max_sentences))
+
+
 if __name__ == "__main__":
-    train_tokenizer()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nTokenizer training interrupted; temporary input was removed.")
+        raise SystemExit(130)

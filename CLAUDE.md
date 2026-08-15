@@ -17,11 +17,12 @@ On Apple Silicon, MLX (`mlx>=0.31.1`) is installed automatically; on CUDA machin
 End-to-end pipeline (data prep → pretrain → SFT) is `scripts/run_pipeline.py`. Individual stages:
 
 ```bash
-# 1. Tokenizer (SentencePiece). Outputs tokenizer/spakie.{model,vocab}
-python3 tokenizer/train_tokenizer.py
-
-# 2. Download a large pretrain corpus into data/raw/large_corpus/
+# 1. Download a large pretrain corpus into data/raw/large_corpus/
 python3 scripts/download_pretrain_corpus.py --sources all --resume --english_only
+
+# 2. Train the tokenizer from cleaned, source-balanced corpus samples
+#    Outputs tokenizer/spakie.{model,vocab}
+python3 tokenizer/train_tokenizer.py
 
 # 3. Tokenize, filter, near-dedup, and shard into data/processed/{train,val}.npy
 python3 scripts/prepare_data.py            # full run
@@ -33,6 +34,9 @@ python3 scripts/train.py --preset 300m --backend mlx --precision auto
 python3 scripts/train.py --preset 300m --backend torch --device auto --precision auto
 python3 scripts/train.py --resume                       # latest pretrain_interrupt.pt in preset checkpoint dir
 python3 scripts/train.py --smoke                        # short 100-step smoke run
+
+# Optional: preview six fair 100M-token LR/schedule pilots; add --execute to run
+python3 scripts/run_pretrain_ablations.py --preset 300m --backend mlx
 
 # 5. Fine-tune on chat JSONL (data/chat/train.jsonl)
 python3 scripts/finetune.py --backend mlx --precision auto
@@ -97,7 +101,7 @@ Shared infrastructure:
 - `runtime/backends.py` — Torch device/precision resolution (`auto` → cuda > mps > cpu; precision `auto` → bf16/cuda, bf16/mps, fp32/cpu) and autocast helpers.
 - `runtime/mlx_backend.py` — MLX-specific runtime helpers (compile, prefetch, wired/memory limits).
 - `training/muon_core.py` — Backend-agnostic Muon helpers (parameter classification, Newton–Schulz coefficients, BF16 tolerance constants, optimizer/adjust-lr choices, AdamW fallback warning).
-- `tokenizer/spakie.model` — Trained SentencePiece tokenizer (vocab_size 16384). Required by all downstream stages.
+- `tokenizer/spakie.model` — SentencePiece tokenizer artifact. Canonical fresh runs use vocab_size 24576 and max_seq_len 2048; retrain it and rebuild processed arrays after changing either contract.
 
 ### Data pipeline (`scripts/prepare_data.py`)
 
@@ -105,7 +109,7 @@ Streams documents from `data/raw/` (including `data/raw/large_corpus/<source>/`)
 
 ### Optimizer
 
-Default optimizer is **Muon** (with AdamW fallback gated by `--allow-adamw-fallback`). Muon is applied only to "Muon-eligible" parameters (per-tensor classification via `is_muon_parameter_name`); the rest go through AdamW. The MLX Muon implementation must match the Torch one — `verify_muon_for_full_mlx_pretrain()` in `scripts/train.py` runs a parity check before any non-smoke MLX pretrain, and refuses to start if it fails. When changing Newton–Schulz coefficients, NS step count, or parameter classification, update both backends and re-run `tests/test_muon.py` + `scripts/verify_muon.py`.
+The default pretraining optimizer is **Muon** (with AdamW fallback gated by `--allow-adamw-fallback`); canonical SFT uses one AdamW epoch. Muon is applied only to "Muon-eligible" parameters (per-tensor classification via `is_muon_parameter_name`); the rest go through AdamW. The MLX Muon implementation must match the Torch one — `verify_muon_for_full_mlx_pretrain()` in `scripts/train.py` runs a parity check before any non-smoke MLX pretrain, and refuses to start if it fails. When changing Newton–Schulz coefficients, NS step count, or parameter classification, update both backends and re-run `tests/test_muon.py` + `scripts/verify_muon.py`.
 
 ### Checkpoints
 

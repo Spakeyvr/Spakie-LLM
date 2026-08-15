@@ -217,6 +217,35 @@ def load_smoltalk(limit: int, seed: int) -> list[dict]:
     return examples
 
 
+def load_openhermes(limit: int, seed: int) -> list[dict]:
+    print("Loading OpenHermes 2.5...")
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True)
+    rows = dataset.shuffle(seed=seed, buffer_size=10_000) if limit > 0 else dataset
+
+    # ShareGPT format: `conversations` turns tagged with `from`/`value`.
+    role_map = {"system": "system", "human": "user", "gpt": "assistant"}
+    examples = []
+    for row in rows:
+        raw_turns = row.get("conversations")
+        if not isinstance(raw_turns, list):
+            continue
+        messages = []
+        for turn in raw_turns:
+            role = role_map.get(turn.get("from")) if isinstance(turn, dict) else None
+            if role is None:
+                messages = []
+                break
+            messages.append({"role": role, "content": turn.get("value", "")})
+        cleaned = clean_chat_messages(messages, fold_system_into_user=True)
+        example = {"messages": cleaned} if cleaned else None
+        source = row.get("source")
+        if example is not None and isinstance(source, str) and source.strip():
+            example["source"] = source.strip()
+        if append_usable(examples, example, limit):
+            break
+    return examples
+
+
 def load_squad(limit: int, seed: int) -> list[dict]:
     print("Loading SQuAD...")
     dataset = load_dataset("squad", split="train")
@@ -403,6 +432,7 @@ def main() -> int:
         "alpaca": lambda limit: download_alpaca(limit, args.seed),
         "no_robots": lambda limit: load_no_robots(limit, args.seed),
         "smoltalk": lambda limit: load_smoltalk(limit, args.seed),
+        "openhermes_2_5": lambda limit: load_openhermes(limit, args.seed),
         "squad": lambda limit: load_squad(limit, args.seed),
         "triviaqa": lambda limit: load_triviaqa(limit, args.seed),
         "sciq": lambda limit: load_sciq(limit, args.seed),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -20,6 +21,25 @@ _LAST_FAILURE_AT = 0.0
 _LOCK = threading.Lock()
 _RETRY_SECONDS = 30.0
 _DEFAULT_MODEL_SHA256 = "8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83"
+
+
+def language_id_sample(text: str, source_kind: str) -> str | None:
+    """Return the natural-language portion that is safe to classify.
+
+    Source code is language-neutral for corpus selection. Mathematical text is
+    classified from prose words only so formulas do not look like a foreign
+    language to fastText.
+    """
+    kind = (source_kind or "prose").lower()
+    if kind == "code":
+        return None
+    if kind == "math":
+        words = re.findall(r"[A-Za-z]{2,}", text)
+        if len(words) < 30:
+            return None
+        sample = " ".join(words[:500])
+        return sample if len(sample) >= 200 else None
+    return text if len(text) >= 400 else None
 
 
 def _sha256(path: Path) -> str:

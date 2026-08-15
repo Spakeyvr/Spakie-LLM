@@ -1,9 +1,9 @@
 """Merge SFT JSONL files from data/chat_raw/ into a single training file.
 
 Each *.jsonl file in the raw dir is treated as one source — the filename stem
-is the source name, used to look up an optional per-source cap from
-`SpakieConfig.sft_source_limits`. Any custom JSONL you drop into data/chat_raw/
-is picked up automatically; sources without a cap entry are taken in full.
+is the source name and must be explicitly enabled in
+`SpakieConfig.sft_source_limits`. This fail-closed allowlist prevents ad-hoc or
+benchmark-tuned files from silently entering the canonical mixture.
 
 System messages are stripped by default, which works better for small models
 where every control token has to earn its keep. Pass --system to inject exactly
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
@@ -64,9 +65,10 @@ DISALLOWED_SFT_MARKERS = (
 # review commentary.
 CORRECTION_ANNOTATION_RE = re.compile(r"(?:^|\n)\s*Correction\s*:", re.IGNORECASE)
 
-# Refusal-style assistant examples are intentionally excluded from this
-# private-model SFT mix. Keep ordinary uncertainty (for example, "I can't
-# guarantee") because it is useful factual calibration.
+# Refusal-style examples are excluded from general sources and accepted only
+# from the small, explicitly configured refusal sources. Keep ordinary
+# uncertainty (for example, "I can't guarantee") because it is useful factual
+# calibration.
 REFUSAL_RESPONSE_RE = re.compile(
     r"\b(?:i\s+(?:can(?:not|'t)|cannot|won't|will\s+not|am\s+unable\s+to)|"
     r"sorry[, ]+but\s+i\s+(?:can(?:not|'t)|cannot|won't|will\s+not))\s+"
@@ -666,7 +668,8 @@ def load_source(
             if contains_correction_annotation(raw.get("messages")):
                 correction_filtered += 1
                 continue
-            if contains_refusal_response(raw.get("messages")):
+            refusal_allowed = source_name in set(config.sft_refusal_sources)
+            if contains_refusal_response(raw.get("messages")) and not refusal_allowed:
                 refusal_filtered += 1
                 continue
             if contains_foreign_identity_claim(raw.get("messages")):
@@ -679,6 +682,16 @@ def load_source(
             if example is None:
                 malformed += 1
                 continue
+            if source_name:
+                original_source = example.get("source")
+                if isinstance(original_source, str) and original_source != source_name:
+                    example["source_detail"] = original_source
+                example["source"] = source_name
+                for source_id_key in ("id", "uuid", "row_id", "source_id"):
+                    source_id = raw.get(source_id_key)
+                    if isinstance(source_id, (str, int)) and str(source_id).strip():
+                        example["source_row_id"] = str(source_id).strip()
+                        break
             if not is_english_sft_example(example["messages"], config):
                 non_english += 1
                 continue
@@ -689,6 +702,20 @@ def load_source(
             ):
                 too_long += 1
                 continue
+            if tokenizer is not None and source_name:
+                total_tokens, assistant_tokens = rendered_token_lengths(
+                    example["messages"], tokenizer
+                )
+                example["rendered_tokens"] = total_tokens
+                example["assistant_tokens"] = assistant_tokens
+            if source_name:
+                canonical_messages = json.dumps(
+                    example["messages"], ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                )
+                example["example_id"] = hashlib.sha256(
+                    canonical_messages.encode("utf-8")
+                ).hexdigest()
             examples.append(example)
     if malformed:
         print(f"    warning: skipped {malformed} malformed lines in {os.path.basename(path)}")
@@ -761,8 +788,11 @@ def main() -> None:
     parser.add_argument(
         "--max",
         type=int,
-        default=0,
-        help="Global cap on total merged examples (0 = no cap)",
+        default=config.sft_download_max_examples,
+        help=(
+            "Global cap on total merged examples "
+            f"(default: {config.sft_download_max_examples:,}; 0 = no cap)"
+        ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed")
     parser.add_argument(
@@ -777,10 +807,10 @@ def main() -> None:
     parser.add_argument(
         "--max-assistant-tokens",
         type=int,
-        default=0,
+        default=512,
         help=(
             "Drop examples whose combined assistant turns exceed this many tokens "
-            "(0 = no cap). Biases the mix toward concise answers."
+            "(default: 512; 0 = no cap). Biases the mix toward concise answers."
         ),
     )
     parser.add_argument(

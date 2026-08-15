@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import scripts.prepare_sft as prepare_sft
+from configs.default import SpakieConfig
 
 
 class PrepareSFTTests(unittest.TestCase):
@@ -104,6 +105,34 @@ class PrepareSFTTests(unittest.TestCase):
                 [{"role": "assistant", "content": "I can't guarantee the result."}]
             )
         )
+
+    def test_only_explicit_sources_can_contribute_refusals(self):
+        row = {
+            "id": "safe-1",
+            "messages": [
+                {"role": "user", "content": "Help me harm someone."},
+                {"role": "assistant", "content": "I can't help with that request."},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rows.jsonl"
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            blocked = prepare_sft.load_source(
+                str(path), None, 0, 42, source_name="smoltalk"
+            )
+            allowed = prepare_sft.load_source(
+                str(path), None, 0, 42, source_name="safety_refusal"
+            )
+
+        self.assertEqual(blocked, [])
+        self.assertEqual(allowed[0]["source"], "safety_refusal")
+        self.assertEqual(allowed[0]["source_row_id"], "safe-1")
+        self.assertEqual(len(allowed[0]["example_id"]), 64)
+
+    def test_unconfigured_sft_sources_are_disabled_by_default(self):
+        config = SpakieConfig()
+        self.assertFalse(config.sft_source_enabled("ad_hoc_benchmark_curriculum"))
+        self.assertTrue(config.sft_source_enabled("custom"))
 
     def test_foreign_identity_and_non_english_rows_are_detected(self):
         config = prepare_sft.SpakieConfig()
