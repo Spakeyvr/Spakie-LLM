@@ -194,7 +194,7 @@ class ScalingConfigTests(unittest.TestCase):
         self.assertFalse(prose_keep, prose_reason)
         self.assertTrue(math_keep, math_reason)
 
-    def test_full_corpus_quality_gate_reports_quota_shortfall(self):
+    def test_full_corpus_quality_gate_reports_kind_shortfall(self):
         config = SpakieConfig(
             corpus_source_plan={
                 "finemath": {
@@ -213,8 +213,114 @@ class ScalingConfigTests(unittest.TestCase):
             ),
             "source_stats": {"finemath": {"tokens_kept": 30}},
         }
-        failures = prepare_data.corpus_quality_gate_failures(report, config)
-        self.assertTrue(any("30.0% of token quota" in item for item in failures))
+        gate = prepare_data.corpus_quality_gate(report, config)
+        self.assertTrue(any("corpus: 30.0%" in item for item in gate["failures"]))
+        self.assertTrue(any("math sources: 30.0%" in item for item in gate["failures"]))
+        self.assertTrue(any("30.0% of token quota" in item for item in gate["warnings"]))
+
+    def test_source_shortfall_is_advisory_when_kind_and_corpus_are_healthy(self):
+        config = SpakieConfig(
+            corpus_source_plan={
+                "fineweb-edu": {
+                    "kind": "web",
+                    "target_tokens": 80,
+                    "target_raw_chars": 320,
+                    "enabled": True,
+                },
+                "refinedweb": {
+                    "kind": "web",
+                    "target_tokens": 20,
+                    "target_raw_chars": 80,
+                    "enabled": True,
+                },
+            }
+        )
+        targets = config.scaled_corpus_source_plan(target_processed_tokens=100)
+        report = {
+            "target_processed_tokens": 100,
+            "processed_tokens": 90,
+            "source_targets": targets,
+            "source_stats": {
+                "fineweb-edu": {"tokens_kept": 90},
+                "refinedweb": {"tokens_kept": 0},
+            },
+        }
+        gate = prepare_data.corpus_quality_gate(report, config)
+        self.assertTrue(gate["passed"], gate["failures"])
+        self.assertTrue(any("refinedweb: 0.0%" in item for item in gate["warnings"]))
+
+    def test_fast_resume_finalizes_completed_shards_without_raw_replay(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            processed = root / "processed"
+            shards = processed / "shards"
+            shards.mkdir(parents=True)
+            shard_path = shards / "tokens-00000.npy"
+            np.save(shard_path, np.array([2, 3, 4, 5, 6, 7], dtype=np.uint16))
+            journal = shards / prepare_data.SHARD_RESUME_JOURNAL
+            with journal.open("wb") as handle:
+                prepare_data.append_accepted_document(
+                    handle,
+                    prepare_data.AcceptedDocument("fineweb-edu", 3, 10, 1, ()),
+                )
+                prepare_data.append_accepted_document(
+                    handle,
+                    prepare_data.AcceptedDocument("fineweb-edu", 3, 10, 2, ()),
+                )
+
+            config = SpakieConfig(
+                processed_data_dir=str(processed),
+                token_shard_dir=str(shards),
+                corpus_report_path=str(processed / "corpus_report.json"),
+                target_train_tokens=3,
+                train_split_fraction=0.5,
+                corpus_source_plan={
+                    "fineweb-edu": {
+                        "kind": "web",
+                        "target_tokens": 6,
+                        "target_raw_chars": 24,
+                        "enabled": True,
+                    }
+                },
+            )
+            source_plan = config.scaled_corpus_source_plan(target_processed_tokens=6)
+            report_path = processed / "corpus_report.json"
+            report_path.write_text(json.dumps({
+                "target_train_tokens": 3,
+                "target_processed_tokens": 6,
+                "target_tokens_requested": 6,
+                "processed_tokens": 6,
+                "discovered_files": 1,
+                "discovered_raw_bytes": 100,
+                "dry_run": False,
+                "source_targets": source_plan,
+                "source_stats": {"fineweb-edu": {"tokens_kept": 6}},
+            }), encoding="utf-8")
+
+            result = prepare_data.try_fast_finalize_resume(
+                config=config,
+                report_dest=report_path,
+                shard_paths=[shard_path],
+                resume_journal=journal,
+                resume_tokens=6,
+                target_tokens=6,
+                source_plan=source_plan,
+                discovered_files=1,
+                discovered_raw_bytes=100,
+                tokenizer_provenance={"vocab_size": 24_576},
+                preparation_provenance={"schema_version": 4},
+                raw_input_provenance={"schema_version": 1},
+                max_token_id=7,
+                token_dtype=np.uint16,
+                enforce_quality_gates=True,
+                full_corpus_run=True,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertTrue(result["resume_fast_finalize"])
+            self.assertEqual(np.load(processed / "train.npy").tolist(), [2, 3, 4])
+            self.assertEqual(np.load(processed / "val.npy").tolist(), [5, 6, 7])
+            self.assertTrue((processed / "processed_data_manifest.json").exists())
 
     def test_default_source_plan_matches_processed_target(self):
         config = SpakieConfig()

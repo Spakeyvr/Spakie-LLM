@@ -200,6 +200,18 @@ class SpakieConfig:
     maximum_source_mix_deviation: float = _D.get(
         "maximum_source_mix_deviation", 0.02
     )
+    minimum_corpus_completion_ratio: float = _D.get(
+        "minimum_corpus_completion_ratio", 0.85
+    )
+    minimum_kind_completion_ratio: float = _D.get(
+        "minimum_kind_completion_ratio", 0.50
+    )
+    maximum_kind_mix_deviation: float = _D.get(
+        "maximum_kind_mix_deviation", 0.06
+    )
+    maximum_unplanned_source_share: float = _D.get(
+        "maximum_unplanned_source_share", 0.05
+    )
     train_split_fraction: float = _D["train_split_fraction"]
     estimated_chars_per_token: float = _D["estimated_chars_per_token"]
 
@@ -292,6 +304,14 @@ class SpakieConfig:
             raise ValueError("minimum_source_completion_ratio must be between 0 and 1")
         if not 0 <= self.maximum_source_mix_deviation <= 1:
             raise ValueError("maximum_source_mix_deviation must be between 0 and 1")
+        for name in (
+            "minimum_corpus_completion_ratio",
+            "minimum_kind_completion_ratio",
+            "maximum_kind_mix_deviation",
+            "maximum_unplanned_source_share",
+        ):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
         self.target_processed_tokens = derive_processed_token_target(self.target_train_tokens, self.train_split_fraction)
         if self.pretrain_target_tokens <= 0:
             self.pretrain_target_tokens = self.target_train_tokens

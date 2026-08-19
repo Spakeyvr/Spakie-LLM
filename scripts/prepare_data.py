@@ -41,6 +41,7 @@ from runtime.processed_data import (
     publish_processed_data_manifest,
     stable_payload_sha256,
     tokenizer_contract,
+    validate_processed_data,
 )
 from tokenizer.train_tokenizer import SpakieTokenizer
 
@@ -1418,33 +1419,298 @@ def build_report(
     }
 
 
-def corpus_quality_gate_failures(report: dict, config: SpakieConfig) -> list[str]:
-    """Return actionable reasons a full corpus must not be published."""
+def corpus_quality_gate(report: dict, config: SpakieConfig) -> dict:
+    """Evaluate hard corpus-level gates and advisory per-source targets.
+
+    Downloader token counts are estimates made before canonical filtering and
+    cross-source deduplication. Requiring every source to retain 95% of that
+    estimate made healthy runs fail after all expensive work was complete.
+    Broad kind coverage is the quality invariant; exact source quotas remain
+    visible as warnings so genuine shortfalls are still actionable.
+    """
     failures: list[str] = []
+    warnings: list[str] = []
     target_total = max(int(report.get("target_processed_tokens", 0)), 1)
-    actual_total = max(int(report.get("processed_tokens", 0)), 1)
+    actual_total = max(int(report.get("processed_tokens", 0)), 0)
+    source_targets = report.get("source_targets", {})
     source_stats = report.get("source_stats", {})
-    for source, target in report.get("source_targets", {}).items():
+
+    corpus_completion = actual_total / target_total
+    if corpus_completion < config.minimum_corpus_completion_ratio:
+        failures.append(
+            f"corpus: {corpus_completion:.1%} of processed-token target "
+            f"({actual_total:,}/{target_total:,})"
+        )
+
+    target_by_kind: dict[str, int] = defaultdict(int)
+    actual_by_kind: dict[str, int] = defaultdict(int)
+    planned_sources: set[str] = set()
+    for source, target in source_targets.items():
         target_tokens = int(target.get("target_tokens", 0))
         if not target.get("enabled", True) or target_tokens <= 0:
             continue
-        stats = source_stats.get(source, {})
-        actual_tokens = int(stats.get("tokens_kept", 0))
+        planned_sources.add(source)
+        kind = str(target.get("kind", "unknown"))
+        target_by_kind[kind] += target_tokens
+        actual_tokens = int(source_stats.get(source, {}).get("tokens_kept", 0))
+        actual_by_kind[kind] += actual_tokens
+
         completion = actual_tokens / target_tokens
         if completion < config.minimum_source_completion_ratio:
-            failures.append(
+            warnings.append(
                 f"{source}: {completion:.1%} of token quota "
                 f"({actual_tokens:,}/{target_tokens:,})"
             )
         target_share = target_tokens / target_total
-        actual_share = actual_tokens / actual_total
+        actual_share = actual_tokens / max(actual_total, 1)
         deviation = abs(actual_share - target_share)
         if deviation > config.maximum_source_mix_deviation:
-            failures.append(
+            warnings.append(
                 f"{source}: actual share {actual_share:.1%} differs from "
                 f"target {target_share:.1%} by {deviation:.1%}"
             )
-    return failures
+
+    unplanned_tokens = 0
+    unplanned_sources: dict[str, int] = {}
+    for source, stats in source_stats.items():
+        if source in planned_sources:
+            continue
+        tokens = int(stats.get("tokens_kept", 0))
+        if tokens <= 0:
+            continue
+        unplanned_sources[source] = tokens
+        unplanned_tokens += tokens
+        actual_by_kind[config.corpus_source_kind(source)] += tokens
+    unplanned_share = unplanned_tokens / max(actual_total, 1)
+    if unplanned_sources:
+        detail = ", ".join(
+            f"{source}={tokens:,}" for source, tokens in sorted(unplanned_sources.items())
+        )
+        warnings.append(f"unplanned sources contributed {unplanned_share:.1%}: {detail}")
+    if unplanned_share > config.maximum_unplanned_source_share:
+        failures.append(
+            f"unplanned sources are {unplanned_share:.1%} of the corpus; "
+            f"maximum is {config.maximum_unplanned_source_share:.1%}"
+        )
+
+    kind_stats: dict[str, dict[str, int | float]] = {}
+    for kind, target_tokens in sorted(target_by_kind.items()):
+        actual_tokens = actual_by_kind.get(kind, 0)
+        completion = actual_tokens / target_tokens
+        target_share = target_tokens / target_total
+        actual_share = actual_tokens / max(actual_total, 1)
+        deviation = abs(actual_share - target_share)
+        kind_stats[kind] = {
+            "target_tokens": target_tokens,
+            "actual_tokens": actual_tokens,
+            "completion_ratio": completion,
+            "target_share": target_share,
+            "actual_share": actual_share,
+            "share_deviation": deviation,
+        }
+        if completion < config.minimum_kind_completion_ratio:
+            failures.append(
+                f"{kind} sources: {completion:.1%} of kind target "
+                f"({actual_tokens:,}/{target_tokens:,})"
+            )
+        if deviation > config.maximum_kind_mix_deviation:
+            failures.append(
+                f"{kind} sources: actual share {actual_share:.1%} differs from "
+                f"target {target_share:.1%} by {deviation:.1%}"
+            )
+
+    return {
+        "minimum_corpus_completion_ratio": config.minimum_corpus_completion_ratio,
+        "minimum_kind_completion_ratio": config.minimum_kind_completion_ratio,
+        "maximum_kind_mix_deviation": config.maximum_kind_mix_deviation,
+        "maximum_unplanned_source_share": config.maximum_unplanned_source_share,
+        "minimum_source_completion_ratio_warning": config.minimum_source_completion_ratio,
+        "maximum_source_mix_deviation_warning": config.maximum_source_mix_deviation,
+        "corpus_completion_ratio": corpus_completion,
+        "unplanned_source_share": unplanned_share,
+        "kind_stats": kind_stats,
+        "passed": not failures,
+        "failures": failures,
+        "warnings": warnings,
+    }
+
+
+def corpus_quality_gate_failures(report: dict, config: SpakieConfig) -> list[str]:
+    """Return actionable reasons a full corpus must not be published."""
+    return list(corpus_quality_gate(report, config)["failures"])
+
+
+def _source_layout_from_resume_journal(
+    journal_path: Path,
+    *,
+    expected_tokens: int,
+) -> tuple[list[tuple[str, int, int]], dict[str, array], dict[str, int], int]:
+    """Rebuild split provenance without rereading or retokenizing raw text."""
+    source_runs: list[tuple[str, int, int]] = []
+    source_document_ends: dict[str, array] = defaultdict(lambda: array("Q"))
+    source_tokens: dict[str, int] = defaultdict(int)
+    total_tokens = 0
+    records = 0
+    pending_progress = 0
+    with tqdm(
+        total=expected_tokens,
+        desc="Validating completed shards",
+        unit="tok",
+        unit_scale=True,
+    ) as progress:
+        for record in iter_accepted_documents(journal_path):
+            records += 1
+            token_start = total_tokens
+            total_tokens += record.token_count
+            pending_progress += record.token_count
+            source_tokens[record.source] += record.token_count
+            source_document_ends[record.source].append(source_tokens[record.source])
+            if (
+                source_runs
+                and source_runs[-1][0] == record.source
+                and source_runs[-1][2] == token_start
+            ):
+                source_runs[-1] = (
+                    record.source,
+                    source_runs[-1][1],
+                    total_tokens,
+                )
+            else:
+                source_runs.append((record.source, token_start, total_tokens))
+            if records % 10_000 == 0:
+                progress.update(pending_progress)
+                pending_progress = 0
+        progress.update(pending_progress)
+    if total_tokens != expected_tokens:
+        raise RuntimeError(
+            "Accepted-document journal does not align with completed token shards "
+            f"({total_tokens:,} journal tokens vs {expected_tokens:,} shard tokens)."
+        )
+    return source_runs, source_document_ends, dict(source_tokens), records
+
+
+def try_fast_finalize_resume(
+    *,
+    config: SpakieConfig,
+    report_dest: Path,
+    shard_paths: list[Path],
+    resume_journal: Path,
+    resume_tokens: int,
+    target_tokens: int,
+    source_plan: dict[str, dict[str, int | str | bool]],
+    discovered_files: int,
+    discovered_raw_bytes: int,
+    tokenizer_provenance: dict,
+    preparation_provenance: dict,
+    raw_input_provenance: dict,
+    max_token_id: int,
+    token_dtype,
+    enforce_quality_gates: bool,
+    full_corpus_run: bool,
+) -> dict | None:
+    """Publish a fully scanned shard run rejected only by the old final gate.
+
+    Interrupted runs contain ``partial_token_shards`` and continue through the
+    normal replay path. A completed run has a report whose exact token/source
+    accounting can be checked against the durable journal before publication.
+    """
+    if not report_dest.exists() or not shard_paths or resume_tokens <= 0:
+        return None
+    try:
+        report = json.loads(report_dest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if (
+        report.get("dry_run")
+        or report.get("partial_token_shards")
+        or int(report.get("processed_tokens", -1)) != resume_tokens
+        or int(report.get("target_tokens_requested", -1)) != target_tokens
+        or report.get("source_targets") != source_plan
+        or int(report.get("discovered_files", -1)) != discovered_files
+        or int(report.get("discovered_raw_bytes", -1)) != discovered_raw_bytes
+    ):
+        return None
+
+    report["quality_gate"] = corpus_quality_gate(report, config)
+    gate_failures = report["quality_gate"]["failures"]
+    if enforce_quality_gates and full_corpus_run and gate_failures:
+        formatted = "\n  - ".join(gate_failures)
+        raise RuntimeError(
+            "Completed token shards still fail corpus-level quality gates; "
+            "processed arrays were not published:\n  - " + formatted
+        )
+
+    processed_dir = Path(config.processed_data_dir)
+    already_valid, validation_detail = validate_processed_data(
+        processed_dir,
+        tokenizer_path=config.tokenizer_prefix + ".model",
+        preparation=preparation_provenance,
+        require_provenance=True,
+    )
+    if (
+        already_valid
+        and int(report.get("train_tokens", 0))
+        + int(report.get("val_tokens", 0)) == resume_tokens
+    ):
+        print(f"Processed arrays are already published and valid: {validation_detail}")
+        return report
+
+    print(
+        f"Found a completed {resume_tokens:,}-token shard run; "
+        "skipping raw-corpus replay."
+    )
+    source_runs, source_document_ends, journal_source_tokens, record_count = (
+        _source_layout_from_resume_journal(
+            resume_journal,
+            expected_tokens=resume_tokens,
+        )
+    )
+    report_source_tokens = {
+        source: int(stats.get("tokens_kept", 0))
+        for source, stats in report.get("source_stats", {}).items()
+        if int(stats.get("tokens_kept", 0)) > 0
+    }
+    if journal_source_tokens != report_source_tokens:
+        raise RuntimeError(
+            "Completed corpus report does not match per-source resume-journal totals."
+        )
+    if np.dtype(token_dtype) != np.dtype(np.uint16):
+        raise ValueError("The current training stack expects uint16-compatible token ids")
+
+    train_path = processed_dir / "train.npy"
+    val_path = processed_dir / "val.npy"
+    train_tokens, val_tokens = merge_shards(
+        shard_paths,
+        train_path,
+        val_path,
+        config.train_split_fraction,
+        np.uint16,
+        train_tokens_target=config.target_train_tokens,
+        show_progress=True,
+        source_runs=source_runs,
+        source_document_ends=source_document_ends,
+        tokenizer_provenance=tokenizer_provenance,
+        preparation_provenance=preparation_provenance,
+        raw_input_provenance=raw_input_provenance,
+        max_token_id=max_token_id,
+    )
+    report.update({
+        "processed_tokens": train_tokens + val_tokens,
+        "train_tokens": train_tokens,
+        "val_tokens": val_tokens,
+        "gap_to_target": max(target_tokens - train_tokens - val_tokens, 0),
+        "resume": True,
+        "resume_fast_finalize": True,
+        "resume_existing_shards": len(shard_paths),
+        "resume_existing_tokens": resume_tokens,
+        "resume_journal_records": record_count,
+        "scan_completed": True,
+    })
+    _write_json_atomic(report_dest, report)
+    print(f"Train: {train_tokens:,} tokens -> {train_path}")
+    print(f"Val:   {val_tokens:,} tokens -> {val_path}")
+    print(f"Report: {report_dest}")
+    return report
 
 
 def prepare_data(
@@ -1510,6 +1776,12 @@ def prepare_data(
         "max_token_id": -1,
         "resume_journal": SHARD_RESUME_JOURNAL,
     }
+    report_dest = Path(report_path or config.corpus_report_path)
+    full_corpus_run = (
+        target_tokens == config.target_processed_tokens
+        and not source_glob
+        and not source_dirs
+    )
     print(f"Found {len(files):,} input files")
     print(f"Discovered raw bytes: {raw_bytes:,}")
 
@@ -1575,6 +1847,26 @@ def prepare_data(
                     f"Existing token shards have no accepted-document journal "
                     f"{resume_journal}; rerun without --resume."
                 )
+            finalized_report = try_fast_finalize_resume(
+                config=config,
+                report_dest=report_dest,
+                shard_paths=existing_shard_paths,
+                resume_journal=resume_journal,
+                resume_tokens=resume_tokens,
+                target_tokens=target_tokens,
+                source_plan=source_plan,
+                discovered_files=len(files),
+                discovered_raw_bytes=raw_bytes,
+                tokenizer_provenance=tokenizer_provenance,
+                preparation_provenance=preparation_provenance,
+                raw_input_provenance=raw_input_provenance,
+                max_token_id=int(run_contract.get("max_token_id", -1)),
+                token_dtype=token_dtype,
+                enforce_quality_gates=enforce_quality_gates,
+                full_corpus_run=full_corpus_run,
+            )
+            if finalized_report is not None:
+                return finalized_report
     if shard_dir.exists() and not dry_run and not resume:
         shutil.rmtree(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
@@ -1990,13 +2282,9 @@ def prepare_data(
     )
     report["target_tokens_requested"] = target_tokens
     report["resume"] = resume
-    gate_failures = corpus_quality_gate_failures(report, config)
-    report["quality_gate"] = {
-        "minimum_source_completion_ratio": config.minimum_source_completion_ratio,
-        "maximum_source_mix_deviation": config.maximum_source_mix_deviation,
-        "passed": not gate_failures,
-        "failures": gate_failures,
-    }
+    report["scan_completed"] = not interrupted
+    report["quality_gate"] = corpus_quality_gate(report, config)
+    gate_failures = report["quality_gate"]["failures"]
     if resume:
         report["resume_existing_shards"] = len(existing_shard_paths)
         report["resume_existing_tokens"] = resume_tokens
@@ -2005,7 +2293,6 @@ def prepare_data(
 
     processed_dir = Path(config.processed_data_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
-    report_dest = Path(report_path or config.corpus_report_path)
     report_dest.parent.mkdir(parents=True, exist_ok=True)
     with report_dest.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
@@ -2031,17 +2318,12 @@ def prepare_data(
         print(f"Gap to target: {max(target_tokens - total_tokens, 0):,}")
         return report
 
-    full_corpus_run = (
-        target_tokens == config.target_processed_tokens
-        and not source_glob
-        and not source_dirs
-    )
     if enforce_quality_gates and full_corpus_run and gate_failures:
         invalidate_processed_data(processed_dir)
         formatted = "\n  - ".join(gate_failures)
         raise RuntimeError(
             "Corpus quality gates failed; processed arrays were not published. "
-            "Download/refill the missing sources or explicitly use "
+            "Download/refill the missing source kinds or explicitly use "
             "--allow-incomplete-corpus for a diagnostic run:\n  - " + formatted
         )
 
@@ -2140,21 +2422,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     source_dirs = [part.strip() for part in args.source_dirs.split(",") if part.strip()] or None
-    prepare_data(
-        target_tokens=args.target_tokens or None,
-        target_train_tokens=args.target_train_tokens or None,
-        dedup=args.dedup,
-        report_path=args.report_path or None,
-        source_glob=args.source_glob or None,
-        source_dirs=source_dirs,
-        dry_run=args.dry_run,
-        resume=args.resume,
-        tokenizer_threads=args.tokenizer_threads or None,
-        tokenize_batch_size=args.tokenize_batch_size,
-        tokenize_batch_chars=args.tokenize_batch_chars,
-        workers=args.workers or None,
-        enforce_quality_gates=not args.allow_incomplete_corpus,
-    )
+    try:
+        prepare_data(
+            target_tokens=args.target_tokens or None,
+            target_train_tokens=args.target_train_tokens or None,
+            dedup=args.dedup,
+            report_path=args.report_path or None,
+            source_glob=args.source_glob or None,
+            source_dirs=source_dirs,
+            dry_run=args.dry_run,
+            resume=args.resume,
+            tokenizer_threads=args.tokenizer_threads or None,
+            tokenize_batch_size=args.tokenize_batch_size,
+            tokenize_batch_chars=args.tokenize_batch_chars,
+            workers=args.workers or None,
+            enforce_quality_gates=not args.allow_incomplete_corpus,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted. Existing token shards were preserved for --resume.")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

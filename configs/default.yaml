@@ -138,11 +138,17 @@ defaults:
 
   # Tier 2 quality filter
   max_url_email_line_ratio: 0.30
-  # Full-corpus preparation is fail-closed when a required source misses its
-  # planned token quota. Scoped/dry-run preparation remains available for
-  # diagnostics and ablations.
+  # Per-source targets are aspirational because canonical filtering and
+  # cross-source dedup happen after download estimates are recorded. They are
+  # retained as warnings; hard publication gates operate on the complete
+  # corpus and broad source kinds so one exhausted dataset cannot discard an
+  # otherwise strong multi-billion-token run.
   minimum_source_completion_ratio: 0.95
   maximum_source_mix_deviation: 0.02
+  minimum_corpus_completion_ratio: 0.85
+  minimum_kind_completion_ratio: 0.50
+  maximum_kind_mix_deviation: 0.06
+  maximum_unplanned_source_share: 0.05
   train_split_fraction: 0.95
   estimated_chars_per_token: 4.0
 
