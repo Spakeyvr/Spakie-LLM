@@ -35,10 +35,12 @@ class BatchPrefetcher:
         *,
         maxsize: int = 2,
         prepare_batch: Callable[[tuple[np.ndarray, ...]], tuple[np.ndarray, ...]] | None = None,
+        repeat: bool = True,
     ):
         self._dataset = dataset
         self._sampler = sampler
         self._prepare_batch = prepare_batch
+        self._repeat = repeat
         self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self._stop = threading.Event()
         self._error: BaseException | None = None
@@ -52,6 +54,9 @@ class BatchPrefetcher:
                 try:
                     batch_indices = next(self._sampler_iter)
                 except StopIteration:
+                    if not self._repeat:
+                        self._queue.put(_SENTINEL)
+                        return
                     self._sampler_iter = iter(self._sampler)
                     batch_indices = next(self._sampler_iter)
                 batch = stack_batch(self._dataset, batch_indices)

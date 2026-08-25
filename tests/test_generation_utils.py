@@ -22,10 +22,76 @@ from inference.generation_utils import (
 )
 from configs.default import SpakieConfig
 from inference.generate import generate as generate_torch
+from inference.generate import sample_top_k_top_p
 from model.transformer import SpakieGPT
 
 
 class GenerationUtilityTests(unittest.TestCase):
+    def test_cached_torch_logits_match_full_forward_for_gqa_and_rope(self):
+        config = SpakieConfig(
+            vocab_size=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=2,
+            d_model=32,
+            d_ff=64,
+            swiglu_hidden=32,
+            max_seq_len=16,
+            position_encoding="rope",
+            dropout=0.0,
+            bias=False,
+        )
+        model = SpakieGPT(config).eval()
+        tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
+        full_logits, _ = model(tokens)
+        _, _, cache = model(tokens[:, :4], return_cache=True)
+        cached_logits, _, cache = model(
+            tokens[:, 4:], cache=cache, cache_offset=4, return_cache=True
+        )
+
+        torch.testing.assert_close(cached_logits, full_logits[:, 4:], rtol=1e-5, atol=1e-6)
+        self.assertEqual(cache[0][0].shape[2], tokens.shape[1])
+
+    def test_torch_generation_decodes_one_token_at_a_time_after_prefill(self):
+        class Tokenizer:
+            eos_id = 56
+            user_id = 57
+            assistant_id = 58
+            system_id = 59
+            json_id = 60
+            pad_id = 61
+            vocab_size = 64
+
+        config = SpakieConfig(
+            vocab_size=64, n_layers=1, n_heads=2, n_kv_heads=1,
+            d_model=16, d_ff=32, swiglu_hidden=16, max_seq_len=12,
+            dropout=0.0, bias=False,
+        )
+        model = SpakieGPT(config)
+        original_forward = model.forward
+        input_lengths = []
+
+        def recording_forward(idx, *args, **kwargs):
+            input_lengths.append(idx.shape[1])
+            return original_forward(idx, *args, **kwargs)
+
+        model.forward = recording_forward
+        generated = generate_torch(
+            model, Tokenizer(), [1, 2, 3], max_new_tokens=3,
+            temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0,
+            stop_on_special_tokens=False, ban_special_tokens=False,
+        )
+        self.assertEqual(len(generated), 3)
+        self.assertEqual(input_lengths, [3, 1, 1])
+
+    def test_temperature_zero_is_greedy_and_invalid_sampling_is_rejected(self):
+        logits = torch.tensor([[1.0, 5.0, 3.0]])
+        self.assertEqual(sample_top_k_top_p(logits, temperature=0).item(), 1)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            sample_top_k_top_p(logits, temperature=-0.1)
+        with self.assertRaisesRegex(ValueError, "top_p"):
+            sample_top_k_top_p(logits, top_p=0.0)
+
     def test_torch_generation_uses_sliding_context_for_long_response(self):
         class Tokenizer:
             eos_id = 120

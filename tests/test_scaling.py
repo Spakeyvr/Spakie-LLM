@@ -71,6 +71,10 @@ class ScalingConfigTests(unittest.TestCase):
         self.assertEqual(config.target_train_tokens, 10_000_000_000)
         self.assertEqual(config.vocab_size, 24_576)
         self.assertEqual(config.max_seq_len, 2_048)
+        self.assertEqual(config.mlp_type, "swiglu")
+        self.assertEqual(config.swiglu_hidden, 2_048)
+        self.assertEqual(config.position_encoding, "rope")
+        self.assertTrue(config.qk_norm)
         self.assertAlmostEqual(by_kind["web"] / total, 0.45)
         self.assertAlmostEqual((by_kind["reference"] + by_kind["books"]) / total, 0.15)
         self.assertAlmostEqual(by_kind["math"] / total, 0.15)
@@ -97,6 +101,10 @@ class ScalingConfigTests(unittest.TestCase):
 
     def test_default_presets_have_recommended_architecture_and_parameter_counts(self):
         expected = {
+            "92m": {
+                "shape": (12, 768, 12, 4, 2048),
+                "parameters": 94_392_576,
+            },
             "180m": {
                 "shape": (24, 768, 12, 4, 2304),
                 "parameters": 184_065_792,
@@ -124,7 +132,7 @@ class ScalingConfigTests(unittest.TestCase):
                 self.assertTrue(config.qk_norm)
                 with torch.device("meta"):
                     model = SpakieGPT(config)
-                self.assertIsNone(model.pos_emb)
+                self.assertFalse(hasattr(model, "pos_emb"))
                 self.assertEqual(
                     sum(parameter.numel() for parameter in model.parameters()),
                     spec["parameters"],

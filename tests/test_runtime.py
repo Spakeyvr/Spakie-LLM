@@ -25,14 +25,15 @@ import runtime.langid as langid
 
 
 class RuntimeResolutionTests(unittest.TestCase):
-    def test_mfa_varlen_rejects_grouped_query_attention(self):
-        with self.assertRaisesRegex(ValueError, "does not support GQA"):
-            SpakieConfig(
-                n_heads=4,
-                n_kv_heads=2,
-                d_model=32,
-                attention_backend="mfa-varlen",
-            )
+    def test_mfa_varlen_accepts_canonical_rope_qk_norm_gqa(self):
+        config = SpakieConfig(
+            n_heads=4,
+            n_kv_heads=2,
+            d_model=32,
+            attention_backend="mfa-varlen",
+        )
+        self.assertEqual(config.position_encoding, "rope")
+        self.assertTrue(config.qk_norm)
 
     def test_language_filter_fails_closed_without_model(self):
         text = "This is ordinary English prose with enough words to satisfy the " * 10

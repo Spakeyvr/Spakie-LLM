@@ -9,8 +9,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import (
     SUPPORTED_PRESETS,
     get_preset_config,
-    inherit_attention_shape_from_tensors,
-    inherit_mlp_shape_from_tensors,
 )
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 from runtime.checkpoint_io import (
@@ -82,10 +80,7 @@ def check_resume_optimizer(resume_state, requested: str, *, backend: str, reset_
         } if requested_config is not None else saved_hparams
         mismatches = [
             key for key, value in expected.items()
-            if saved_hparams.get(
-                key,
-                1 if key == "optimizer_schema_version" else value,
-            ) != value
+            if saved_hparams.get(key) != value
         ]
         if not mismatches:
             return
@@ -117,14 +112,8 @@ def print_optimizer_banner(kind: str, *, stage: str) -> None:
         print("Optimizer: Muon (required default)")
 
 
-def require_processed_data(config, args) -> None:
+def require_processed_data(config) -> None:
     """Require data produced by the current tokenizer and preparation contract."""
-    if args.unsafe_skip_data_validation:
-        print(
-            "WARNING: processed-data provenance validation is disabled; "
-            "tokenizer/data mismatches can corrupt training."
-        )
-        return
     current_tokenizer = tokenizer_contract(config.tokenizer_prefix + ".model")
     if int(current_tokenizer["vocab_size"]) != config.vocab_size:
         raise RuntimeError(
@@ -140,8 +129,7 @@ def require_processed_data(config, args) -> None:
     if not ready:
         raise RuntimeError(
             f"Processed pretraining data is not safe to use: {reason}. "
-            "Re-run scripts/prepare_data.py, or use "
-            "--unsafe-skip-data-validation only for a deliberate diagnostic run."
+            "Re-run scripts/prepare_data.py."
         )
 
 
@@ -261,33 +249,19 @@ def run_torch_pretrain(args, config):
         if not os.path.exists(resume_path):
             print(f"Error: resume checkpoint not found at {resume_path}")
             sys.exit(1)
-        resume_state = load_torch_checkpoint(
-            resume_path, map_location="cpu", trust_checkpoint=args.trust_checkpoint
-        )
+        resume_state = load_torch_checkpoint(resume_path, map_location="cpu")
         if args.reset_best_loss:
             resume_state["best_val_loss"] = float("inf")
-        checkpoint_config = resume_state.get("config")
-        if checkpoint_config is not None:
-            config = config_from_checkpoint_payload(
-                checkpoint_config,
-                source=resume_path,
-                schema_version=resume_state.get("config_schema_version"),
-            )
-        elif args.allow_legacy_config:
-            model_tensors = resume_state.get("model", {})
-            config = inherit_attention_shape_from_tensors(config, model_tensors)
-            config = inherit_mlp_shape_from_tensors(config, model_tensors)
-        else:
-            raise ValueError(
-                "Legacy checkpoint has no full configuration. Pass --allow-legacy-config "
-                "only after verifying its original training settings."
-            )
+        config = config_from_checkpoint_payload(
+            resume_state.get("config"),
+            source=resume_path,
+            schema_version=resume_state.get("config_schema_version"),
+        )
         apply_pretrain_cli_overrides(config, args)
         validate_checkpoint_tokenizer(
             resume_state,
             config.tokenizer_prefix + ".model",
             source=resume_path,
-            allow_unverified=args.allow_unverified_tokenizer,
         )
         resume_state["_requested_config"] = config
         check_resume_optimizer(
@@ -320,13 +294,12 @@ def run_torch_pretrain(args, config):
     if not resume_state:
         apply_pretrain_cli_overrides(config, args)
 
-    require_processed_data(config, args)
+    require_processed_data(config)
     if resume_state:
         validate_checkpoint_processed_data(
             resume_state,
             config.processed_data_dir,
             source=resume_path,
-            allow_unverified=args.unsafe_skip_data_validation,
         )
 
     runtime = resolve_runtime_settings(args.device, args.precision)
@@ -421,17 +394,8 @@ def run_mlx_pretrain(args, config):
         if not os.path.exists(resume_path):
             print(f"Error: resume checkpoint not found at {resume_path}")
             sys.exit(1)
+        config = load_mlx_checkpoint_config(resume_path)
         resume_state = load_training_checkpoint_mlx(resume_path)
-        saved_config = load_mlx_checkpoint_config(
-            resume_path, allow_legacy_config=args.allow_legacy_config
-        )
-        if saved_config is not None:
-            config = saved_config
-        else:
-            from mlx.utils import tree_flatten
-            model_tensors = dict(tree_flatten(resume_state["model"]))
-            config = inherit_attention_shape_from_tensors(config, model_tensors)
-            config = inherit_mlp_shape_from_tensors(config, model_tensors)
         if args.reset_best_loss:
             resume_state.setdefault("meta", {})["best_val_loss"] = float("inf")
         apply_pretrain_cli_overrides(config, args)
@@ -439,7 +403,6 @@ def run_mlx_pretrain(args, config):
             resume_state.get("meta", {}),
             config.tokenizer_prefix + ".model",
             source=resume_path,
-            allow_unverified=args.allow_unverified_tokenizer,
         )
         resume_state["_requested_config"] = config
         check_resume_optimizer(
@@ -473,13 +436,12 @@ def run_mlx_pretrain(args, config):
     if not resume_state:
         apply_pretrain_cli_overrides(config, args)
 
-    require_processed_data(config, args)
+    require_processed_data(config)
     if resume_state:
         validate_checkpoint_processed_data(
             resume_state.get("meta", {}),
             config.processed_data_dir,
             source=resume_path,
-            allow_unverified=args.unsafe_skip_data_validation,
         )
 
     # Resume restoration can change the NS transform and other Muon settings;
@@ -668,26 +630,6 @@ def main():
     )
     parser.add_argument("--resume", action="store_true", help="Resume from the latest interrupt checkpoint")
     parser.add_argument("--resume-from", type=str, default="", help="Resume from a specific checkpoint path")
-    parser.add_argument(
-        "--trust-checkpoint",
-        action="store_true",
-        help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint",
-    )
-    parser.add_argument(
-        "--allow-legacy-config",
-        action="store_true",
-        help="Allow inexact shape-only recovery from a checkpoint without full config metadata",
-    )
-    parser.add_argument(
-        "--allow-unverified-tokenizer",
-        action="store_true",
-        help="Allow a legacy checkpoint without tokenizer identity metadata",
-    )
-    parser.add_argument(
-        "--unsafe-skip-data-validation",
-        action="store_true",
-        help="Skip processed-data provenance checks (unsafe; diagnostic use only)",
-    )
     parser.add_argument(
         "--reset-sampler",
         action="store_true",

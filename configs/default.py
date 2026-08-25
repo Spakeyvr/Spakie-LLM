@@ -64,16 +64,14 @@ class SpakieConfig:
     n_kv_heads: int = _D.get("n_kv_heads", 0)
     d_model: int = _D["d_model"]
     d_ff: int = _D["d_ff"]
-    mlp_type: str = _D.get("mlp_type", "gelu")
-    gelu_variant: str = _D.get("gelu_variant", "exact")
+    mlp_type: str = _D["mlp_type"]
     norm_type: str = _D.get("norm_type", "layernorm")
     # RMSNorm applied to per-head Q and K before attention (Qwen3/Gemma2 style).
     # Stabilizes attention logits — especially valuable under Muon, which is more
-    # prone to attention-logit growth than AdamW. Off by default for back-compat.
+    # prone to attention-logit growth than AdamW.
     qk_norm: bool = _D.get("qk_norm", False)
-    # Learned absolute embeddings preserve existing checkpoint structure. RoPE
-    # rotates Q/K inside attention and therefore allocates no position table.
-    position_encoding: str = _D.get("position_encoding", "learned")
+    # RoPE rotates Q/K inside attention and allocates no position table.
+    position_encoding: str = _D["position_encoding"]
     rope_theta: float = _D.get("rope_theta", 100000.0)
     loss_layout: str = _D.get("loss_layout", "flat")
     residual_type: str = _D.get("residual_type", "serial")
@@ -254,26 +252,29 @@ class SpakieConfig:
         self.refresh_derived_fields()
 
     def refresh_derived_fields(self) -> None:
+        if self.n_heads <= 0:
+            raise ValueError("n_heads must be positive")
+        if self.d_model <= 0 or self.d_model % self.n_heads != 0:
+            raise ValueError("d_model must be positive and divisible by n_heads")
+        if self.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
         if self.n_kv_heads < 0:
             raise ValueError("n_kv_heads must be >= 0")
         effective_kv_heads = self.n_kv_heads or self.n_heads
         if self.n_heads % effective_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
-        self.mlp_type = (self.mlp_type or "gelu").lower()
-        if self.mlp_type not in {"gelu", "swiglu"}:
-            raise ValueError("mlp_type must be 'gelu' or 'swiglu'")
-        self.gelu_variant = (self.gelu_variant or "exact").lower()
-        if self.gelu_variant not in {"exact", "fast"}:
-            raise ValueError("gelu_variant must be 'exact' or 'fast'")
+        self.mlp_type = (self.mlp_type or "").lower()
+        if self.mlp_type != "swiglu":
+            raise ValueError("Spakie models require mlp_type='swiglu'")
         self.norm_type = (self.norm_type or "layernorm").lower()
         if self.norm_type not in {"layernorm", "rmsnorm"}:
             raise ValueError("norm_type must be 'layernorm' or 'rmsnorm'")
-        self.position_encoding = (self.position_encoding or "learned").lower()
-        if self.position_encoding not in {"learned", "rope"}:
-            raise ValueError("position_encoding must be 'learned' or 'rope'")
+        self.position_encoding = (self.position_encoding or "").lower()
+        if self.position_encoding != "rope":
+            raise ValueError("Spakie models require position_encoding='rope'")
         if self.rope_theta <= 0:
             raise ValueError("rope_theta must be positive")
-        if self.position_encoding == "rope" and (self.d_model // self.n_heads) % 2 != 0:
+        if (self.d_model // self.n_heads) % 2 != 0:
             raise ValueError("RoPE requires an even attention head dimension")
         self.loss_layout = (self.loss_layout or "flat").lower()
         if self.loss_layout not in {"flat", "3d", "custom"}:
@@ -284,17 +285,6 @@ class SpakieConfig:
         self.attention_backend = (self.attention_backend or "sdpa").lower()
         if self.attention_backend not in {"sdpa", "mfa", "mfa-varlen"}:
             raise ValueError("attention_backend must be 'sdpa', 'mfa', or 'mfa-varlen'")
-        effective_kv_heads = self.n_kv_heads or self.n_heads
-        if self.attention_backend == "mfa-varlen" and effective_kv_heads != self.n_heads:
-            raise ValueError(
-                "attention_backend='mfa-varlen' does not support GQA; use sdpa/mfa "
-                "or set n_kv_heads == n_heads"
-            )
-        if self.attention_backend == "mfa-varlen" and self.position_encoding == "rope":
-            raise ValueError(
-                "attention_backend='mfa-varlen' does not support RoPE; use sdpa/mfa "
-                "or position_encoding='learned'"
-            )
         self.muon_route = (self.muon_route or "all").lower()
         if self.muon_route not in {"all", "mlp", "attn", "none"}:
             raise ValueError("muon_route must be 'all', 'mlp', 'attn', or 'none'")
@@ -434,11 +424,7 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
     return config
 
 
-CHECKPOINT_CONFIG_SCHEMA_VERSION = 2
-_LEGACY_CONFIG_DEFAULTS = {
-    "position_encoding": "learned",
-    "rope_theta": 100000.0,
-}
+CHECKPOINT_CONFIG_SCHEMA_VERSION = 3
 
 
 def config_to_dict(config: SpakieConfig) -> dict:
@@ -460,8 +446,6 @@ def config_from_dict(payload: dict) -> SpakieConfig:
     if unknown:
         raise ValueError(f"checkpoint config contains unknown fields: {', '.join(unknown)}")
     values = dict(payload)
-    for name, value in _LEGACY_CONFIG_DEFAULTS.items():
-        values.setdefault(name, value)
     missing = sorted(known_fields - set(values))
     if missing:
         raise ValueError(f"checkpoint config is missing fields: {', '.join(missing)}")
@@ -489,91 +473,4 @@ def checkpoint_search_dirs(config: SpakieConfig) -> list[str]:
         smoke_dir = os.path.join(config.checkpoint_dir, subdir)
         if smoke_dir not in dirs:
             dirs.append(smoke_dir)
-    if config.preset_name == DEFAULT_PRESET:
-        legacy_dir = config.checkpoint_root_dir
-        if legacy_dir not in dirs:
-            dirs.append(legacy_dir)
     return dirs
-
-
-def inherit_model_shape(config: SpakieConfig, checkpoint_config) -> SpakieConfig:
-    def has_value(name: str) -> bool:
-        if isinstance(checkpoint_config, dict):
-            return name in checkpoint_config
-        return hasattr(checkpoint_config, name)
-
-    def get_value(name: str):
-        if isinstance(checkpoint_config, dict):
-            return checkpoint_config[name]
-        return getattr(checkpoint_config, name)
-
-    if not has_value("n_kv_heads"):
-        # Older checkpoints predate grouped-query attention and use the fused
-        # full-MHA qkv projection. Preserve that shape when loading them.
-        config.n_kv_heads = 0
-    if not has_value("mlp_type"):
-        config.mlp_type = "gelu"
-        config.swiglu_hidden = 0
-    if not has_value("position_encoding"):
-        config.position_encoding = "learned"
-    if not has_value("rope_theta"):
-        config.rope_theta = _LEGACY_CONFIG_DEFAULTS["rope_theta"]
-    for field_name in (
-        "vocab_size",
-        "n_layers",
-        "n_heads",
-        "n_kv_heads",
-        "d_model",
-        "d_ff",
-        "mlp_type",
-        "gelu_variant",
-        "norm_type",
-        "loss_layout",
-        "residual_type",
-        "swiglu_hidden",
-        "max_seq_len",
-        "dropout",
-        "bias",
-        "activation_checkpointing",
-        "qk_norm",
-        "position_encoding",
-        "rope_theta",
-    ):
-        if has_value(field_name):
-            setattr(config, field_name, get_value(field_name))
-    config.refresh_derived_fields()
-    return config
-
-
-def inherit_attention_shape_from_tensors(config: SpakieConfig, tensors: dict) -> SpakieConfig:
-    """Infer MHA vs GQA from checkpoint tensor names/shapes for MLX safetensors."""
-    # QK-norm leaves per-head q_norm/k_norm gains in the checkpoint; detect them
-    # so chat/finetune rebuild the matching module structure.
-    config.qk_norm = any(name.endswith(".attn.q_norm.weight") for name in tensors)
-    config.position_encoding = (
-        "learned"
-        if any(name.endswith("pos_emb.weight") for name in tensors)
-        else "rope"
-    )
-    if any(name.endswith(".attn.qkv.weight") for name in tensors):
-        config.n_kv_heads = 0
-        return config
-    for name, tensor in tensors.items():
-        if name.endswith(".attn.kv_proj.weight"):
-            head_dim = config.d_model // config.n_heads
-            config.n_kv_heads = int(tensor.shape[0]) // (2 * head_dim)
-            return config
-    return config
-
-
-def inherit_mlp_shape_from_tensors(config: SpakieConfig, tensors: dict) -> SpakieConfig:
-    """Infer GELU vs SwiGLU MLP shape from checkpoint tensor names for MLX safetensors."""
-    if any(name.endswith(".mlp.fc1.weight") for name in tensors):
-        config.mlp_type = "gelu"
-        return config
-    for name, tensor in tensors.items():
-        if name.endswith(".mlp.gate_up.weight"):
-            config.mlp_type = "swiglu"
-            config.swiglu_hidden = int(tensor.shape[0]) // 2
-            return config
-    return config

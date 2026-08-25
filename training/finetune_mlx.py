@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import copy
 import math
 import os
 import sys
@@ -44,8 +45,33 @@ from training.monitor import (
 )
 from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers_mlx import configure_mlx_optimizer
-from training.pretrain_mlx import _accum_grads, _build_microbatch_step
+from training.pretrain_mlx import (
+    _accum_grads,
+    _build_microbatch_step,
+    _json_restore,
+    _json_safe,
+)
 from training.prefetch_mlx import BatchPrefetcher
+from training.sft_tokenization import sft_dataset_fingerprint
+
+
+SFT_RESUME_SCHEMA_VERSION = 1
+
+
+class _FiniteSamplerView:
+    """Expose one bounded epoch slice from an otherwise-infinite sampler."""
+
+    def __init__(self, sampler, *, skip: int, count: int):
+        self.sampler = sampler
+        self.skip = int(skip)
+        self.count = int(count)
+
+    def __iter__(self):
+        iterator = iter(self.sampler)
+        for _ in range(self.skip):
+            next(iterator)
+        for _ in range(self.count):
+            yield next(iterator)
 
 
 def _save_sft_checkpoint(
@@ -242,6 +268,7 @@ def finetune_mlx(
     loss_log_path: str | None = None,
     allow_adamw_fallback: bool = False,
     trainable_block_start: int = -1,
+    resume_state: dict | None = None,
 ) -> float:
     # The caller may have loaded BF16 checkpoint arrays. Explicit FP32 must
     # cast those weights too, so always apply the resolved runtime dtype.
@@ -328,10 +355,72 @@ def finetune_mlx(
     global_step = 0
     interrupted = False
     reached_max_steps = False
+    start_epoch = 0
+    epoch_microbatch_offset = 0
+    resume_epoch_rng_state = None
+    dataset_fingerprint = sft_dataset_fingerprint(train_dataset)
+    if resume_state is not None:
+        resume_meta = resume_state.get("meta", {})
+        if int(resume_meta.get("sft_resume_schema_version", 0)) != SFT_RESUME_SCHEMA_VERSION:
+            raise ValueError("SFT checkpoint does not contain supported resume state")
+        contract = resume_meta.get("sft_resume_contract", {})
+        expected_contract = {
+            "dataset_size": len(train_dataset),
+            "dataset_fingerprint": dataset_fingerprint,
+            "batch_size": config.sft_batch_size,
+            "grad_accum_steps": config.sft_grad_accum_steps,
+            "sampler": sft_sampler,
+            "pack": bool(sft_pack),
+            "training_scope": training_scope,
+        }
+        if contract != expected_contract:
+            raise ValueError(
+                f"SFT resume contract differs: saved={contract}, requested={expected_contract}"
+            )
+        if resume_state.get("optimizer"):
+            optimizer.load_state_trees(resume_state["optimizer"])
+        best_val_loss = float(resume_meta.get("best_val_loss", best_val_loss))
+        patience_counter = int(resume_meta.get("patience_counter", 0))
+        global_step = int(resume_meta.get("step", 0))
+        start_epoch = int(resume_meta.get("epoch_index", 0))
+        epoch_microbatch_offset = int(resume_meta.get("epoch_microbatch_offset", 0))
+        if not 0 <= epoch_microbatch_offset <= microbatches_per_epoch:
+            raise ValueError("SFT resume microbatch offset is out of range")
+        resume_epoch_rng_state = _json_restore(
+            resume_meta.get("sampler_epoch_rng_state")
+        )
     accum_scale = 1.0 / config.sft_grad_accum_steps
     microbatch_step = _build_microbatch_step(model, accum_scale, compile_step=use_compile)
     varlen_value_and_grad_cache = {}
     monitor_total_steps = min(total_steps, max_steps) if max_steps > 0 else total_steps
+    current_epoch = start_epoch
+    epoch_start_rng_state = resume_epoch_rng_state
+
+    def interrupt_meta() -> dict:
+        return {
+            "step": global_step,
+            "best_val_loss": best_val_loss,
+            "patience_counter": patience_counter,
+            "preset_name": config.preset_name,
+            "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+            "optimizer_warning": "fallback_not_recommended"
+            if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+            else "",
+            "muon_verified": config.muon_verified,
+            "sft_resume_schema_version": SFT_RESUME_SCHEMA_VERSION,
+            "epoch_index": current_epoch,
+            "epoch_microbatch_offset": epoch_microbatch_offset,
+            "sampler_epoch_rng_state": _json_safe(epoch_start_rng_state),
+            "sft_resume_contract": {
+                "dataset_size": len(train_dataset),
+                "dataset_fingerprint": dataset_fingerprint,
+                "batch_size": config.sft_batch_size,
+                "grad_accum_steps": config.sft_grad_accum_steps,
+                "sampler": sft_sampler,
+                "pack": bool(sft_pack),
+                "training_scope": training_scope,
+            },
+        }
     status_writer = TrainingStatusWriter(
         config.checkpoint_dir,
         stage="sft",
@@ -452,13 +541,16 @@ def finetune_mlx(
     loss_log = None
     if loss_log_path:
         os.makedirs(os.path.dirname(loss_log_path) or ".", exist_ok=True)
-        loss_log = open(loss_log_path, "w", encoding="utf-8")
-        loss_log.write("step,loss,lr\n")
+        append_log = resume_state is not None and os.path.exists(loss_log_path)
+        loss_log = open(loss_log_path, "a" if append_log else "w", encoding="utf-8")
+        if not append_log:
+            loss_log.write("step,loss,lr\n")
 
     try:
-        for epoch in range(config.sft_epochs):
+        for epoch in range(start_epoch, config.sft_epochs):
             if reached_max_steps:
                 break
+            current_epoch = epoch
             model.train()
             epoch_loss = 0.0
             n_micro = 0
@@ -466,20 +558,35 @@ def finetune_mlx(
             accum_loss_lazy = mx.array(0.0, dtype=mx.float32)
             micro_in_step = 0
 
+            if epoch == start_epoch and resume_epoch_rng_state is not None:
+                train_sampler.rng.bit_generator.state = copy.deepcopy(resume_epoch_rng_state)
+                epoch_start_rng_state = copy.deepcopy(resume_epoch_rng_state)
+            else:
+                epoch_start_rng_state = copy.deepcopy(train_sampler.rng.bit_generator.state)
+                epoch_microbatch_offset = 0
+            remaining_microbatches = microbatches_per_epoch - epoch_microbatch_offset
+            epoch_sampler = _FiniteSamplerView(
+                train_sampler,
+                skip=epoch_microbatch_offset,
+                count=remaining_microbatches,
+            )
             pbar = tqdm(
-                range(microbatches_per_epoch),
+                range(remaining_microbatches),
                 desc=f"SFT[mlx] Epoch {epoch + 1}/{config.sft_epochs}",
+                initial=epoch_microbatch_offset,
+                total=microbatches_per_epoch,
             )
             prefetcher = (
                 BatchPrefetcher(
                     train_dataset,
-                    train_sampler,
+                    epoch_sampler,
                     prepare_batch=prepare_sft_batch,
+                    repeat=False,
                 )
                 if use_prefetch
                 else None
             )
-            train_iter = None if prefetcher is not None else iter(train_sampler)
+            train_iter = None if prefetcher is not None else iter(epoch_sampler)
 
             def next_batch():
                 nonlocal train_iter
@@ -488,7 +595,7 @@ def finetune_mlx(
                 try:
                     batch_indices = next(train_iter)
                 except StopIteration:
-                    train_iter = iter(train_sampler)
+                    train_iter = iter(epoch_sampler)
                     batch_indices = next(train_iter)
                 return stack_batch(train_dataset, batch_indices)
 
@@ -562,6 +669,7 @@ def finetune_mlx(
                         mx.async_eval(eval_target)
 
                     if micro_in_step == config.sft_grad_accum_steps:
+                        committed_microbatches = micro_in_step
                         if profiler.enabled:
                             opt_start = now()
                         accum_grads, accum_loss_lazy, micro_in_step, step_mean_loss, _lr = run_optimizer_step(
@@ -571,6 +679,7 @@ def finetune_mlx(
                         )
                         if profiler.enabled:
                             profiler.add("opt_step", now() - opt_start)
+                        epoch_microbatch_offset += committed_microbatches
                         pbar.set_postfix(loss=f"{epoch_loss / max(n_micro, 1):.4f}")
                         if reached_max_steps:
                             break
@@ -580,6 +689,7 @@ def finetune_mlx(
                 pbar.close()
 
             if micro_in_step > 0:
+                committed_microbatches = micro_in_step
                 if profiler.enabled:
                     opt_start = now()
                 accum_grads, accum_loss_lazy, micro_in_step, _step_mean_loss, _lr = run_optimizer_step(
@@ -589,6 +699,7 @@ def finetune_mlx(
                 )
                 if profiler.enabled:
                     profiler.add("opt_step", now() - opt_start)
+                epoch_microbatch_offset += committed_microbatches
 
             if reached_max_steps:
                 print(f"Reached max SFT optimizer steps: {global_step}")
@@ -695,6 +806,9 @@ def finetune_mlx(
                         print(profiler.format_report(window_label=f"epoch {epoch + 1}"))
                         profiler.reset()
                     break
+            epoch_microbatch_offset = 0
+            current_epoch = epoch + 1
+            resume_epoch_rng_state = None
             if profiler.enabled:
                 print(profiler.format_report(window_label=f"epoch {epoch + 1}"))
                 profiler.reset()
@@ -703,36 +817,10 @@ def finetune_mlx(
         interrupt_path = os.path.join(config.checkpoint_dir, interrupt_checkpoint_name)
         if profiler.enabled:
             checkpoint_start = now()
-            save_checkpoint(
-                interrupt_path,
-                meta={
-                    "step": global_step,
-                    "best_val_loss": best_val_loss,
-                    "preset_name": config.preset_name,
-                    "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
-                    "optimizer_warning": "fallback_not_recommended"
-                    if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
-                    else "",
-                    "muon_verified": config.muon_verified,
-                },
-                include_optimizer=True,
-            )
+            save_checkpoint(interrupt_path, meta=interrupt_meta(), include_optimizer=True)
             profiler.add("checkpoint", now() - checkpoint_start)
         else:
-            save_checkpoint(
-                interrupt_path,
-                meta={
-                    "step": global_step,
-                    "best_val_loss": best_val_loss,
-                    "preset_name": config.preset_name,
-                    "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
-                    "optimizer_warning": "fallback_not_recommended"
-                    if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
-                    else "",
-                    "muon_verified": config.muon_verified,
-                },
-                include_optimizer=True,
-            )
+            save_checkpoint(interrupt_path, meta=interrupt_meta(), include_optimizer=True)
         status_writer.finish(
             "interrupted",
             message=f"Saved checkpoint to {interrupt_path}",

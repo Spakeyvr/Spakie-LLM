@@ -110,7 +110,7 @@ class MLXDatasetUtilityTests(unittest.TestCase):
         class Dataset(ChatSFTDatasetMLX):
             def __init__(self):
                 self.tokenizer = FakeTokenizer()
-                self.max_seq_len = 12
+                self.max_seq_len = 20
                 self.examples = [
                     {
                         "messages": [

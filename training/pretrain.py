@@ -141,20 +141,18 @@ def restore_rng_state(state: dict[str, object] | None) -> None:
         random.setstate(state["python"])
     if "numpy" in state:
         numpy_state = state["numpy"]
-        if isinstance(numpy_state, dict):
-            keys = numpy_state["keys"]
-            if isinstance(keys, torch.Tensor):
-                keys = keys.cpu().numpy().astype(np.uint32, copy=False)
-            np.random.set_state((
-                numpy_state["bit_generator"],
-                keys,
-                int(numpy_state["position"]),
-                int(numpy_state["has_gauss"]),
-                float(numpy_state["cached_gaussian"]),
-            ))
-        else:
-            # Unsafe legacy checkpoints used NumPy's native tuple representation.
-            np.random.set_state(numpy_state)
+        if not isinstance(numpy_state, dict):
+            raise ValueError("checkpoint NumPy RNG state must use the current safe schema")
+        keys = numpy_state["keys"]
+        if isinstance(keys, torch.Tensor):
+            keys = keys.cpu().numpy().astype(np.uint32, copy=False)
+        np.random.set_state((
+            numpy_state["bit_generator"],
+            keys,
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        ))
     if "torch" in state:
         torch.set_rng_state(state["torch"])
     if torch.cuda.is_available() and state.get("cuda") is not None:
@@ -248,10 +246,7 @@ def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, run
     model.train()
     if not losses:
         return 0.0
-    total_loss = 0.0
-    for value in torch.stack(losses).tolist():
-        total_loss += value
-    return total_loss / len(losses)
+    return float(torch.stack(losses).mean().item())
 
 
 def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
@@ -270,6 +265,7 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     )
     scaler = create_grad_scaler(runtime)
     parameters = tuple(model.parameters())
+    mps_noncontiguous_parameters: tuple[torch.nn.Parameter, ...] | None = None
     non_blocking = runtime.device.type == "cuda"
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -365,8 +361,6 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                 step_tokens += x.numel()
                 consumed_microbatches += 1
 
-            accum_loss = accum_loss_tensor.item()  # single GPU→CPU sync per optimizer step
-
             scaler.unscale_(optimizer)
             if config.pretrain_grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(parameters, config.pretrain_grad_clip)
@@ -378,7 +372,12 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             # MPS bug: addcmul_/addcdiv_ silently fails on non-contiguous tensors (AdamW internals),
             # causing weights to stop updating. Force contiguous before the step.
             if runtime.device.type == "mps":
-                for p in parameters:
+                if mps_noncontiguous_parameters is None:
+                    mps_noncontiguous_parameters = tuple(
+                        p for p in parameters
+                        if p.grad is not None and not p.grad.is_contiguous()
+                    )
+                for p in mps_noncontiguous_parameters:
                     if p.grad is not None and not p.grad.is_contiguous():
                         p.grad = p.grad.contiguous()
 
@@ -412,6 +411,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             committed_sampler.advance_batches(consumed_microbatches)
             pbar.update(1)
             elapsed = time.time() - start_time
+            status_due = status_writer.due()
+            accum_loss = float(accum_loss_tensor.item()) if status_due else None
             status_writer.update(
                 status="running",
                 step=global_step,
@@ -473,6 +474,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
 
             # Eval
             if global_step % config.pretrain_eval_interval == 0:
+                if accum_loss is None:
+                    accum_loss = float(accum_loss_tensor.item())
                 val_loss = evaluate(model, val_loader, config, runtime)
                 last_val_loss = val_loss
                 elapsed = time.time() - start_time

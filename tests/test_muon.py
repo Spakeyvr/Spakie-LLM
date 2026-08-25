@@ -38,7 +38,6 @@ class MuonCoreTests(unittest.TestCase):
 
     def test_parameter_name_routing(self):
         self.assertFalse(is_muon_parameter_name("tok_emb.weight", 2))
-        self.assertFalse(is_muon_parameter_name("pos_emb.weight", 2))
         self.assertFalse(is_muon_parameter_name("blocks.0.ln1.weight", 1))
         self.assertTrue(is_muon_parameter_name("blocks.0.attn.qkv.weight", 2))
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.fc1.weight", 2))

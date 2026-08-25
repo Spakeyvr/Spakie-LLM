@@ -501,7 +501,8 @@ def _hash_is_in_sorted_array(exact_hash: int, values) -> bool:
 
 
 def _worker_process_file(file_path_str: str) -> dict:
-    assert _WORKER_CONFIG is not None and _WORKER_RAW_ROOT is not None
+    if _WORKER_CONFIG is None or _WORKER_RAW_ROOT is None:
+        raise RuntimeError("prepare-data worker was not initialized")
     config = _WORKER_CONFIG
     raw_root = _WORKER_RAW_ROOT
     dedup_enabled = _WORKER_DEDUP_ENABLED
@@ -1835,6 +1836,16 @@ def prepare_data(
                 )
             for key in ("tokenizer", "preparation", "raw_inputs"):
                 if saved_run_contract.get(key) != run_contract[key]:
+                    if key == "preparation":
+                        saved_target = saved_run_contract.get(key, {}).get("target_tokens")
+                        requested_target = run_contract[key].get("target_tokens")
+                        if saved_target != requested_target:
+                            raise RuntimeError(
+                                "Cannot resume token preparation with a different target: "
+                                f"existing shards target {saved_target:,} tokens, but this run "
+                                f"requests {requested_target:,}. Rerun without --resume to start "
+                                "a new shard set."
+                            )
                     raise RuntimeError(
                         f"Existing token shards have a different {key} contract; "
                         "rerun without --resume."
@@ -1958,7 +1969,8 @@ def prepare_data(
             else:
                 source_runs.append((item.source, token_start, token_end))
             writer.add(token_ids)
-            assert journal_handle is not None and item.exact_hash is not None
+            if journal_handle is None or item.exact_hash is None:
+                raise RuntimeError("accepted document is missing resume-journal state")
             band_keys = (
                 dup_index.band_keys(item.signature)
                 if dup_index is not None and item.signature is not None
@@ -1987,7 +1999,8 @@ def prepare_data(
         nonlocal pending, pending_chars, in_flight
         if not pending:
             return False
-        assert pipeline is not None
+        if pipeline is None:
+            raise RuntimeError("tokenizer pipeline is unavailable")
         while in_flight >= PIPELINE_DEPTH:
             ready = pipeline.get_ready_blocking()
             in_flight -= 1
@@ -2004,7 +2017,8 @@ def prepare_data(
     def drain_all() -> None:
         """Drain every remaining in-flight batch, blocking FIFO."""
         nonlocal in_flight
-        assert pipeline is not None
+        if pipeline is None:
+            raise RuntimeError("tokenizer pipeline is unavailable")
         while in_flight > 0:
             ready = pipeline.get_ready_blocking()
             in_flight -= 1
@@ -2089,7 +2103,8 @@ def prepare_data(
                 stats["drop_reasons"][drop_reason] += 1
                 continue
 
-            assert text is not None
+            if text is None:
+                raise RuntimeError("accepted document has no cleaned text")
             # Language filtering belongs in canonical preparation, not only in
             # one optional downloader path: users can add raw files directly,
             # and old downloads may predate --english_only. Very short custom
@@ -2113,7 +2128,8 @@ def prepare_data(
             # prefix without rerunning SentencePiece or MinHash. Cleaning and
             # the exact content hash still verify deterministic input order.
             if expected_resume_record is not None:
-                assert exact_hash is not None
+                if exact_hash is None:
+                    raise RuntimeError("resume candidate has no exact content hash")
                 if (
                     source == expected_resume_record.source
                     and exact_hash == expected_resume_record.exact_hash
@@ -2155,12 +2171,14 @@ def prepare_data(
             # so we don't burn tokenizer cycles on near-duplicates. Workers
             # already computed exact_hash + signature in parallel.
             if dup_index is not None:
-                assert exact_hash is not None
+                if exact_hash is None:
+                    raise RuntimeError("deduplication candidate has no exact content hash")
                 if dup_index.is_duplicate_exact(exact_hash):
                     stats["documents_dropped"] += 1
                     stats["drop_reasons"]["exact_duplicate"] += 1
                     continue
-                assert signature is not None
+                if signature is None:
+                    raise RuntimeError("deduplication candidate has no MinHash signature")
                 if dup_index.query_signature(exact_hash, signature):
                     stats["documents_dropped"] += 1
                     stats["drop_reasons"]["near_duplicate"] += 1
@@ -2219,14 +2237,16 @@ def prepare_data(
         )
 
     if not dry_run:
-        assert pipeline is not None
+        if pipeline is None:
+            raise RuntimeError("tokenizer pipeline is unavailable")
         if pending and not interrupted:
             submit_pending()
         if not interrupted:
             drain_all()
         pipeline.close_input()
         shard_paths = writer.close()
-        assert journal_handle is not None
+        if journal_handle is None:
+            raise RuntimeError("resume journal is unavailable during finalization")
         journal_handle.flush()
         os.fsync(journal_handle.fileno())
         journal_handle.close()

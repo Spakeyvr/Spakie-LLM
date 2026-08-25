@@ -20,6 +20,7 @@ from runtime.mlx_backend import (
     load_safetensors_checkpoint_meta,
     save_safetensors_checkpoint,
 )
+from runtime.checkpoint_io import load_mlx_checkpoint_config
 
 
 def interpolate_arrays(
@@ -88,13 +89,16 @@ def main() -> int:
     if os.path.abspath(args.output) in {os.path.abspath(args.base), os.path.abspath(args.target)}:
         parser.error("--output must not overwrite an input checkpoint")
 
+    # Reject old or incomplete formats before loading multi-gigabyte tensors.
+    load_mlx_checkpoint_config(args.base)
+    load_mlx_checkpoint_config(args.target)
     base_meta = load_safetensors_checkpoint_meta(args.base)
     target_meta = load_safetensors_checkpoint_meta(args.target)
     if not base_meta or not target_meta:
         raise ValueError("both inputs require checkpoint metadata")
     architecture_keys = (
         "vocab_size", "d_model", "n_layers", "n_heads", "n_kv_heads", "d_ff",
-        "max_seq_len", "bias", "norm_type", "mlp_type", "gelu_variant", "qk_norm",
+        "max_seq_len", "bias", "norm_type", "mlp_type", "qk_norm",
         "position_encoding", "rope_theta",
         "residual_type", "swiglu_hidden",
     )

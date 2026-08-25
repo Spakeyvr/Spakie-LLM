@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -37,6 +39,35 @@ def _dataset_without_file(dataset_type, messages):
 
 
 class SFTLossMaskTests(unittest.TestCase):
+    def test_dataset_drops_overlength_and_unsupervised_rows_without_truncation(self):
+        rows = [
+            {"messages": [
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "a"},
+            ]},
+            {"messages": [
+                {"role": "user", "content": "too long"},
+                {"role": "assistant", "content": "answer"},
+            ]},
+            {"messages": [{"role": "user", "content": "u"}]},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "train.jsonl"
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            lazy = ChatSFTDataset(str(path), FakeTokenizer(), max_seq_len=6)
+            cached = ChatSFTDataset(
+                str(path), FakeTokenizer(), max_seq_len=6, pretokenize=True
+            )
+
+        self.assertEqual(len(lazy), 1)
+        self.assertEqual(lazy.validation_stats, {"overlength": 1, "no_supervised_tokens": 1})
+        torch_lazy = tuple(np.asarray(value) for value in lazy[0])
+        torch_cached = tuple(np.asarray(value) for value in cached[0])
+        np.testing.assert_array_equal(torch_lazy[0], torch_cached[0])
+        np.testing.assert_array_equal(torch_lazy[1], torch_cached[1])
+
     def _assert_only_final_assistant_is_supervised(self, dataset_type) -> None:
         messages = [
             {"role": "user", "content": "u"},

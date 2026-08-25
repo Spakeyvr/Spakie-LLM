@@ -16,11 +16,18 @@ from inference.generation_utils import (
     apply_repetition_penalty,
     mask_out_of_tokenizer_vocab,
     prepare_generation_prompt,
+    validate_sampling_parameters,
 )
 
 
 def _apply_top_k_top_p_np(logits: np.ndarray, temperature: float, top_k: int, top_p: float) -> np.ndarray:
     """Filter a [V] numpy logit vector with temperature, top-k, and top-p."""
+    validate_sampling_parameters(temperature, top_k, top_p)
+    if temperature == 0:
+        greedy = int(np.argmax(logits))
+        filtered = np.full_like(logits, -np.inf)
+        filtered[greedy] = logits[greedy]
+        return filtered
     logits = logits / temperature
     vocab = logits.shape[-1]
 
@@ -71,6 +78,7 @@ def generate(
 ) -> list[int]:
     if max_new_tokens <= 0:
         return []
+    validate_sampling_parameters(temperature, top_k, top_p)
     model.eval()
     generated: list[int] = []
     generated_seen: set[int] = set()

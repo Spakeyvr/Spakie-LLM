@@ -479,54 +479,40 @@ def normalize_example(raw: dict, system_prompt: str | None) -> dict | None:
     return normalized
 
 
-def build_assistant_seed_examples(system_prompt: str | None, repeats: int) -> list[dict]:
-    """Return candidate assistant-behavior examples for SFT anchoring.
-
-    ``repeats`` is retained for CLI compatibility, but the final dataset pass
-    collapses exact duplicates so it cannot silently turn a handful of seeds
-    into thousands of identical gradient updates.
-    """
-    if repeats <= 0:
-        return []
-
+def build_assistant_seed_examples(system_prompt: str | None) -> list[dict]:
+    """Return one canonical copy of each assistant-behavior SFT anchor."""
     examples: list[dict] = []
-    for _ in range(repeats):
-        for user_text, assistant_text in ASSISTANT_BEHAVIOR_SEEDS:
-            messages: list[dict] = []
-            if system_prompt is not None:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.extend(
-                [
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": assistant_text},
-                ]
-            )
-            examples.append({"messages": messages})
+    for user_text, assistant_text in ASSISTANT_BEHAVIOR_SEEDS:
+        messages: list[dict] = []
+        if system_prompt is not None:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text},
+            ]
+        )
+        examples.append({"messages": messages})
     return examples
 
 
 def build_pair_seed_examples(
     pairs: tuple[tuple[str, str], ...],
     system_prompt: str | None,
-    repeats: int,
 ) -> list[dict]:
-    """Return candidate single-turn seed examples; exact duplicates are removed later."""
-    if repeats <= 0:
-        return []
-
+    """Return one canonical copy of each single-turn seed example."""
     examples: list[dict] = []
-    for _ in range(repeats):
-        for user_text, assistant_text in pairs:
-            messages: list[dict] = []
-            if system_prompt is not None:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.extend(
-                [
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": assistant_text},
-                ]
-            )
-            examples.append({"messages": messages})
+    for user_text, assistant_text in pairs:
+        messages: list[dict] = []
+        if system_prompt is not None:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text},
+            ]
+        )
+        examples.append({"messages": messages})
     return examples
 
 
@@ -545,7 +531,7 @@ def build_identity_seed_examples(system_prompt: str | None) -> list[dict]:
         if pair not in seen:
             seen.add(pair)
             pairs.append(pair)
-    return build_pair_seed_examples(tuple(pairs), system_prompt, repeats=1)
+    return build_pair_seed_examples(tuple(pairs), system_prompt)
 
 
 def rendered_token_lengths(messages: list[dict], tokenizer: SpakieTokenizer) -> tuple[int, int]:

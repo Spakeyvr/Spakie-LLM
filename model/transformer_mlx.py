@@ -15,6 +15,19 @@ from configs.default import SpakieConfig
 
 
 _MFA_FLASH_ATTENTION = None
+_ROPE_INV_FREQ_CACHE: dict[tuple[int, float], mx.array] = {}
+
+
+def _rope_inv_freq(head_dim: int, theta: float) -> mx.array:
+    key = (head_dim, float(theta))
+    cached = _ROPE_INV_FREQ_CACHE.get(key)
+    if cached is None:
+        half_dim = head_dim // 2
+        cached = mx.exp(
+            -math.log(theta) * mx.arange(half_dim, dtype=mx.float32) / half_dim
+        )
+        _ROPE_INV_FREQ_CACHE[key] = cached
+    return cached
 
 
 def _mfa_flash_attention():
@@ -46,30 +59,6 @@ def _mfa_flash_attention_varlen():
     return _MFA_FLASH_ATTENTION_VARLEN
 
 
-_MFA_FLASH_ATTENTION_VARLEN_QKV_PACKED = None
-
-
-def _mfa_flash_attention_varlen_qkv_packed():
-    global _MFA_FLASH_ATTENTION_VARLEN_QKV_PACKED
-    if _MFA_FLASH_ATTENTION_VARLEN_QKV_PACKED is None:
-        try:
-            from mlx_mfa import flash_attention_varlen_qkv_packed
-        except ImportError as exc:
-            raise RuntimeError(
-                "attention_backend='mfa-varlen' requires the optional mlx-mfa package"
-            ) from exc
-        _MFA_FLASH_ATTENTION_VARLEN_QKV_PACKED = flash_attention_varlen_qkv_packed
-    return _MFA_FLASH_ATTENTION_VARLEN_QKV_PACKED
-
-
-def _gelu_exact(x: mx.array) -> mx.array:
-    return x * (1 + mx.erf(x / math.sqrt(2))) / 2
-
-
-def _gelu_fast(x: mx.array) -> mx.array:
-    return x * mx.sigmoid(1.702 * x)
-
-
 def apply_rotary_emb(
     x: mx.array,
     position_ids: mx.array,
@@ -83,11 +72,7 @@ def apply_rotary_emb(
     positions = position_ids
     if positions.ndim == 1:
         positions = positions[None, :]
-    inv_freq = mx.exp(
-        -math.log(theta)
-        * mx.arange(half_dim, dtype=mx.float32)
-        / half_dim
-    )
+    inv_freq = _rope_inv_freq(head_dim, theta)
     angles = positions.astype(mx.float32)[..., None] * inv_freq
     cos = mx.cos(angles).astype(x.dtype)[:, :, None, :]
     sin = mx.sin(angles).astype(x.dtype)[:, :, None, :]
@@ -165,13 +150,14 @@ def _linear_cross_entropy_mean_vjp(primals, cotangent, output):
 class CausalSelfAttentionMLX(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        assert config.d_model % config.n_heads == 0
+        if config.d_model % config.n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads or config.n_heads
-        assert self.n_heads % self.n_kv_heads == 0
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads")
         self.head_dim = config.d_model // config.n_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.position_encoding = config.position_encoding
         self.rope_theta = config.rope_theta
 
         if self.n_kv_heads == self.n_heads:
@@ -190,8 +176,6 @@ class CausalSelfAttentionMLX(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.attention_backend = config.attention_backend
         if config.qk_norm:
-            if config.attention_backend == "mfa-varlen":
-                raise ValueError("qk_norm is not supported with the mfa-varlen attention backend")
             self.q_norm = nn.RMSNorm(self.head_dim)
             self.k_norm = nn.RMSNorm(self.head_dim)
         else:
@@ -216,7 +200,6 @@ class CausalSelfAttentionMLX(nn.Module):
         return_cache: bool = False,
     ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
         B, T, C = x.shape
-        used_varlen_qkv = False
         linear_x = mx.contiguous(x) if self.contiguous_linear_inputs else x
         use_compact_proj = (
             self.compact_valid_projections
@@ -236,35 +219,7 @@ class CausalSelfAttentionMLX(nn.Module):
                 )
             else:
                 qkv = self.qkv(linear_x)
-            if (
-                self.attention_backend == "mfa-varlen"
-                and cache is None
-                and varlen_indices is not None
-                and varlen_cu_seqlens is not None
-                and (not self.training or self.attn_dropout_p == 0.0)
-            ):
-                qkv_packed = _pack_varlen_flat(qkv, varlen_indices)[None, :, :]
-                y_packed = _mfa_flash_attention_varlen_qkv_packed()(
-                    qkv_packed,
-                    varlen_cu_seqlens,
-                    varlen_cu_seqlens,
-                    T,
-                    T,
-                    scale=self.scale,
-                    causal=True,
-                    num_heads=self.n_heads,
-                    num_kv_heads=self.n_kv_heads,
-                )
-                y = _unpack_varlen_heads(
-                    y_packed,
-                    varlen_indices,
-                    rows=B * T,
-                    heads=self.n_heads,
-                    head_dim=self.head_dim,
-                ).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-                used_varlen_qkv = True
-            else:
-                q, k, v = mx.split(qkv, 3, axis=-1)
+            q, k, v = mx.split(qkv, 3, axis=-1)
         else:
             if use_compact_proj:
                 compact_x = _compact_rows(linear_x, valid_indices)
@@ -284,68 +239,89 @@ class CausalSelfAttentionMLX(nn.Module):
                 q = self.q_proj(linear_x)
                 kv = self.kv_proj(linear_x)
             k, v = mx.split(kv, 2, axis=-1)
-        if used_varlen_qkv:
-            new_cache = None
-        else:
-            q = q.reshape(B, T, self.n_heads, self.head_dim)
-            k = k.reshape(B, T, self.n_kv_heads, self.head_dim)
-            # QK-norm normalizes over head_dim (the last axis) before the transpose.
-            if self.q_norm is not None:
-                q = self.q_norm(q)
-                k = self.k_norm(k)
-            if self.position_encoding == "rope":
-                if position_ids is None:
-                    position_ids = mx.arange(T, dtype=mx.int32)
-                q = apply_rotary_emb(q, position_ids, self.rope_theta)
-                k = apply_rotary_emb(k, position_ids, self.rope_theta)
-            q = q.transpose(0, 2, 1, 3)
-            k = k.transpose(0, 2, 1, 3)
-            v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(B, T, self.n_heads, self.head_dim)
+        k = k.reshape(B, T, self.n_kv_heads, self.head_dim)
+        # QK-norm and RoPE are part of the canonical attention contract and
+        # therefore run before every dense or variable-length backend.
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        if position_ids is None:
+            position_ids = mx.arange(T, dtype=mx.int32)
+        q = apply_rotary_emb(q, position_ids, self.rope_theta)
+        k = apply_rotary_emb(k, position_ids, self.rope_theta)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-            if cache is not None:
-                k_prev, v_prev = cache
-                k = mx.concatenate([k_prev, k], axis=2)
-                v = mx.concatenate([v_prev, v], axis=2)
-                new_cache = (k, v) if return_cache else None
-                # MLX's causal mask is lower-right aligned, so it handles both
-                # the usual one-token decode and cached chunks with T > 1. The
-                # latter must not let an early query see later keys in its chunk.
+        if cache is not None:
+            k_prev, v_prev = cache
+            k = mx.concatenate([k_prev, k], axis=2)
+            v = mx.concatenate([v_prev, v], axis=2)
+            new_cache = (k, v) if return_cache else None
+            # MLX's causal mask is lower-right aligned, so it handles both
+            # the usual one-token decode and cached chunks with T > 1. The
+            # latter must not let an early query see later keys in its chunk.
+            y = mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                mask="causal",
+            )
+        else:
+            new_cache = (k, v) if return_cache else None
+            if (
+                self.attention_backend == "mfa-varlen"
+                and varlen_indices is not None
+                and varlen_cu_seqlens is not None
+                and (not self.training or self.attn_dropout_p == 0.0)
+            ):
+                y_packed = _mfa_flash_attention_varlen()(
+                    _pack_varlen_heads(q, varlen_indices),
+                    _pack_varlen_heads(k, varlen_indices),
+                    _pack_varlen_heads(v, varlen_indices),
+                    varlen_cu_seqlens,
+                    varlen_cu_seqlens,
+                    T,
+                    T,
+                    scale=self.scale,
+                    causal=True,
+                )
+                y = _unpack_varlen_heads(
+                    y_packed,
+                    varlen_indices,
+                    rows=B * T,
+                    heads=self.n_heads,
+                    head_dim=self.head_dim,
+                ).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+            elif self.training and self.attn_dropout_p > 0.0:
+                y = _attention_with_dropout(
+                    q,
+                    k,
+                    v,
+                    scale=self.scale,
+                    mask=attention_mask,
+                    dropout=self.attn_dropout,
+                )
+            elif self.attention_backend == "mfa":
+                y = _mfa_flash_attention()(
+                    q,
+                    k,
+                    v,
+                    scale=self.scale,
+                    causal=attention_mask is None,
+                    attn_bias=attention_mask,
+                    backend="auto",
+                )
+            else:
                 y = mx.fast.scaled_dot_product_attention(
                     q,
                     k,
                     v,
                     scale=self.scale,
-                    mask="causal",
+                    mask=attention_mask if attention_mask is not None else "causal",
                 )
-            else:
-                new_cache = (k, v) if return_cache else None
-                if self.training and self.attn_dropout_p > 0.0:
-                    y = _attention_with_dropout(
-                        q,
-                        k,
-                        v,
-                        scale=self.scale,
-                        mask=attention_mask,
-                        dropout=self.attn_dropout,
-                    )
-                elif self.attention_backend == "mfa":
-                    y = _mfa_flash_attention()(
-                        q,
-                        k,
-                        v,
-                        scale=self.scale,
-                        causal=attention_mask is None,
-                        attn_bias=attention_mask,
-                        backend="auto",
-                    )
-                else:
-                    y = mx.fast.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        scale=self.scale,
-                        mask=attention_mask if attention_mask is not None else "causal",
-                    )
 
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
         if self.contiguous_linear_inputs:
@@ -372,21 +348,10 @@ class CausalSelfAttentionMLX(nn.Module):
 class MLPMLX(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        self.mlp_type = config.mlp_type
-        self.gelu_variant = config.gelu_variant
-        if self.mlp_type == "swiglu":
-            hidden = config.swiglu_hidden or config.d_ff
-            self.swiglu_hidden = hidden
-            self.gate_up = nn.Linear(config.d_model, 2 * hidden, bias=config.bias)
-            self.down = nn.Linear(hidden, config.d_model, bias=config.bias)
-            self.fc1 = None
-            self.fc2 = None
-        else:
-            self.swiglu_hidden = 0
-            self.fc1 = nn.Linear(config.d_model, config.d_ff, bias=config.bias)
-            self.fc2 = nn.Linear(config.d_ff, config.d_model, bias=config.bias)
-            self.gate_up = None
-            self.down = None
+        hidden = config.swiglu_hidden or config.d_ff
+        self.swiglu_hidden = hidden
+        self.gate_up = nn.Linear(config.d_model, 2 * hidden, bias=config.bias)
+        self.down = nn.Linear(hidden, config.d_model, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
         self.dropout_p = config.dropout
         self.addmm_residual_projections = config.addmm_residual_projections
@@ -395,22 +360,9 @@ class MLPMLX(nn.Module):
 
     def __call__(self, x: mx.array, residual: mx.array | None = None) -> mx.array:
         x = mx.contiguous(x) if self.contiguous_linear_inputs else x
-        if self.mlp_type == "swiglu":
-            gate_up = _linear_addmm_zero(x, self.gate_up) if self.mlp_addmm_linears else self.gate_up(x)
-            gate, up = mx.split(gate_up, 2, axis=-1)
-            h = nn.silu(gate) * up
-            if self.contiguous_linear_inputs:
-                h = mx.contiguous(h)
-            if (
-                residual is not None
-                and self.addmm_residual_projections
-                and self.dropout_p == 0.0
-            ):
-                return _linear_addmm_residual(residual, h, self.down)
-            out = _linear_addmm_zero(h, self.down) if self.mlp_addmm_linears else self.down(h)
-            return self.dropout(out)
-        h = _linear_addmm_zero(x, self.fc1) if self.mlp_addmm_linears else self.fc1(x)
-        h = _gelu_fast(h) if self.gelu_variant == "fast" else _gelu_exact(h)
+        gate_up = _linear_addmm_zero(x, self.gate_up) if self.mlp_addmm_linears else self.gate_up(x)
+        gate, up = mx.split(gate_up, 2, axis=-1)
+        h = nn.silu(gate) * up
         if self.contiguous_linear_inputs:
             h = mx.contiguous(h)
         if (
@@ -418,8 +370,8 @@ class MLPMLX(nn.Module):
             and self.addmm_residual_projections
             and self.dropout_p == 0.0
         ):
-            return _linear_addmm_residual(residual, h, self.fc2)
-        out = _linear_addmm_zero(h, self.fc2) if self.mlp_addmm_linears else self.fc2(h)
+            return _linear_addmm_residual(residual, h, self.down)
+        out = _linear_addmm_zero(h, self.down) if self.mlp_addmm_linears else self.down(h)
         return self.dropout(out)
 
 
@@ -656,11 +608,6 @@ class SpakieGPTMLX(nn.Module):
         super().__init__()
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = (
-            nn.Embedding(config.max_seq_len, config.d_model)
-            if config.position_encoding == "learned"
-            else None
-        )
         self.drop = nn.Dropout(config.dropout)
         self.blocks = [TransformerBlockMLX(config) for _ in range(config.n_layers)]
         # Wrap blocks for activation checkpointing only when the preset asks
@@ -691,8 +638,6 @@ class SpakieGPTMLX(nn.Module):
         # Collect per-submodule overrides in one pass for clarity.
         overrides = {}
         overrides["tok_emb.weight"] = _normal(self.tok_emb.weight.shape, 0.02)
-        if self.pos_emb is not None:
-            overrides["pos_emb.weight"] = _normal(self.pos_emb.weight.shape, 0.02)
         overrides["ln_f.weight"] = mx.ones_like(self.ln_f.weight)
         if getattr(self.ln_f, "bias", None) is not None:
             overrides["ln_f.bias"] = mx.zeros_like(self.ln_f.bias)
@@ -732,28 +677,18 @@ class SpakieGPTMLX(nn.Module):
                 overrides[f"{prefix}.attn.q_norm.weight"] = mx.ones_like(block.attn.q_norm.weight)
                 overrides[f"{prefix}.attn.k_norm.weight"] = mx.ones_like(block.attn.k_norm.weight)
 
-            if block.mlp.mlp_type == "swiglu":
-                overrides[f"{prefix}.mlp.gate_up.weight"] = _normal(
-                    block.mlp.gate_up.weight.shape, 0.02
+            overrides[f"{prefix}.mlp.gate_up.weight"] = _normal(
+                block.mlp.gate_up.weight.shape, 0.02
+            )
+            if config.bias:
+                overrides[f"{prefix}.mlp.gate_up.bias"] = mx.zeros_like(
+                    block.mlp.gate_up.bias
                 )
-                if config.bias:
-                    overrides[f"{prefix}.mlp.gate_up.bias"] = mx.zeros_like(
-                        block.mlp.gate_up.bias
-                    )
-                overrides[f"{prefix}.mlp.down.weight"] = _normal(
-                    block.mlp.down.weight.shape, residual_std
-                )
-                if config.bias:
-                    overrides[f"{prefix}.mlp.down.bias"] = mx.zeros_like(block.mlp.down.bias)
-            else:
-                overrides[f"{prefix}.mlp.fc1.weight"] = _normal(block.mlp.fc1.weight.shape, 0.02)
-                if config.bias:
-                    overrides[f"{prefix}.mlp.fc1.bias"] = mx.zeros_like(block.mlp.fc1.bias)
-                overrides[f"{prefix}.mlp.fc2.weight"] = _normal(
-                    block.mlp.fc2.weight.shape, residual_std
-                )
-                if config.bias:
-                    overrides[f"{prefix}.mlp.fc2.bias"] = mx.zeros_like(block.mlp.fc2.bias)
+            overrides[f"{prefix}.mlp.down.weight"] = _normal(
+                block.mlp.down.weight.shape, residual_std
+            )
+            if config.bias:
+                overrides[f"{prefix}.mlp.down.bias"] = mx.zeros_like(block.mlp.down.bias)
 
         from mlx.utils import tree_unflatten
 
@@ -780,14 +715,15 @@ class SpakieGPTMLX(nn.Module):
         valid_mask: mx.array | None = None,
     ):
         B, T = idx.shape
-        assert T + cache_offset <= self.config.max_seq_len, (
-            f"Sequence length {T + cache_offset} exceeds max {self.config.max_seq_len}"
-        )
+        if T + cache_offset > self.config.max_seq_len:
+            raise ValueError(
+                f"Sequence length {T + cache_offset} exceeds max {self.config.max_seq_len}"
+            )
+        if cache is not None and len(cache) != len(self.blocks):
+            raise ValueError("KV cache layer count does not match the model")
 
         pos = position_ids if position_ids is not None else mx.arange(cache_offset, cache_offset + T)
         x = self.tok_emb(idx)
-        if self.pos_emb is not None:
-            x = x + self.pos_emb(pos)
         x = self.drop(x)
         attention_mask = (
             _block_causal_attention_mask(segment_ids, dtype=x.dtype)
@@ -963,12 +899,6 @@ def _pack_varlen_heads(x: mx.array, indices: mx.array) -> mx.array:
     flat = x.transpose(0, 2, 1, 3).reshape(B * T, H, D)
     packed = mx.take(flat, indices, axis=0)
     return packed.transpose(1, 0, 2)[None, :, :, :]
-
-
-def _pack_varlen_flat(x: mx.array, indices: mx.array) -> mx.array:
-    B, T, C = x.shape
-    flat = x.reshape(B * T, C)
-    return mx.take(flat, indices, axis=0)
 
 
 def _unpack_varlen_heads(

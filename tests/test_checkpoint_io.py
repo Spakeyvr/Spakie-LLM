@@ -140,36 +140,48 @@ class CheckpointIOTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing fields: n_layers"):
             config_from_dict(payload)
 
-    def test_schema_v1_config_migrates_to_learned_positions(self):
+    def test_old_config_schema_is_rejected(self):
         payload = config_to_dict(self._tiny_config())
-        del payload["position_encoding"]
-        del payload["rope_theta"]
-        restored = config_from_checkpoint_payload(
-            payload,
-            source="legacy.pt",
-            schema_version=1,
-        )
-        self.assertEqual(restored.position_encoding, "learned")
-        self.assertEqual(restored.rope_theta, 100_000.0)
+        with self.assertRaisesRegex(ValueError, "required schema"):
+            config_from_checkpoint_payload(
+                payload,
+                source="old.pt",
+                schema_version=1,
+            )
 
-    def test_mlx_metadata_roundtrip_and_legacy_refusal(self):
+    def test_mlx_metadata_roundtrip_and_missing_config_refusal(self):
         config = self._tiny_config()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            weights = Path(temp_dir) / "model.safetensors"
-            meta = {
-                "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
-                "config": config_to_dict(config),
-            }
-            Path(str(weights) + ".meta.json").write_text(json.dumps(meta), encoding="utf-8")
-            restored = load_mlx_checkpoint_config(str(weights))
+        meta = {
+            "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
+            "config": config_to_dict(config),
+        }
+        with patch("runtime.checkpoint_io.load_mlx_checkpoint_meta", return_value=meta):
+            restored = load_mlx_checkpoint_config("model.safetensors")
             self.assertEqual(restored, config)
 
-            Path(str(weights) + ".meta.json").write_text("{}", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "predates full configuration"):
-                load_mlx_checkpoint_config(str(weights))
-            self.assertIsNone(
-                load_mlx_checkpoint_config(str(weights), allow_legacy_config=True)
-            )
+        with patch("runtime.checkpoint_io.load_mlx_checkpoint_meta", return_value={}):
+            with self.assertRaisesRegex(ValueError, "no full configuration"):
+                load_mlx_checkpoint_config("model.safetensors")
+
+    def test_mlx_training_loader_rejects_obsolete_sampler_metadata_before_tensors(self):
+        from training.pretrain_mlx import load_training_checkpoint_mlx
+
+        metadata = {
+            "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
+            "config": config_to_dict(self._tiny_config()),
+            "sampler": {"indices": [0, 1]},
+        }
+        with (
+            patch("training.pretrain_mlx.load_mlx_checkpoint_config"),
+            patch(
+                "training.pretrain_mlx.load_safetensors_checkpoint_meta",
+                return_value=metadata,
+            ),
+            patch("training.pretrain_mlx.load_safetensors") as load_tensors,
+        ):
+            with self.assertRaisesRegex(ValueError, "obsolete metadata"):
+                load_training_checkpoint_mlx("old.safetensors")
+        load_tensors.assert_not_called()
 
     def test_strict_mlx_loader_does_not_accept_partial_weights(self):
         class FakeModel:
@@ -335,17 +347,11 @@ class CheckpointIOTests(unittest.TestCase):
                     {"tokenizer": saved}, "tokenizer.model", source="model.pt"
                 )
 
-    def test_legacy_checkpoint_requires_explicit_tokenizer_opt_in(self):
+    def test_checkpoint_without_tokenizer_provenance_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "no tokenizer provenance"):
             validate_checkpoint_tokenizer(
-                {}, "tokenizer.model", source="legacy.pt"
+                {}, "tokenizer.model", source="old.pt"
             )
-        validate_checkpoint_tokenizer(
-            {},
-            "tokenizer.model",
-            source="legacy.pt",
-            allow_unverified=True,
-        )
 
     def test_resume_rejects_different_processed_generation(self):
         with patch(

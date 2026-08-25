@@ -261,6 +261,12 @@ python3 scripts/finetune.py --backend mlx --precision auto
 python3 scripts/finetune.py --backend torch --device auto --precision auto
 ```
 
+Fine-tuning validates every rendered conversation before training, drops rows
+that would require truncating a turn, and caches compact unpadded token arrays by
+default (`--no-pretokenize-sft` disables the cache). If interrupted, resume the
+exact optimizer/sampler position with `python3 scripts/finetune.py --resume`; an
+explicit path can be supplied with `--resume-from PATH`.
+
 The default SFT download uses the enabled sources in `configs/default.yaml`.
 The canonical merge is capped at 100,000 examples and uses concise
 `smol-smoltalk`, grounded QA/science sources, and small capped Nemotron and
@@ -330,7 +336,7 @@ python3 scripts/run_pretrain_ablations.py --preset 300m --backend mlx --execute
 
 ## Checkpoints and Chat
 
-Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. New Torch and MLX checkpoints store a complete versioned configuration plus tokenizer identity; pretraining checkpoints also bind resume state to the processed-data generation. Every model load validates all tensor keys and shapes. Torch uses PyTorch's restricted loader by default; `--trust-checkpoint` is required for a legacy pickle that contains custom Python objects. MLX files created before full config metadata are refused by default; `--allow-legacy-config` is an explicit inexact compatibility opt-in. Legacy files without tokenizer identity additionally require `--allow-unverified-tokenizer`. `pretrain_interrupt.*` is the rolling resume checkpoint; every successful run also atomically publishes `pretrain_final.*`, even when it ends before an evaluation boundary.
+Checkpoints live under `checkpoints/<preset>/`. Smoke-test outputs live under `smoke_pretrain/` and `smoke_sft/` subdirectories. Torch and MLX checkpoints are self-contained and store the exact current configuration schema plus tokenizer identity; pretraining checkpoints also bind resume state to the processed-data generation. Every model load validates the schema, provenance, tensor keys, and shapes. Torch always uses PyTorch's restricted loader, and MLX requires metadata embedded in the safetensors file. Older or incomplete checkpoints are rejected rather than migrated or guessed. `pretrain_interrupt.*` is the rolling resume checkpoint; every successful run also atomically publishes `pretrain_final.*`, even when it ends before an evaluation boundary.
 
 Useful commands:
 
@@ -341,6 +347,7 @@ python3 scripts/chat.py --checkpoint checkpoints/300m/pretrain_final.safetensors
 python3 scripts/chat.py --json_mode --system "Answer as JSON."
 python3 scripts/finetune.py --list-models --backend mlx
 python3 scripts/train.py --resume
+python3 scripts/finetune.py --resume
 ```
 
 The default chat tokenizer path is `tokenizer/spakie.model`.
@@ -374,7 +381,7 @@ The repo currently supports these presets:
 
 | Preset | Layers | `d_model` | Q heads | KV heads | MLP | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
-| `92m` | 12 | 768 | 12 | 4 | GELU `d_ff=3072` | 23 | 1 | 23 | 2 | Smallest preset, good for smoke tests and quicker iteration |
+| `92m` | 12 | 768 | 12 | 4 | SwiGLU hidden 2048 | 16 | 4 | 16 | 4 | Default modern small preset; RoPE + QK norm |
 | `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 12 | 4 | 8 | 4 | ~184M parameters, RoPE + QK norm |
 | `180m_gqa4` | 16 | 896 | 16 | 4 | SwiGLU hidden 2048 | 24 | 2 | 16 | 4 | Short-run 4-KV-head architecture ablation |
 | `180m_deep` | 24 | 768 | 12 | 4 | SwiGLU hidden 1536 | 18 | 2 | 12 | 4 | Short-run deep/thin architecture ablation |
@@ -386,9 +393,9 @@ Shared model defaults:
 - `max_seq_len = 2048`
 - `dropout = 0.0`
 - `bias = false`
-- RoPE (`theta=100000`) with QK norm for the `180m` and `300m` presets; learned positional embeddings remain available for legacy configurations
+- RoPE (`theta=100000`) with QK norm for every preset
 - weight-tied LM head
-- GELU or SwiGLU MLPs, depending on preset
+- SwiGLU MLPs
 - scaled dot-product attention, with grouped-query attention where configured
 - activation checkpointing disabled by default for all current presets
 

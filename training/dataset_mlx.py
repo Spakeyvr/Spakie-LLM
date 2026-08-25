@@ -10,6 +10,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tokenizer.train_tokenizer import SpakieTokenizer
+from training.sft_tokenization import (
+    EncodedSFTExample,
+    encode_sft_example,
+    pad_sft_example,
+    prepare_sft_examples,
+)
 
 
 class PretrainDatasetMLX:
@@ -49,7 +55,14 @@ class PretrainDatasetMLX:
 class ChatSFTDatasetMLX:
     """JSONL chat dataset with loss masking on non-assistant turns (numpy arrays)."""
 
-    def __init__(self, jsonl_path: str, tokenizer: SpakieTokenizer, max_seq_len: int):
+    def __init__(
+        self,
+        jsonl_path: str,
+        tokenizer: SpakieTokenizer,
+        max_seq_len: int,
+        *,
+        pretokenize: bool = False,
+    ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.examples: list[dict] = []
@@ -58,47 +71,27 @@ class ChatSFTDatasetMLX:
                 line = line.strip()
                 if line:
                     self.examples.append(json.loads(line))
+        self.examples, self._encoded, self.validation_stats = prepare_sft_examples(
+            self.examples,
+            self.tokenizer,
+            self.max_seq_len,
+            keep_cache=pretokenize,
+        )
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
-        messages = self.examples[idx]["messages"]
-        input_ids: list[int] = []
-        labels: list[int] = []
-
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                role_token = self.tokenizer.system_id
-            elif role == "user":
-                role_token = self.tokenizer.user_id
-            elif role == "assistant":
-                role_token = self.tokenizer.assistant_id
-            else:
-                continue
-
-            content_ids = self.tokenizer.encode(content)
-            turn_ids = [role_token] + content_ids + [self.tokenizer.eos_id]
-            if role == "assistant" and msg.get("train", True):
-                turn_labels = [-100] + content_ids + [self.tokenizer.eos_id]
-            else:
-                turn_labels = [-100] * len(turn_ids)
-
-            input_ids.extend(turn_ids)
-            labels.extend(turn_labels)
-
-        input_ids = input_ids[: self.max_seq_len + 1]
-        labels = labels[: self.max_seq_len + 1]
-
-        x = input_ids[:-1]
-        y = labels[1:]
-        pad_len = self.max_seq_len - len(x)
-        x = x + [self.tokenizer.pad_id] * pad_len
-        y = y + [-100] * pad_len
-
-        return np.asarray(x, dtype=np.int32), np.asarray(y, dtype=np.int32)
+        encoded = (
+            getattr(self, "_encoded", None)[idx]
+            if getattr(self, "_encoded", None) is not None
+            else encode_sft_example(self.examples[idx], self.tokenizer, self.max_seq_len)
+        )
+        return pad_sft_example(
+            encoded,
+            max_seq_len=self.max_seq_len,
+            pad_id=self.tokenizer.pad_id,
+        )
 
     def get_batch(self, indices: list[int] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         return _stack_items(self, indices)
@@ -118,40 +111,47 @@ class PretokenizedChatSFTDatasetMLX:
         self.tokenizer = getattr(dataset, "tokenizer", None)
         self.max_seq_len = getattr(dataset, "max_seq_len", None)
         raw_examples = []
-        xs = []
-        ys = []
+        encoded_items: list[EncodedSFTExample] = []
         for idx in range(len(dataset)):
-            item = dataset[idx]
-            if not isinstance(item, tuple) or len(item) < 2:
-                raise ValueError("pretokenized SFT dataset expects (x, y) items")
-            x, y = item[:2]
-            xs.append(np.asarray(x, dtype=np.int32))
-            ys.append(np.asarray(y, dtype=np.int32))
             raw = _raw_example_at(dataset, idx)
+            tokenizer = getattr(dataset, "tokenizer", None)
+            max_seq_len = getattr(dataset, "max_seq_len", None)
+            if raw is not None and tokenizer is not None and max_seq_len is not None:
+                encoded_items.append(encode_sft_example(raw, tokenizer, max_seq_len))
+            else:
+                item = dataset[idx]
+                if not isinstance(item, tuple) or len(item) < 2:
+                    raise ValueError("pretokenized SFT dataset expects (x, y) items")
+                x, y = item[:2]
+                keep = (np.asarray(x) != getattr(self.tokenizer, "pad_id", 0)) | (
+                    np.asarray(y) != -100
+                )
+                length = int(np.nonzero(keep)[0].max()) + 1 if keep.any() else 1
+                encoded_items.append(EncodedSFTExample(
+                    np.asarray(x[:length], dtype=np.int32),
+                    np.asarray(y[:length], dtype=np.int32),
+                ))
             if raw is not None:
                 raw_examples.append(raw)
-
-        if xs:
-            self.x = np.ascontiguousarray(np.stack(xs))
-            self.y = np.ascontiguousarray(np.stack(ys))
-        else:
-            self.x = np.empty((0, 0), dtype=np.int32)
-            self.y = np.empty((0, 0), dtype=np.int32)
-        if len(raw_examples) == len(xs):
+        self._encoded = encoded_items
+        if len(raw_examples) == len(encoded_items):
             self.examples = raw_examples
 
     def __len__(self) -> int:
-        return int(self.x.shape[0])
+        return len(self._encoded)
 
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
-        return self.x[idx], self.y[idx]
+        return pad_sft_example(
+            self._encoded[idx],
+            max_seq_len=self.max_seq_len,
+            pad_id=self.tokenizer.pad_id,
+        )
 
     def get_batch(self, indices: list[int] | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        indices_array = np.asarray(indices, dtype=np.int64)
-        return (
-            np.ascontiguousarray(self.x[indices_array]),
-            np.ascontiguousarray(self.y[indices_array]),
-        )
+        return _stack_items(self, indices)
+
+    def sequence_lengths(self) -> np.ndarray:
+        return np.asarray([item.length for item in self._encoded], dtype=np.int32)
 
 
 def train_val_split_mlx(dataset, val_fraction: float = 0.05, seed: int = 42):
@@ -347,6 +347,14 @@ def sequence_length_at(dataset, idx: int, *, pad_id: int = 0, ignore_index: int 
 
 
 def sequence_lengths(dataset, *, pad_id: int = 0, ignore_index: int = -100) -> np.ndarray:
+    direct = getattr(dataset, "sequence_lengths", None)
+    if callable(direct):
+        return np.asarray(direct(), dtype=np.int32)
+    if isinstance(dataset, SubsetView):
+        parent_lengths = sequence_lengths(
+            dataset.dataset, pad_id=pad_id, ignore_index=ignore_index
+        )
+        return parent_lengths[dataset._indices_array]
     lengths = np.empty((len(dataset),), dtype=np.int32)
     batch_size = 4096
     for start in range(0, len(dataset), batch_size):

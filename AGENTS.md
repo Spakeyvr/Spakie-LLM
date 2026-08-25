@@ -41,6 +41,7 @@ python3 scripts/run_pretrain_ablations.py --preset 300m --backend mlx
 # 5. Fine-tune on chat JSONL (data/chat/train.jsonl)
 python3 scripts/finetune.py --backend mlx --precision auto
 python3 scripts/finetune.py --list-models --backend mlx
+python3 scripts/finetune.py --resume                      # latest sft_interrupt checkpoint
 
 # 6. Chat with a checkpoint
 python3 scripts/chat.py --backend mlx --precision auto
@@ -113,7 +114,7 @@ The default pretraining optimizer is **Muon** (with AdamW fallback gated by `--a
 
 ### Checkpoints
 
-Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `smoke_sft/` subdirs for smoke runs. `checkpoint_search_dirs()` in `configs/default.py` lists fallback dirs used by `chat.py --list-models` and resume logic. New checkpoints store a versioned full `SpakieConfig`; resume restores it before explicit CLI overrides and validates sampler/Muon compatibility. Torch loads with `weights_only=True` unless `--trust-checkpoint` is explicitly supplied for a verified legacy pickle. MLX model tensors are loaded strictly; legacy MLX files without full config metadata require the explicit `--allow-legacy-config` compatibility opt-in. `pretrain_interrupt.pt` is the rolling Torch resume checkpoint written by the pretrain loop; `--resume` picks it up automatically.
+Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `smoke_sft/` subdirs for smoke runs. `checkpoint_search_dirs()` in `configs/default.py` lists fallback dirs used by `chat.py --list-models` and resume logic. Checkpoints store the current versioned full `SpakieConfig`; resume restores it before explicit CLI overrides and validates tokenizer, data, sampler, and Muon compatibility. Torch always loads with `weights_only=True`; MLX metadata is embedded in safetensors and model tensors are loaded strictly. Older or incomplete checkpoint formats are rejected. `pretrain_interrupt.pt` is the rolling Torch resume checkpoint written by the pretrain loop; `--resume` picks it up automatically.
 
 ### Chat template
 

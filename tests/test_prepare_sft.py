@@ -332,10 +332,10 @@ class PrepareSFTTests(unittest.TestCase):
         self.assertEqual(examples[0]["messages"][0]["content"], "short q")
         self.assertIn("dropped 1 examples over the 16-token window", output.getvalue())
 
-    def test_build_assistant_seed_examples_repeats_and_injects_system(self):
-        examples = prepare_sft.build_assistant_seed_examples("System prompt.", repeats=2)
+    def test_build_assistant_seed_examples_injects_system(self):
+        examples = prepare_sft.build_assistant_seed_examples("System prompt.")
 
-        self.assertEqual(len(examples), len(prepare_sft.ASSISTANT_BEHAVIOR_SEEDS) * 2)
+        self.assertEqual(len(examples), len(prepare_sft.ASSISTANT_BEHAVIOR_SEEDS))
         self.assertEqual(examples[0]["messages"][0], {"role": "system", "content": "System prompt."})
         self.assertEqual(examples[0]["messages"][1], {"role": "user", "content": "Hi"})
         self.assertEqual(
@@ -344,20 +344,18 @@ class PrepareSFTTests(unittest.TestCase):
         )
 
     def test_build_assistant_seed_examples_can_omit_system(self):
-        examples = prepare_sft.build_assistant_seed_examples(None, repeats=1)
+        examples = prepare_sft.build_assistant_seed_examples(None)
 
         self.assertEqual(examples[0]["messages"][0], {"role": "user", "content": "Hi"})
         self.assertNotIn("system", {msg["role"] for msg in examples[0]["messages"]})
-        self.assertEqual(prepare_sft.build_assistant_seed_examples("System prompt.", repeats=0), [])
 
-    def test_build_pair_seed_examples_repeats_and_injects_system(self):
+    def test_build_pair_seed_examples_injects_system(self):
         examples = prepare_sft.build_pair_seed_examples(
             (("What's Python", "Python is a programming language."),),
             "System prompt.",
-            repeats=2,
         )
 
-        self.assertEqual(len(examples), 2)
+        self.assertEqual(len(examples), 1)
         self.assertEqual(examples[0]["messages"][0], {"role": "system", "content": "System prompt."})
         self.assertEqual(examples[0]["messages"][1], {"role": "user", "content": "What's Python"})
         self.assertEqual(
@@ -369,22 +367,10 @@ class PrepareSFTTests(unittest.TestCase):
         examples = prepare_sft.build_pair_seed_examples(
             (("Explain sleep", "Sleep helps the body rest."),),
             None,
-            repeats=1,
         )
 
         self.assertEqual(examples[0]["messages"][0], {"role": "user", "content": "Explain sleep"})
         self.assertNotIn("system", {msg["role"] for msg in examples[0]["messages"]})
-        self.assertEqual(prepare_sft.build_pair_seed_examples(prepare_sft.ANTI_ECHO_SEEDS, None, repeats=0), [])
-
-    def test_seed_repeats_are_collapsed_before_export(self):
-        examples = prepare_sft.build_pair_seed_examples(
-            (("What is Python?", "Python is a programming language."),),
-            None,
-            repeats=80,
-        )
-        deduped, dropped = prepare_sft.deduplicate_examples(examples)
-        self.assertEqual(len(deduped), 1)
-        self.assertEqual(dropped, 79)
 
 
 if __name__ == "__main__":

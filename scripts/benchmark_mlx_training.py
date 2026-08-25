@@ -1090,7 +1090,6 @@ def main() -> None:
         default=None,
         help="Force row-contiguous inputs before large MLX linear projections",
     )
-    parser.add_argument("--mlp-type", choices=("gelu", "swiglu"), default=None, help="Override MLP block type")
     parser.add_argument("--swiglu-hidden", type=int, default=None, help="Override SwiGLU hidden size")
     parser.add_argument(
         "--qk-norm",
@@ -1106,12 +1105,6 @@ def main() -> None:
         choices=("sdpa", "mfa", "mfa-varlen"),
         default=None,
         help="Override MLX attention backend",
-    )
-    parser.add_argument(
-        "--gelu-variant",
-        choices=("exact", "fast"),
-        default=None,
-        help="Override GELU variant for benchmark comparisons",
     )
     parser.add_argument(
         "--optimizer",
@@ -1368,8 +1361,6 @@ def main() -> None:
         config.fused_residual_rmsnorm = args.fused_residual_rmsnorm
     if args.contiguous_linear_inputs is not None:
         config.contiguous_linear_inputs = args.contiguous_linear_inputs
-    if args.mlp_type is not None:
-        config.mlp_type = args.mlp_type
     if args.swiglu_hidden is not None:
         config.swiglu_hidden = args.swiglu_hidden
     if args.norm_type is not None:
@@ -1382,8 +1373,6 @@ def main() -> None:
         config.residual_type = args.residual_type
     if args.attention_backend is not None:
         config.attention_backend = args.attention_backend
-    if args.gelu_variant is not None:
-        config.gelu_variant = args.gelu_variant
     if args.n_layers is not None:
         config.n_layers = args.n_layers
     if args.d_model is not None:
@@ -1464,7 +1453,6 @@ def main() -> None:
     )
     print(f"Attention KV heads: {config.n_kv_heads or config.n_heads}/{config.n_heads}")
     print(f"MLP: {config.mlp_type}")
-    print(f"GELU variant: {config.gelu_variant}")
     print(f"Norm type: {config.norm_type}")
     print(f"Loss layout: {config.loss_layout}")
     print(f"Residual type: {config.residual_type}")

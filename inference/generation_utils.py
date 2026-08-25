@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from typing import TypeVar
 
 
 Logits = TypeVar("Logits")
+
+
+def validate_sampling_parameters(
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> None:
+    """Validate backend-neutral sampling controls.
+
+    ``temperature == 0`` is the conventional greedy-decoding mode. Negative or
+    non-finite temperatures are invalid rather than silently reversing or
+    corrupting the probability distribution.
+    """
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and non-negative")
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative")
+    if not math.isfinite(top_p) or not 0 < top_p <= 1:
+        raise ValueError("top_p must be finite and in (0, 1]")
 
 
 def prompt_token_budget(max_seq_len: int, max_new_tokens: int) -> int:

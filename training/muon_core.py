@@ -96,7 +96,7 @@ def is_muon_parameter_name(name: str, ndim: int) -> bool:
     """Return whether a parameter should receive Muon instead of auxiliary AdamW."""
     if ndim != 2:
         return False
-    if name in {"tok_emb.weight", "pos_emb.weight", "lm_head.weight"}:
+    if name in {"tok_emb.weight", "lm_head.weight"}:
         return False
     if name.endswith(".bias") or ".ln" in name or "norm" in name.lower():
         return False

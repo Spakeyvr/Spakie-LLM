@@ -148,7 +148,6 @@ class DualAdamW:
         self.master_params: dict[str, mx.array] = {
             name: value.astype(mx.float32) for name, value in param_flat.items()
         }
-        self._master_loaded = False
 
     @property
     def learning_rate(self):
@@ -182,23 +181,12 @@ class DualAdamW:
     def load_state_trees(self, state: dict) -> None:
         self.decay.state = _cast_floating_tree(state["decay"])
         self.nodecay.state = _cast_floating_tree(state["nodecay"])
-        master = state.get("master")
-        if master is not None:
-            self.master_params = {
-                name: value.astype(mx.float32)
-                for name, value in _flatten_arrays(master).items()
-            }
-            self._master_loaded = True
-
-    def sync_master_from_model(self, model) -> None:
-        if self._master_loaded:
-            return
-        self.model_parameters = model.parameters()
-        model_flat = _flatten_arrays(self.model_parameters)
-        self._model_dtypes = {name: value.dtype for name, value in model_flat.items()}
+        if "master" not in state:
+            raise ValueError("MLX optimizer checkpoint is missing FP32 master parameters")
+        master = state["master"]
         self.master_params = {
             name: value.astype(mx.float32)
-            for name, value in model_flat.items()
+            for name, value in _flatten_arrays(master).items()
         }
 
     def evaluation_state(self) -> tuple:
@@ -291,7 +279,6 @@ class MuonAdamWMLX:
         self.master_params: dict[str, mx.array] = {
             name: value.astype(mx.float32) for name, value in param_flat.items()
         }
-        self._master_loaded = False
 
     def set_lr(self, lr: float) -> None:
         self.learning_rate = lr
@@ -347,7 +334,6 @@ class MuonAdamWMLX:
         self.model_parameters = _publish_master_params(
             model, self.master_params, self._model_dtypes
         )
-        self._master_loaded = True
         self.muon_state = next_muon_state
 
     def _prepare_muon(
@@ -495,30 +481,18 @@ class MuonAdamWMLX:
         }
 
     def load_state_trees(self, state: dict) -> None:
-        master = state.get("master")
-        if master is not None:
-            self.master_params = {
-                name: value.astype(mx.float32)
-                for name, value in _flatten_arrays(master).items()
-            }
-            self._master_loaded = True
+        if "master" not in state:
+            raise ValueError("MLX optimizer checkpoint is missing FP32 master parameters")
+        self.master_params = {
+            name: value.astype(mx.float32)
+            for name, value in _flatten_arrays(state["master"]).items()
+        }
         self.muon_state = {
             name: value.astype(mx.float32)
             for name, value in _flatten_arrays(state.get("muon", {})).items()
         }
         self.aux_decay.state = _cast_floating_tree(state["aux_decay"])
         self.aux_nodecay.state = _cast_floating_tree(state["aux_nodecay"])
-
-    def sync_master_from_model(self, model) -> None:
-        if self._master_loaded:
-            return
-        self.model_parameters = model.parameters()
-        model_flat = _flatten_arrays(self.model_parameters)
-        self._model_dtypes = {name: value.dtype for name, value in model_flat.items()}
-        self.master_params = {
-            name: value.astype(mx.float32)
-            for name, value in model_flat.items()
-        }
 
     def evaluation_state(self) -> tuple:
         return (

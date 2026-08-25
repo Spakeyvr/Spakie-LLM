@@ -39,9 +39,9 @@ def main() -> int:
     output_dir = SpakieConfig().chat_raw_dir
     sources = {
         "spakie_180m_identity": build_identity_seed_examples(None),
-        "assistant_behavior": build_assistant_seed_examples(None, repeats=1),
-        "anti_echo": build_pair_seed_examples(ANTI_ECHO_SEEDS, None, repeats=1),
-        "factual_repairs": build_pair_seed_examples(_FACTUAL_REPAIR_SEEDS, None, repeats=1),
+        "assistant_behavior": build_assistant_seed_examples(None),
+        "anti_echo": build_pair_seed_examples(ANTI_ECHO_SEEDS, None),
+        "factual_repairs": build_pair_seed_examples(_FACTUAL_REPAIR_SEEDS, None),
     }
     for source_name, examples in sources.items():
         path = os.path.join(output_dir, f"{source_name}.jsonl")

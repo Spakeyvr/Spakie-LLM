@@ -77,6 +77,11 @@ def chat_loop(model: SpakieGPT, tokenizer: SpakieTokenizer, config: SpakieConfig
             )
             response_text = tokenizer.decode(response_ids)
 
+        if not response_text.strip():
+            # Do not carry an invalid empty assistant turn into the next prompt.
+            history.pop()
+            print("Spakie: (no response generated; turn was not added to history)\n")
+            continue
         print(f"Spakie: {response_text}\n")
         history.append({"role": "assistant", "content": response_text})
 

@@ -14,12 +14,16 @@ from inference.generation_utils import (
     apply_repetition_penalty,
     mask_out_of_tokenizer_vocab,
     prepare_generation_prompt,
+    validate_sampling_parameters,
 )
 
 
 def sample_top_k_top_p(logits: torch.Tensor, temperature: float = 0.8,
                         top_k: int = 50, top_p: float = 0.9) -> torch.Tensor:
     """Sample from logits with temperature, top-k, and top-p filtering."""
+    validate_sampling_parameters(temperature, top_k, top_p)
+    if temperature == 0:
+        return torch.argmax(logits, dim=-1, keepdim=True)
     logits = logits / temperature
 
     # Top-k
@@ -52,6 +56,7 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
     """Autoregressive generation. Returns generated token IDs (excluding prompt)."""
     if max_new_tokens <= 0:
         return []
+    validate_sampling_parameters(temperature, top_k, top_p)
     model.eval()
     if runtime is None:
         runtime_device = torch.device(device) if device is not None else next(model.parameters()).device
@@ -61,6 +66,7 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
         max_seq_len=model.config.max_seq_len,
         max_new_tokens=max_new_tokens,
     )
+    context_tokens = list(prompt_ids)
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=runtime.device)
     generated = []
     generated_seen: set[int] = set()
@@ -73,13 +79,11 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
         tokenizer.system_id,
     }
 
+    with autocast_context(runtime):
+        logits, _, cache = model(idx, cache_offset=0, return_cache=True)
+    cache_offset = idx.shape[1]
+
     for _ in range(max_new_tokens):
-        # Crop to max_seq_len
-        idx_cond = idx[:, -model.config.max_seq_len:]
-
-        with autocast_context(runtime):
-            logits, _ = model(idx_cond)
-
         next_logits = logits[:, -1, :].clone()
         mask_out_of_tokenizer_vocab(
             next_logits,
@@ -106,7 +110,26 @@ def generate(model: SpakieGPT, tokenizer: SpakieTokenizer, prompt_ids: list[int]
 
         generated.append(token)
         generated_seen.add(token)
-        idx = torch.cat([idx, next_id], dim=1)
+        context_tokens.append(token)
+        if len(generated) >= max_new_tokens:
+            break
+
+        if cache_offset + 1 <= model.config.max_seq_len:
+            idx = next_id
+            with autocast_context(runtime):
+                logits, _, cache = model(
+                    idx,
+                    cache=cache,
+                    cache_offset=cache_offset,
+                    return_cache=True,
+                )
+            cache_offset += 1
+        else:
+            window = context_tokens[-model.config.max_seq_len :]
+            idx = torch.tensor([window], dtype=torch.long, device=runtime.device)
+            with autocast_context(runtime):
+                logits, _, cache = model(idx, cache_offset=0, return_cache=True)
+            cache_offset = len(window)
 
     return generated
 

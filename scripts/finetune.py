@@ -10,8 +10,6 @@ from configs.default import (
     SUPPORTED_PRESETS,
     checkpoint_search_dirs,
     get_preset_config,
-    inherit_attention_shape_from_tensors,
-    inherit_mlp_shape_from_tensors,
 )
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 from runtime.checkpoint_io import (
@@ -130,39 +128,33 @@ def list_available_models(backend: str, preset_name: str | None = None) -> list[
     return available_models
 
 
-def infer_preset_from_checkpoint(checkpoint_path: str, *, trust_checkpoint: bool = False) -> str | None:
+def infer_preset_from_checkpoint(checkpoint_path: str) -> str | None:
     """Best-effort read of `preset_name` from a checkpoint's own metadata.
 
-    MLX checkpoints write `<path>.meta.json`; torch `.pt` files carry a pickled
-    `SpakieConfig` (with `preset_name`) inside the archive. Returns None when
-    the preset can't be determined or isn't a supported preset.
+    Returns None when the preset can't be determined or isn't supported.
     """
     if checkpoint_path.endswith(_TORCH_EXTS):
         try:
-            ckpt = load_torch_checkpoint(
-                checkpoint_path, map_location="cpu", trust_checkpoint=trust_checkpoint
-            )
+            ckpt = load_torch_checkpoint(checkpoint_path, map_location="cpu")
         except (OSError, RuntimeError, ValueError):
             return None
         checkpoint_config = ckpt.get("config") if isinstance(ckpt, dict) else None
         preset = (
             checkpoint_config.get("preset_name")
             if isinstance(checkpoint_config, dict)
-            else getattr(checkpoint_config, "preset_name", None)
+            else None
         )
         if preset in SUPPORTED_PRESETS:
             return preset
         return None
 
-    meta_path = checkpoint_path + ".meta.json"
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as handle:
-                preset = json.load(handle).get("preset_name")
-        except (OSError, json.JSONDecodeError):
-            preset = None
-        if preset in SUPPORTED_PRESETS:
-            return preset
+    try:
+        meta = load_mlx_checkpoint_meta(checkpoint_path)
+    except (OSError, RuntimeError, ValueError):
+        meta = None
+    preset = meta.get("preset_name") if isinstance(meta, dict) else None
+    if preset in SUPPORTED_PRESETS:
+        return preset
     return None
 
 
@@ -172,7 +164,6 @@ def resolve_source_checkpoint(
     interactive: bool,
     preset_name: str | None,
     default_name: str,
-    trust_checkpoint: bool = False,
 ) -> tuple[str | None, str]:
     candidate = requested or default_name
     if os.path.isabs(candidate) or os.path.dirname(candidate):
@@ -184,7 +175,7 @@ def resolve_source_checkpoint(
         # An explicit path that exists but lives outside the standard per-preset
         # checkpoint dirs: infer the preset from its own metadata.
         if os.path.exists(candidate):
-            inferred = infer_preset_from_checkpoint(candidate, trust_checkpoint=trust_checkpoint)
+            inferred = infer_preset_from_checkpoint(candidate)
             if inferred:
                 return inferred, candidate
         return None, candidate
@@ -320,23 +311,22 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
         sys.exit(1)
 
     print(f"Loading pretrained checkpoint: {ckpt_path}")
-    ckpt = load_torch_checkpoint(
-        ckpt_path, map_location=device, trust_checkpoint=args.trust_checkpoint
+    ckpt = load_torch_checkpoint(ckpt_path, map_location=device)
+    config = config_from_checkpoint_payload(
+        ckpt.get("config"), source=ckpt_path,
+        schema_version=ckpt.get("config_schema_version"),
     )
-    if "config" in ckpt:
-        config = config_from_checkpoint_payload(
-            ckpt["config"], source=ckpt_path,
-            schema_version=ckpt.get("config_schema_version"),
-        )
-    elif not args.allow_legacy_config:
-        raise ValueError("checkpoint has no full config; use --allow-legacy-config only for a verified legacy file")
     validate_checkpoint_tokenizer(
         ckpt,
         config.tokenizer_prefix + ".model",
         source=ckpt_path,
-        allow_unverified=args.allow_unverified_tokenizer,
     )
-    discard_training_state(ckpt)
+    resume_state = ckpt if args.resume else None
+    if resume_state is None:
+        discard_training_state(ckpt)
+    elif args.reset_optimizer:
+        resume_state.pop("optimizer", None)
+        resume_state.pop("scaler", None)
     apply_sft_cli_overrides(config, args)
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPT(config)
@@ -347,7 +337,28 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
         print(f"Error: SFT data not found at {jsonl_path}")
         sys.exit(1)
 
-    dataset = ChatSFTDataset(jsonl_path, tokenizer, config.max_seq_len)
+    print(
+        "Pretokenizing SFT dataset into compact in-memory arrays..."
+        if args.pretokenize_sft
+        else "Validating SFT lengths without retaining a token cache..."
+    )
+    try:
+        dataset = ChatSFTDataset(
+            jsonl_path,
+            tokenizer,
+            config.max_seq_len,
+            pretokenize=args.pretokenize_sft,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted while validating/tokenizing the SFT dataset.")
+        sys.exit(130)
+    dropped = dataset.validation_stats
+    if any(dropped.values()):
+        print(
+            "Dropped invalid SFT examples: "
+            f"overlength={dropped['overlength']:,}, "
+            f"no_supervised_tokens={dropped['no_supervised_tokens']:,}"
+        )
     print_sft_format_warning(jsonl_path, dataset.examples)
     if args.max_examples > 0:
         max_examples = min(args.max_examples, len(dataset))
@@ -369,6 +380,7 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
         best_checkpoint_name=output_name,
         interrupt_checkpoint_name=interrupt_name_for(output_name),
         allow_adamw_fallback=config.allow_adamw_fallback,
+        resume_state=resume_state,
     )
 
 
@@ -380,11 +392,11 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     from tokenizer.train_tokenizer import SpakieTokenizer
     from training.dataset_mlx import (
         ChatSFTDatasetMLX,
-        PretokenizedChatSFTDatasetMLX,
         SubsetView,
         train_val_split_mlx,
     )
     from training.finetune_mlx import finetune_mlx
+    from training.pretrain_mlx import load_training_checkpoint_mlx
 
     runtime = resolve_mlx_runtime(args.precision)
     applied_limits = configure_metal_limits(
@@ -437,29 +449,24 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         sys.exit(1)
 
     print(f"Loading pretrained checkpoint: {ckpt_path}")
+    config = load_mlx_checkpoint_config(ckpt_path)
     flat = load_safetensors(ckpt_path)
     model_flat = {k[len("model."):]: v for k, v in flat.items() if k.startswith("model.")}
     if not model_flat:
         print(f"Error: no 'model.*' tensors found in {ckpt_path}")
         sys.exit(1)
-    saved_config = load_mlx_checkpoint_config(
-        ckpt_path, allow_legacy_config=args.allow_legacy_config
-    )
-    if saved_config is not None:
-        config = saved_config
-    else:
-        config = inherit_attention_shape_from_tensors(config, model_flat)
-        config = inherit_mlp_shape_from_tensors(config, model_flat)
     validate_checkpoint_tokenizer(
         load_mlx_checkpoint_meta(ckpt_path),
         config.tokenizer_prefix + ".model",
         source=ckpt_path,
-        allow_unverified=args.allow_unverified_tokenizer,
     )
     apply_sft_cli_overrides(config, args)
     config.checkpoint_dir = output_checkpoint_dir
     model = SpakieGPTMLX(config)
     load_mlx_model_weights_strict(model, flat, path=ckpt_path)
+    resume_state = load_training_checkpoint_mlx(ckpt_path) if args.resume else None
+    if resume_state is not None and args.reset_optimizer:
+        resume_state["optimizer"] = {}
     del flat, model_flat
 
     tokenizer = SpakieTokenizer(config.tokenizer_prefix + ".model")
@@ -467,19 +474,33 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         print(f"Error: SFT data not found at {jsonl_path}")
         sys.exit(1)
 
-    dataset = ChatSFTDatasetMLX(jsonl_path, tokenizer, config.max_seq_len)
+    print(
+        "Pretokenizing SFT dataset into compact in-memory arrays..."
+        if args.pretokenize_sft
+        else "Validating SFT lengths without retaining a token cache..."
+    )
+    try:
+        dataset = ChatSFTDatasetMLX(
+            jsonl_path,
+            tokenizer,
+            config.max_seq_len,
+            pretokenize=args.pretokenize_sft,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted while validating/tokenizing the SFT dataset.")
+        sys.exit(130)
+    dropped = dataset.validation_stats
+    if any(dropped.values()):
+        print(
+            "Dropped invalid SFT examples: "
+            f"overlength={dropped['overlength']:,}, "
+            f"no_supervised_tokens={dropped['no_supervised_tokens']:,}"
+        )
     print_sft_format_warning(jsonl_path, dataset.examples)
     if args.max_examples > 0:
         dataset = SubsetView(dataset, range(min(args.max_examples, len(dataset))))
     elif args.smoke:
         dataset = SubsetView(dataset, range(min(512, len(dataset))))
-    if args.pretokenize_sft:
-        print("Pretokenizing SFT dataset into in-memory NumPy arrays...")
-        try:
-            dataset = PretokenizedChatSFTDatasetMLX(dataset)
-        except KeyboardInterrupt:
-            print("\nInterrupted while pretokenizing SFT dataset.")
-            sys.exit(130)
     print(f"SFT examples: {len(dataset)}")
 
     train_idx, val_idx = train_val_split_mlx(dataset)
@@ -510,6 +531,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
         loss_log_path=args.loss_log,
         allow_adamw_fallback=config.allow_adamw_fallback,
         trainable_block_start=args.mlx_trainable_block_start,
+        resume_state=resume_state,
     )
 
 
@@ -526,12 +548,17 @@ def main():
                         help="Training backend")
     parser.add_argument("--train-jsonl", type=str, default="", help="Path to SFT JSONL file")
     parser.add_argument("--source-checkpoint", type=str, default="", help="Checkpoint filename or path to fine-tune from")
-    parser.add_argument("--trust-checkpoint", action="store_true",
-                        help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint")
-    parser.add_argument("--allow-legacy-config", action="store_true",
-                        help="Allow shape guessing for verified legacy checkpoints without full config metadata")
-    parser.add_argument("--allow-unverified-tokenizer", action="store_true",
-                        help="Allow a legacy checkpoint without tokenizer identity metadata")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume SFT optimizer, sampler, RNG, epoch, and step state from an interrupt checkpoint",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default="",
+        help="SFT interrupt checkpoint to resume (implies --resume)",
+    )
     parser.add_argument("--list-models", action="store_true",
                         help="List available source checkpoints and exit")
     parser.add_argument("--no-model-prompt", action="store_true",
@@ -572,7 +599,7 @@ def main():
     parser.add_argument(
         "--reset-optimizer",
         action="store_true",
-        help="Accepted for CLI symmetry; SFT starts with fresh optimizer state.",
+        help="Resume SFT progress with a fresh optimizer/scaler state",
     )
     parser.add_argument(
         "--muon-adjust-lr-fn",
@@ -718,8 +745,8 @@ def main():
     parser.add_argument(
         "--pretokenize-sft",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Cache MLX SFT input/label arrays in memory before fine-tuning",
+        default=True,
+        help="Cache compact Torch/MLX SFT input/label arrays in memory before fine-tuning",
     )
     parser.add_argument(
         "--mlx-async-step-eval",
@@ -743,6 +770,13 @@ def main():
         help="Set the MLX Metal cache limit in GB (-1 = leave default, 0 = disable cache)",
     )
     args = parser.parse_args()
+    if args.resume_from:
+        args.resume = True
+        args.source_checkpoint = args.resume_from
+    elif args.resume and not args.source_checkpoint:
+        args.source_checkpoint = (
+            "sft_interrupt.safetensors" if args.backend == "mlx" else "sft_interrupt.pt"
+        )
 
     available_models = list_available_models(args.backend, args.preset)
     if args.list_models:
@@ -760,7 +794,6 @@ def main():
         interactive=not args.no_model_prompt,
         preset_name=args.preset,
         default_name=_default_source_checkpoint_name(args.backend),
-        trust_checkpoint=args.trust_checkpoint,
     )
     if selected_preset is None:
         print(f"Error: pretrained checkpoint not found at {resolved_source_checkpoint}")

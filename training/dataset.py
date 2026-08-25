@@ -11,6 +11,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 from tokenizer.train_tokenizer import SpakieTokenizer
+from training.sft_tokenization import (
+    encode_sft_example,
+    pad_sft_example,
+    prepare_sft_examples,
+)
 
 
 class PretrainDataset(Dataset):
@@ -44,7 +49,14 @@ class PretrainDataset(Dataset):
 class ChatSFTDataset(Dataset):
     """JSONL chat dataset with loss masking on non-assistant turns."""
 
-    def __init__(self, jsonl_path: str, tokenizer: SpakieTokenizer, max_seq_len: int):
+    def __init__(
+        self,
+        jsonl_path: str,
+        tokenizer: SpakieTokenizer,
+        max_seq_len: int,
+        *,
+        pretokenize: bool = False,
+    ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.examples = []
@@ -54,54 +66,39 @@ class ChatSFTDataset(Dataset):
                 line = line.strip()
                 if line:
                     self.examples.append(json.loads(line))
+        self.examples, self._encoded, self.validation_stats = prepare_sft_examples(
+            self.examples,
+            self.tokenizer,
+            self.max_seq_len,
+            keep_cache=pretokenize,
+        )
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
-        messages = self.examples[idx]["messages"]
-        input_ids = []
-        labels = []
+        encoded = (
+            getattr(self, "_encoded", None)[idx]
+            if getattr(self, "_encoded", None) is not None
+            else encode_sft_example(self.examples[idx], self.tokenizer, self.max_seq_len)
+        )
+        x, y = pad_sft_example(
+            encoded,
+            max_seq_len=self.max_seq_len,
+            pad_id=self.tokenizer.pad_id,
+        )
+        return torch.from_numpy(x.astype(np.int64)), torch.from_numpy(y.astype(np.int64))
 
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-
-            if role == "system":
-                role_token = self.tokenizer.system_id
-            elif role == "user":
-                role_token = self.tokenizer.user_id
-            elif role == "assistant":
-                role_token = self.tokenizer.assistant_id
-            else:
-                continue
-
-            content_ids = self.tokenizer.encode(content)
-            turn_ids = [role_token] + content_ids + [self.tokenizer.eos_id]
-
-            if role == "assistant" and msg.get("train", True):
-                # Loss on assistant content + eos, but not on the role token
-                turn_labels = [-100] + content_ids + [self.tokenizer.eos_id]
-            else:
-                turn_labels = [-100] * len(turn_ids)
-
-            input_ids.extend(turn_ids)
-            labels.extend(turn_labels)
-
-        # Shift: input is all tokens except last, labels are all tokens except first
-        # This way input_ids[i] predicts labels[i] = token at position i+1
-        input_ids = input_ids[: self.max_seq_len + 1]
-        labels = labels[: self.max_seq_len + 1]
-
-        x = input_ids[:-1]
-        y = labels[1:]
-
-        # Pad
-        pad_len = self.max_seq_len - len(x)
-        x = x + [self.tokenizer.pad_id] * pad_len
-        y = y + [-100] * pad_len
-
-        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+    def sequence_lengths(self) -> np.ndarray:
+        if getattr(self, "_encoded", None) is not None:
+            return np.asarray([item.length for item in self._encoded], dtype=np.int32)
+        return np.asarray(
+            [
+                encode_sft_example(example, self.tokenizer, self.max_seq_len).length
+                for example in self.examples
+            ],
+            dtype=np.int32,
+        )
 
 
 def train_val_split(dataset: Dataset, val_fraction: float = 0.05, seed: int = 42):

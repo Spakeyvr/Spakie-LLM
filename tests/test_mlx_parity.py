@@ -72,12 +72,9 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         from mlx.utils import tree_unflatten
 
         state = {k: v.detach().cpu().numpy() for k, v in torch_model.state_dict().items()}
-        # Shared embedding names match directly. RoPE models intentionally have
-        # no learned position table.
+        # Shared embedding names match directly.
         overrides: dict[str, mx.array] = {}
         overrides["tok_emb.weight"] = mx.array(state["tok_emb.weight"])
-        if "pos_emb.weight" in state:
-            overrides["pos_emb.weight"] = mx.array(state["pos_emb.weight"])
         overrides["ln_f.weight"] = mx.array(state["ln_f.weight"])
         if "ln_f.bias" in state:
             overrides["ln_f.bias"] = mx.array(state["ln_f.bias"])
@@ -594,6 +591,42 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         self.assertLess(np.max(np.abs(first_np[0] - packed_np[0, :4])), 1e-5)
         self.assertLess(np.max(np.abs(second_np[0] - packed_np[0, 4:7])), 1e-5)
 
+    def test_mfa_varlen_packed_segments_match_separate_mlx_logits(self):
+        import mlx.core as mx
+
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        config.attention_backend = "mfa-varlen"
+        config.refresh_derived_fields()
+        mlx_model = SpakieGPTMLX(config)
+        mlx_model.eval()
+
+        first = np.array([[3, 7, 11, 2]], dtype=np.int32)
+        second = np.array([[5, 9, 13]], dtype=np.int32)
+        packed = np.array([[3, 7, 11, 2, 5, 9, 13]], dtype=np.int32)
+        segments = np.array([[0, 0, 0, 0, 1, 1, 1]], dtype=np.int32)
+        positions = np.array([[0, 1, 2, 3, 0, 1, 2]], dtype=np.int32)
+        indices = np.arange(7, dtype=np.int32)
+        cu_seqlens = np.array([0, 4, 7], dtype=np.int32)
+
+        first_logits, _, _ = mlx_model(mx.array(first))
+        second_logits, _, _ = mlx_model(mx.array(second))
+        packed_logits, _, _ = mlx_model(
+            mx.array(packed),
+            segment_ids=mx.array(segments),
+            position_ids=mx.array(positions),
+            varlen_indices=mx.array(indices),
+            varlen_cu_seqlens=mx.array(cu_seqlens),
+        )
+        mx.eval(first_logits, second_logits, packed_logits)
+
+        first_np = np.asarray(first_logits.astype(mx.float32))
+        second_np = np.asarray(second_logits.astype(mx.float32))
+        packed_np = np.asarray(packed_logits.astype(mx.float32))
+        self.assertLess(np.max(np.abs(first_np[0] - packed_np[0, :4])), 1e-4)
+        self.assertLess(np.max(np.abs(second_np[0] - packed_np[0, 4:7])), 1e-4)
+
     def test_mlx_muon_failure_does_not_partially_update_parameters(self):
         import mlx.core as mx
         from mlx.utils import tree_flatten, tree_map
@@ -654,6 +687,24 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         self.assertEqual(before.dtype, mx.float32)
         self.assertEqual(after.dtype, mx.float32)
         self.assertTrue(np.any(np.asarray(after) != np.asarray(before)))
+
+    def test_mlx_optimizer_rejects_checkpoint_without_fp32_master_parameters(self):
+        from model.transformer_mlx import SpakieGPTMLX
+        from training.optimizers_mlx import configure_mlx_optimizer
+
+        config = self._tiny_config()
+        model = SpakieGPTMLX(config)
+        optimizer = configure_mlx_optimizer(
+            model,
+            config,
+            kind="muon",
+            learning_rate=1e-3,
+            weight_decay=0.1,
+        )
+        state = optimizer.state_trees()
+        del state["master"]
+        with self.assertRaisesRegex(ValueError, "missing FP32 master parameters"):
+            optimizer.load_state_trees(state)
 
     def test_mlx_atomic_checkpoint_failure_preserves_previous_generation(self):
         import os

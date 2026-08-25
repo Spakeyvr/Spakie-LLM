@@ -16,7 +16,6 @@ from functools import partial
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
-import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 
@@ -26,6 +25,7 @@ from model.transformer_mlx import SpakieGPTMLX
 from runtime.checkpoint_io import (
     checkpoint_processed_data_fingerprint,
     checkpoint_tokenizer_contract,
+    load_mlx_checkpoint_config,
 )
 from runtime.mlx_backend import (
     MLXRuntimeSettings,
@@ -53,52 +53,6 @@ from training.muon_core import (
 )
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.prefetch_mlx import BatchPrefetcher
-
-
-def _split_decay_grads(grads):
-    """Return (decay_subset, nodecay_subset) of a grad tree. Split by ndim >= 2."""
-    flat = tree_flatten(grads)
-    decay = [(k, v) for k, v in flat if v is not None and v.ndim >= 2]
-    nodecay = [(k, v) for k, v in flat if v is not None and v.ndim < 2]
-    return tree_unflatten(decay), tree_unflatten(nodecay)
-
-
-class DualAdamW:
-    """Two AdamW optimizers: one with weight decay on >=2D params, one without on <2D params.
-
-    Mirrors the PyTorch param-group pattern from training/pretrain.py.
-    """
-
-    def __init__(self, learning_rate: float, weight_decay: float, betas: tuple[float, float]):
-        self._betas = betas
-        self._weight_decay = weight_decay
-        self.decay = optim.AdamW(
-            learning_rate=learning_rate, weight_decay=weight_decay, betas=betas
-        )
-        self.nodecay = optim.AdamW(
-            learning_rate=learning_rate, weight_decay=0.0, betas=betas
-        )
-
-    @property
-    def learning_rate(self):
-        return self.decay.learning_rate
-
-    def set_lr(self, lr: float) -> None:
-        self.decay.learning_rate = lr
-        self.nodecay.learning_rate = lr
-
-    def update(self, model, grads) -> None:
-        decay_grads, nodecay_grads = _split_decay_grads(grads)
-        self.decay.update(model, decay_grads)
-        self.nodecay.update(model, nodecay_grads)
-
-    def state_trees(self) -> dict:
-        return {"decay": self.decay.state, "nodecay": self.nodecay.state}
-
-    def load_state_trees(self, state: dict) -> None:
-        # Assigning to .state rehydrates the internal moments; MLX optimizers accept this.
-        self.decay.state = state["decay"]
-        self.nodecay.state = state["nodecay"]
 
 
 def get_lr(step: int, config: SpakieConfig) -> float:
@@ -426,7 +380,7 @@ def _restore_rng(state: dict | None) -> None:
 class AsyncCheckpointWriter:
     """Serializes safetensors writes onto a worker thread.
 
-    The producer (training loop) calls `submit(path, flat, meta, meta_path)`
+    The producer (training loop) calls `submit(path, flat, meta)`
     after having eval'd the array dict on the main thread, so the arrays are
     materialized and safe to hand off. Only one write is in flight at a time;
     submitting a second one blocks until the first finishes. `join()` waits
@@ -437,7 +391,7 @@ class AsyncCheckpointWriter:
         self._thread: threading.Thread | None = None
         self._error: BaseException | None = None
 
-    def submit(self, path: str, flat: dict[str, mx.array], meta: dict, meta_path: str) -> None:
+    def submit(self, path: str, flat: dict[str, mx.array], meta: dict) -> None:
         self.join()
 
         def _work() -> None:
@@ -450,7 +404,7 @@ class AsyncCheckpointWriter:
         self._thread = thread
         thread.start()
 
-    def write_sync(self, path: str, flat: dict[str, mx.array], meta: dict, meta_path: str) -> None:
+    def write_sync(self, path: str, flat: dict[str, mx.array], meta: dict) -> None:
         self.join()
         if flat:
             mx.eval(*flat.values())
@@ -564,7 +518,7 @@ def save_training_checkpoint_mlx(
     writer: AsyncCheckpointWriter | None = None,
     sync: bool = False,
 ) -> None:
-    """Write a .safetensors weights file plus a sibling .meta.json.
+    """Write a self-contained .safetensors checkpoint with embedded metadata.
 
     When `writer` is provided and `sync=False`, the actual I/O happens on a
     worker thread; the caller is responsible for keeping the writer alive and
@@ -583,13 +537,11 @@ def save_training_checkpoint_mlx(
         elapsed_time=elapsed_time,
         train_sampler=train_sampler,
     )
-    meta_path = base_path + ".meta.json"
-
     if writer is not None and not sync:
         # Materialize on the main thread so the worker only does I/O.
         if flat:
             mx.eval(*flat.values())
-        writer.submit(base_path, flat, meta, meta_path)
+        writer.submit(base_path, flat, meta)
         return
 
     if flat:
@@ -625,10 +577,17 @@ def _json_restore(obj):
 
 
 def load_training_checkpoint_mlx(base_path: str) -> dict:
-    flat = load_safetensors(base_path)
+    # Validate the exact current config contract before mapping large tensors.
+    load_mlx_checkpoint_config(base_path)
     meta = load_safetensors_checkpoint_meta(base_path)
     if meta is None:
         raise ValueError(f"Missing metadata for MLX training checkpoint '{base_path}'")
+    sampler_meta = meta.get("sampler", {})
+    if isinstance(sampler_meta, dict) and "indices" in sampler_meta:
+        raise ValueError(
+            f"MLX checkpoint '{base_path}' stores sampler indices in obsolete metadata"
+        )
+    flat = load_safetensors(base_path)
 
     model_flat: dict[str, mx.array] = {}
     optimizer_sections: dict[str, dict[str, mx.array]] = {}
@@ -642,8 +601,6 @@ def load_training_checkpoint_mlx(base_path: str) -> dict:
         elif key == "sampler.indices":
             sampler_indices = np.asarray(arr, dtype=np.int64)
 
-    # New checkpoints store sampler indices in safetensors. Older checkpoints
-    # still have them in meta["sampler"]["indices"], which remains supported.
     if sampler_indices is not None:
         meta.setdefault("sampler", {})["indices"] = sampler_indices
 
@@ -730,11 +687,6 @@ def pretrain_mlx(
     if resume_state:
         if "optimizer" in resume_state:
             optimizer.load_state_trees(resume_state["optimizer"])
-        # Older checkpoints predate FP32 master parameters. In that case seed
-        # the new master copy from the restored runtime-dtype model exactly
-        # once; checkpoints that contain a master tree keep their precision.
-        if hasattr(optimizer, "sync_master_from_model"):
-            optimizer.sync_master_from_model(model)
         meta = resume_state["meta"]
         best_val_loss = float(meta.get("best_val_loss", best_val_loss))
         global_step = int(meta.get("step", 0))

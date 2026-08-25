@@ -46,28 +46,20 @@ def load_torch_checkpoint(
     path: str,
     *,
     map_location: Any = "cpu",
-    trust_checkpoint: bool = False,
 ) -> dict:
-    """Load a checkpoint without executing arbitrary pickle globals by default.
-
-    Legacy checkpoints containing custom Python objects can still be loaded, but
-    only after the caller explicitly opts into normal pickle execution.
-    """
+    """Load a checkpoint without executing arbitrary pickle globals."""
     import torch
 
     try:
         checkpoint = torch.load(
             path,
             map_location=map_location,
-            weights_only=not trust_checkpoint,
+            weights_only=True,
         )
     except Exception as exc:
-        if trust_checkpoint:
-            raise
         raise UnsafeCheckpointError(
             f"Checkpoint '{path}' was rejected by PyTorch's safe loader. "
-            "Only use --trust-checkpoint for a legacy file you created or have "
-            "independently verified; that option permits arbitrary pickle code execution."
+            "Spakie does not execute unrestricted checkpoint pickle payloads."
         ) from exc
     if not isinstance(checkpoint, dict):
         raise ValueError(f"Checkpoint '{path}' must contain a dictionary payload")
@@ -104,25 +96,14 @@ def validate_checkpoint_tokenizer(
     tokenizer_path: str,
     *,
     source: str,
-    allow_unverified: bool = False,
 ) -> None:
     saved = metadata.get("tokenizer") if isinstance(metadata, dict) else None
     if not isinstance(saved, dict):
-        if allow_unverified:
-            print(f"WARNING: checkpoint '{source}' has no tokenizer provenance")
-            return
         raise ValueError(
-            f"Checkpoint '{source}' has no tokenizer provenance. Pass "
-            "--allow-unverified-tokenizer only after verifying the tokenizer manually."
+            f"Checkpoint '{source}' has no tokenizer provenance."
         )
     current = tokenizer_contract(tokenizer_path)
     if current != saved:
-        if allow_unverified:
-            print(
-                f"WARNING: checkpoint '{source}' tokenizer contract does not match "
-                f"{tokenizer_path}"
-            )
-            return
         raise ValueError(
             f"Checkpoint '{source}' was created with a different tokenizer contract."
         )
@@ -133,7 +114,6 @@ def validate_checkpoint_processed_data(
     processed_dir: str,
     *,
     source: str,
-    allow_unverified: bool = False,
 ) -> None:
     saved = (
         metadata.get("processed_data_manifest_sha256")
@@ -143,31 +123,21 @@ def validate_checkpoint_processed_data(
     try:
         current = processed_manifest_sha256(processed_dir)
     except FileNotFoundError as exc:
-        if allow_unverified:
-            print(f"WARNING: processed data for checkpoint '{source}' has no manifest")
-            return
         raise ValueError(
             f"Processed data for checkpoint '{source}' has no completion manifest."
         ) from exc
     if not isinstance(saved, str) or not saved:
-        if allow_unverified:
-            print(f"WARNING: checkpoint '{source}' has no processed-data fingerprint")
-            return
         raise ValueError(
-            f"Checkpoint '{source}' has no processed-data generation fingerprint. "
-            "Pass --unsafe-skip-data-validation only after verifying the data manually."
+            f"Checkpoint '{source}' has no processed-data generation fingerprint."
         )
     if saved != current:
-        if allow_unverified:
-            print(f"WARNING: checkpoint '{source}' used a different data generation")
-            return
         raise ValueError(
             f"Checkpoint '{source}' was created from a different processed-data generation."
         )
 
 
 def load_mlx_checkpoint_meta(path: str) -> dict | None:
-    """Load authoritative embedded MLX metadata, with sidecar fallback."""
+    """Load authoritative metadata embedded in an MLX checkpoint."""
     from runtime.mlx_backend import load_safetensors_checkpoint_meta
 
     payload = load_safetensors_checkpoint_meta(path)
@@ -178,22 +148,14 @@ def load_mlx_checkpoint_meta(path: str) -> dict | None:
     return payload
 
 
-def mlx_checkpoint_config_payload(
-    path: str,
-    *,
-    allow_legacy_config: bool,
-) -> dict | None:
+def mlx_checkpoint_config_payload(path: str) -> dict:
     """Return the full saved config or reject semantically ambiguous weights."""
     meta = load_mlx_checkpoint_meta(path)
     payload = meta.get("config") if meta else None
     if isinstance(payload, dict):
         return payload
-    if allow_legacy_config:
-        return None
     raise ValueError(
-        f"MLX checkpoint '{path}' predates full configuration metadata. "
-        "Refusing to guess semantic model fields. Pass --allow-legacy-config "
-        "only after verifying the checkpoint's original configuration."
+        f"MLX checkpoint '{path}' has no full configuration metadata."
     )
 
 
@@ -205,43 +167,27 @@ def config_from_checkpoint_payload(
 ) -> SpakieConfig:
     """Restore a configuration from a new primitive checkpoint payload.
 
-    Old trusted Torch checkpoints may contain a ``SpakieConfig`` instance;
-    accepting that object is safe only because reaching here required the
-    caller to opt into unsafe pickle loading explicitly.
+    Only primitive dictionaries from the current schema are accepted.
     """
-    if isinstance(payload, SpakieConfig):
-        return payload
     if not isinstance(payload, dict):
         raise ValueError(f"Checkpoint '{source}' is missing full configuration metadata")
-    if schema_version not in {1, CHECKPOINT_CONFIG_SCHEMA_VERSION}:
+    if schema_version != CHECKPOINT_CONFIG_SCHEMA_VERSION:
         raise ValueError(
             f"Checkpoint '{source}' uses unsupported config schema {schema_version!r}; "
-            f"supported schemas are 1 and {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
+            f"required schema is {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
         )
     return config_from_dict(payload)
 
 
-def load_mlx_checkpoint_config(
-    path: str,
-    *,
-    allow_legacy_config: bool = False,
-) -> SpakieConfig | None:
-    """Restore the semantic config saved beside MLX weights.
-
-    Returning ``None`` is reserved for an explicit legacy opt-in. New files
-    must carry both a supported schema marker and a complete config object.
-    """
+def load_mlx_checkpoint_config(path: str) -> SpakieConfig:
+    """Restore the current semantic config saved beside MLX weights."""
     meta = load_mlx_checkpoint_meta(path)
-    payload = mlx_checkpoint_config_payload(
-        path, allow_legacy_config=allow_legacy_config
-    )
-    if payload is None:
-        return None
+    payload = mlx_checkpoint_config_payload(path)
     version = meta.get("config_schema_version") if meta else None
-    if version not in {1, CHECKPOINT_CONFIG_SCHEMA_VERSION}:
+    if version != CHECKPOINT_CONFIG_SCHEMA_VERSION:
         raise ValueError(
             f"MLX checkpoint '{path}' uses unsupported config schema {version!r}; "
-            f"supported schemas are 1 and {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
+            f"required schema is {CHECKPOINT_CONFIG_SCHEMA_VERSION}."
         )
     return config_from_dict(payload)
 

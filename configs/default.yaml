@@ -24,18 +24,16 @@ defaults:
   n_kv_heads: 0
   d_model: 768
   d_ff: 3072
-  mlp_type: gelu
-  gelu_variant: fast
+  mlp_type: swiglu
   norm_type: rmsnorm
-  qk_norm: false
-  # Existing checkpoints use learned absolute position embeddings. New v2
-  # presets opt into RoPE without changing the tensor structure of old models.
-  position_encoding: learned
+  qk_norm: true
+  # Canonical models use RoPE; learned position embeddings are unsupported.
+  position_encoding: rope
   rope_theta: 100000.0
   loss_layout: custom
   residual_type: serial
   # Hidden size for SwiGLU MLPs. 0 uses d_ff. Only used when mlp_type=swiglu.
-  swiglu_hidden: 0
+  swiglu_hidden: 2048
   max_seq_len: 2048
   dropout: 0.0
   bias: false
@@ -171,12 +169,17 @@ presets:
     # 60-step real-data probe (final loss identical, max delta 0.81%).
     n_kv_heads: 4
     d_ff: 3072
+    mlp_type: swiglu
+    swiglu_hidden: 2048
+    qk_norm: true
+    position_encoding: rope
+    rope_theta: 100000.0
     activation_checkpointing: false
-    pretrain_batch_size: 23
-    pretrain_grad_accum_steps: 1
+    pretrain_batch_size: 16
+    pretrain_grad_accum_steps: 4
     pretrain_lr: 6.0e-4
-    sft_batch_size: 23
-    sft_grad_accum_steps: 2
+    sft_batch_size: 16
+    sft_grad_accum_steps: 4
     sft_lr: 1.5e-5
     sft_epochs: 1
 

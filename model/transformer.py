@@ -12,10 +12,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import SpakieConfig
 
 
+_SDPA_SUPPORTS_GQA: bool | None = None
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     position_ids: torch.Tensor,
     theta: float,
+    inv_freq: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply Llama-style half-rotation RoPE to ``[B, T, H, D]`` Q/K tensors."""
     head_dim = x.shape[-1]
@@ -25,11 +29,12 @@ def apply_rotary_emb(
     positions = position_ids
     if positions.ndim == 1:
         positions = positions.unsqueeze(0)
-    inv_freq = torch.exp(
-        -math.log(theta)
-        * torch.arange(half_dim, dtype=torch.float32, device=x.device)
-        / half_dim
-    )
+    if inv_freq is None:
+        inv_freq = torch.exp(
+            -math.log(theta)
+            * torch.arange(half_dim, dtype=torch.float32, device=x.device)
+            / half_dim
+        )
     angles = positions.to(device=x.device, dtype=torch.float32).unsqueeze(-1) * inv_freq
     cos = angles.cos().to(dtype=x.dtype).unsqueeze(2)
     sin = angles.sin().to(dtype=x.dtype).unsqueeze(2)
@@ -40,13 +45,21 @@ def apply_rotary_emb(
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        assert config.d_model % config.n_heads == 0
+        if config.d_model % config.n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads or config.n_heads
-        assert self.n_heads % self.n_kv_heads == 0
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads")
         self.head_dim = config.d_model // config.n_heads
-        self.position_encoding = config.position_encoding
         self.rope_theta = config.rope_theta
+        half_dim = self.head_dim // 2
+        rope_inv_freq = torch.exp(
+            -math.log(self.rope_theta)
+            * torch.arange(half_dim, dtype=torch.float32)
+            / half_dim
+        )
+        self.register_buffer("rope_inv_freq", rope_inv_freq, persistent=False)
 
         if self.n_kv_heads == self.n_heads:
             self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
@@ -72,7 +85,10 @@ class CausalSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        return_cache: bool = False,
+    ):
         B, T, C = x.shape
         if self.qkv is not None:
             qkv = self.qkv(x)
@@ -87,60 +103,77 @@ class CausalSelfAttention(nn.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        if self.position_encoding == "rope":
-            if position_ids is None:
-                position_ids = torch.arange(T, dtype=torch.long, device=x.device)
-            q = apply_rotary_emb(q, position_ids, self.rope_theta)
-            k = apply_rotary_emb(k, position_ids, self.rope_theta)
+        if position_ids is None:
+            position_ids = torch.arange(T, dtype=torch.long, device=x.device)
+        q = apply_rotary_emb(q, position_ids, self.rope_theta, self.rope_inv_freq)
+        k = apply_rotary_emb(k, position_ids, self.rope_theta, self.rope_inv_freq)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
+        if cache is not None:
+            cached_k, cached_v = cache
+            k = torch.cat((cached_k, k), dim=2)
+            v = torch.cat((cached_v, v), dim=2)
+        new_cache = (k, v) if return_cache else None
+
+        if cache is None:
+            attention_mask = None
+            is_causal = True
+        else:
+            # SDPA's rectangular causal alignment is backend/version sensitive.
+            # Build the lower-right mask explicitly for cached chunks; the usual
+            # one-token decode consequently attends to every cached key.
+            key_length = k.shape[2]
+            past_length = key_length - T
+            query_positions = torch.arange(T, device=x.device)[:, None] + past_length
+            key_positions = torch.arange(key_length, device=x.device)[None, :]
+            attention_mask = key_positions <= query_positions
+            is_causal = False
+
         dropout_p = self.attn_dropout.p if self.training else 0.0
         if self.n_kv_heads == self.n_heads:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dropout_p)
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attention_mask,
+                is_causal=is_causal, dropout_p=dropout_p,
+            )
         else:
-            try:
-                y = F.scaled_dot_product_attention(
-                    q, k, v, is_causal=True, dropout_p=dropout_p, enable_gqa=True
-                )
-            except TypeError:
+            global _SDPA_SUPPORTS_GQA
+            if _SDPA_SUPPORTS_GQA is not False:
+                try:
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attention_mask,
+                        is_causal=is_causal, dropout_p=dropout_p, enable_gqa=True,
+                    )
+                    _SDPA_SUPPORTS_GQA = True
+                except TypeError as exc:
+                    if "enable_gqa" not in str(exc):
+                        raise
+                    _SDPA_SUPPORTS_GQA = False
+            if _SDPA_SUPPORTS_GQA is False:
                 repeat = self.n_heads // self.n_kv_heads
-                k = k.repeat_interleave(repeat, dim=1)
-                v = v.repeat_interleave(repeat, dim=1)
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dropout_p)
+                expanded_k = k.repeat_interleave(repeat, dim=1)
+                expanded_v = v.repeat_interleave(repeat, dim=1)
+                y = F.scaled_dot_product_attention(
+                    q, expanded_k, expanded_v, attn_mask=attention_mask,
+                    is_causal=is_causal, dropout_p=dropout_p,
+                )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.out_proj(y))
+        output = self.resid_dropout(self.out_proj(y))
+        return (output, new_cache) if return_cache else output
 
 
 class MLP(nn.Module):
     def __init__(self, config: SpakieConfig):
         super().__init__()
-        self.mlp_type = config.mlp_type
-        self.gelu_variant = config.gelu_variant
-        if self.mlp_type == "swiglu":
-            hidden = config.swiglu_hidden or config.d_ff
-            self.gate_up = nn.Linear(config.d_model, 2 * hidden, bias=config.bias)
-            self.down = nn.Linear(hidden, config.d_model, bias=config.bias)
-            self.fc1 = None
-            self.fc2 = None
-        else:
-            self.fc1 = nn.Linear(config.d_model, config.d_ff, bias=config.bias)
-            self.fc2 = nn.Linear(config.d_ff, config.d_model, bias=config.bias)
-            self.gate_up = None
-            self.down = None
+        hidden = config.swiglu_hidden or config.d_ff
+        self.gate_up = nn.Linear(config.d_model, 2 * hidden, bias=config.bias)
+        self.down = nn.Linear(hidden, config.d_model, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.mlp_type == "swiglu":
-            gate, up = self.gate_up(x).chunk(2, dim=-1)
-            return self.dropout(self.down(F.silu(gate) * up))
-        h = self.fc1(x)
-        if self.gelu_variant == "fast":
-            h = h * torch.sigmoid(1.702 * h)
-        else:
-            h = F.gelu(h)
-        return self.dropout(self.fc2(h))
+        gate, up = self.gate_up(x).chunk(2, dim=-1)
+        return self.dropout(self.down(F.silu(gate) * up))
 
 
 class TransformerBlock(nn.Module):
@@ -164,14 +197,25 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        return_cache: bool = False,
+    ):
         h = self.ln1(x)
-        attn_out = self.attn(h, position_ids)
+        attention_result = self.attn(
+            h, position_ids, cache=cache, return_cache=return_cache
+        )
+        if return_cache:
+            attn_out, new_cache = attention_result
+        else:
+            attn_out = attention_result
+            new_cache = None
         if self.residual_type == "parallel":
-            return x + attn_out + self.mlp(h)
+            output = x + attn_out + self.mlp(h)
+            return (output, new_cache) if return_cache else output
         x = x + attn_out
         x = x + self.mlp(self.ln2(x))
-        return x
+        return (x, new_cache) if return_cache else x
 
 
 class SpakieGPT(nn.Module):
@@ -179,11 +223,6 @@ class SpakieGPT(nn.Module):
         super().__init__()
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = (
-            nn.Embedding(config.max_seq_len, config.d_model)
-            if config.position_encoding == "learned"
-            else None
-        )
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
         self.ln_f = (
@@ -200,10 +239,7 @@ class SpakieGPT(nn.Module):
         # Scale residual projections
         for block in self.blocks:
             nn.init.normal_(block.attn.out_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
-            if block.mlp.mlp_type == "swiglu":
-                nn.init.normal_(block.mlp.down.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
-            else:
-                nn.init.normal_(block.mlp.fc2.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
+            nn.init.normal_(block.mlp.down.weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -223,25 +259,45 @@ class SpakieGPT(nn.Module):
         targets: torch.Tensor | None = None,
         *,
         position_ids: torch.Tensor | None = None,
+        cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cache_offset: int = 0,
+        return_cache: bool = False,
     ):
         B, T = idx.shape
-        assert T <= self.config.max_seq_len, f"Sequence length {T} exceeds max {self.config.max_seq_len}"
+        if T + cache_offset > self.config.max_seq_len:
+            raise ValueError(
+                f"Sequence length {T + cache_offset} exceeds max {self.config.max_seq_len}"
+            )
+        if cache is not None and len(cache) != len(self.blocks):
+            raise ValueError("KV cache layer count does not match the model")
 
         pos = (
             position_ids
             if position_ids is not None
-            else torch.arange(0, T, dtype=torch.long, device=idx.device)
+            else torch.arange(cache_offset, cache_offset + T, dtype=torch.long, device=idx.device)
         )
         x = self.tok_emb(idx)
-        if self.pos_emb is not None:
-            x = x + self.pos_emb(pos)
         x = self.drop(x)
 
-        for block in self.blocks:
-            if self.training and self.config.activation_checkpointing:
+        new_caches = [] if return_cache else None
+        for block_index, block in enumerate(self.blocks):
+            block_cache = cache[block_index] if cache is not None else None
+            if (
+                self.training
+                and self.config.activation_checkpointing
+                and cache is None
+                and not return_cache
+            ):
                 x = checkpoint(block, x, pos, use_reentrant=False)
             else:
-                x = block(x, pos)
+                block_result = block(
+                    x, pos, cache=block_cache, return_cache=return_cache
+                )
+                if return_cache:
+                    x, new_cache = block_result
+                    new_caches.append(new_cache)
+                else:
+                    x = block_result
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -250,4 +306,6 @@ class SpakieGPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
 
+        if return_cache:
+            return logits, loss, new_caches
         return logits, loss

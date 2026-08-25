@@ -113,7 +113,7 @@ The default pretraining optimizer is **Muon** (with AdamW fallback gated by `--a
 
 ### Checkpoints
 
-Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `smoke_sft/` subdirs for smoke runs. `checkpoint_search_dirs()` in `configs/default.py` lists fallback dirs used by `chat.py --list-models` and resume logic. `pretrain_interrupt.pt` is the rolling resume checkpoint written by the pretrain loop; `--resume` picks it up automatically. `inherit_model_shape()` re-applies model shape from a checkpoint's saved config so chat/finetune work even if the active preset differs.
+Per-preset directory under `checkpoints/<preset>/`, with `smoke_pretrain/` and `smoke_sft/` subdirs for smoke runs. `checkpoint_search_dirs()` in `configs/default.py` lists fallback dirs used by `chat.py --list-models` and resume logic. Checkpoints must contain the exact current configuration schema and provenance; older or incomplete formats are rejected rather than inferred. `pretrain_interrupt.pt` is the rolling resume checkpoint written by the pretrain loop; `--resume` picks it up automatically.
 
 ### Chat template
 

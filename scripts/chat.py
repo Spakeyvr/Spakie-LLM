@@ -9,8 +9,6 @@ from configs.default import (
     SUPPORTED_PRESETS,
     checkpoint_search_dirs,
     get_preset_config,
-    inherit_attention_shape_from_tensors,
-    inherit_mlp_shape_from_tensors,
 )
 from runtime import DEVICE_CHOICES, PRECISION_CHOICES
 from runtime.checkpoint_io import (
@@ -174,24 +172,16 @@ def run_torch_chat(args, config, ckpt_path):
     print(f"Precision: {runtime.precision}")
 
     print(f"Loading checkpoint: {ckpt_path}")
-    ckpt = load_torch_checkpoint(
-        ckpt_path, map_location=device, trust_checkpoint=args.trust_checkpoint
+    ckpt = load_torch_checkpoint(ckpt_path, map_location=device)
+    config = config_from_checkpoint_payload(
+        ckpt.get("config"), source=ckpt_path,
+        schema_version=ckpt.get("config_schema_version"),
     )
-    if "config" in ckpt:
-        config = config_from_checkpoint_payload(
-            ckpt["config"], source=ckpt_path,
-            schema_version=ckpt.get("config_schema_version"),
-        )
-    elif not args.allow_legacy_config:
-        raise ValueError(
-            "Checkpoint has no full config. Pass --allow-legacy-config only for a verified legacy file."
-        )
     tok_path = args.tokenizer or (config.tokenizer_prefix + ".model")
     validate_checkpoint_tokenizer(
         ckpt,
         tok_path,
         source=ckpt_path,
-        allow_unverified=args.allow_unverified_tokenizer,
     )
     discard_training_state(ckpt)
     model = SpakieGPT(config)
@@ -237,26 +227,18 @@ def run_mlx_chat(args, config, ckpt_path):
     print(f"Precision: {runtime.precision}")
 
     print(f"Loading checkpoint: {ckpt_path}")
+    config = load_mlx_checkpoint_config(ckpt_path)
     flat = load_safetensors(ckpt_path)
     model_flat = {k[len("model."):]: v for k, v in flat.items() if k.startswith("model.")}
     if not model_flat:
         print(f"Error: no 'model.*' tensors found in {ckpt_path}")
         sys.exit(1)
-    saved_config = load_mlx_checkpoint_config(
-        ckpt_path, allow_legacy_config=args.allow_legacy_config
-    )
-    if saved_config is not None:
-        config = saved_config
-    else:
-        config = inherit_attention_shape_from_tensors(config, model_flat)
-        config = inherit_mlp_shape_from_tensors(config, model_flat)
 
     tok_path = args.tokenizer or (config.tokenizer_prefix + ".model")
     validate_checkpoint_tokenizer(
         load_mlx_checkpoint_meta(ckpt_path),
         tok_path,
         source=ckpt_path,
-        allow_unverified=args.allow_unverified_tokenizer,
     )
 
     model = SpakieGPTMLX(config)
@@ -324,12 +306,6 @@ def main():
                         help="Optional system message to include in chat prompts")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto", help="Execution device (torch backend)")
     parser.add_argument("--precision", choices=PRECISION_CHOICES, default="auto", help="Execution precision")
-    parser.add_argument("--trust-checkpoint", action="store_true",
-                        help="Allow unsafe Python pickle loading for a trusted legacy Torch checkpoint")
-    parser.add_argument("--allow-legacy-config", action="store_true",
-                        help="Allow shape guessing for verified legacy checkpoints without full config metadata")
-    parser.add_argument("--allow-unverified-tokenizer", action="store_true",
-                        help="Allow a legacy checkpoint without tokenizer identity metadata")
     args = parser.parse_args()
 
     available_models = list_available_models(args.backend, args.preset)

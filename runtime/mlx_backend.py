@@ -119,7 +119,7 @@ def _safetensors_header_metadata(path: str) -> dict[str, str]:
 
 
 def load_safetensors_checkpoint_meta(path: str) -> dict | None:
-    """Load authoritative in-file metadata, with legacy sidecar fallback."""
+    """Load authoritative metadata embedded in a safetensors checkpoint."""
     header_meta = _safetensors_header_metadata(path)
     embedded = header_meta.get("checkpoint_meta")
     if embedded:
@@ -127,8 +127,7 @@ def load_safetensors_checkpoint_meta(path: str) -> dict | None:
         if not isinstance(payload, dict):
             raise ValueError(f"Embedded checkpoint metadata in '{path}' must be an object")
         return payload
-    sidecar = path + ".meta.json"
-    return load_meta_json(sidecar) if os.path.exists(sidecar) else None
+    return None
 
 
 def save_safetensors_checkpoint(path: str, arrays: dict[str, mx.array], meta: dict) -> None:
@@ -138,10 +137,6 @@ def save_safetensors_checkpoint(path: str, arrays: dict[str, mx.array], meta: di
     generation = uuid.uuid4().hex
     weights_tmp = os.path.join(
         directory, f".{os.path.basename(path)}.{generation}.tmp.safetensors"
-    )
-    meta_path = path + ".meta.json"
-    meta_tmp = os.path.join(
-        directory, f".{os.path.basename(meta_path)}.{generation}.tmp"
     )
     published_meta = dict(meta)
     published_meta["checkpoint_generation"] = generation
@@ -156,15 +151,6 @@ def save_safetensors_checkpoint(path: str, arrays: dict[str, mx.array], meta: di
         )
         with open(weights_tmp, "rb") as handle:
             os.fsync(handle.fileno())
-        with open(meta_tmp, "w", encoding="utf-8") as handle:
-            json.dump(published_meta, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # The complete metadata is embedded in the weights file, so its atomic
-        # rename is the single commit point. Publish the compatibility sidecar
-        # first: a crash before the weights rename still leaves the previous
-        # in-file generation authoritative and loadable.
-        os.replace(meta_tmp, meta_path)
         os.replace(weights_tmp, path)
         dir_fd = os.open(directory, os.O_RDONLY)
         try:
@@ -172,20 +158,9 @@ def save_safetensors_checkpoint(path: str, arrays: dict[str, mx.array], meta: di
         finally:
             os.close(dir_fd)
     finally:
-        for temp_path in (weights_tmp, meta_tmp):
+        for temp_path in (weights_tmp,):
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
-
-
-def save_meta_json(path: str, meta: dict) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
-
-
-def load_meta_json(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def global_grad_norm(grads: Any) -> mx.array:

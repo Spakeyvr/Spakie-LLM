@@ -219,7 +219,7 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    from configs.default import get_preset_config, inherit_attention_shape_from_tensors, inherit_mlp_shape_from_tensors
+    from configs.default import get_preset_config
     from model.transformer_mlx import SpakieGPTMLX
     from runtime.checkpoint_io import (
         load_mlx_checkpoint_config,
@@ -232,12 +232,9 @@ def main() -> None:
 
     config = get_preset_config(args.preset)
     checkpoint = resolve_checkpoint(config, args.checkpoint, "mlx")
+    config = load_mlx_checkpoint_config(checkpoint)
     flat = load_safetensors(checkpoint)
     model_flat = {key[len("model."):]: value for key, value in flat.items() if key.startswith("model.")}
-    saved_config = load_mlx_checkpoint_config(checkpoint, allow_legacy_config=False)
-    config = saved_config or inherit_mlp_shape_from_tensors(
-        inherit_attention_shape_from_tensors(config, model_flat), model_flat
-    )
     validate_checkpoint_tokenizer(
         load_mlx_checkpoint_meta(checkpoint),
         config.tokenizer_prefix + ".model",

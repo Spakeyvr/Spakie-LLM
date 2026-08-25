@@ -25,6 +25,15 @@ from training.monitor import (
 )
 from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers import configure_torch_optimizer, set_optimizer_lr
+from training.pretrain import (
+    ResumableBatchSampler,
+    capture_rng_state,
+    restore_rng_state,
+)
+from training.sft_tokenization import sft_dataset_fingerprint
+
+
+SFT_RESUME_SCHEMA_VERSION = 1
 
 
 def _parameter_iter(model_or_parameters):
@@ -168,18 +177,12 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
              num_workers: int = 2,
              best_checkpoint_name: str = "sft_best.pt",
              interrupt_checkpoint_name: str = "sft_interrupt.pt",
-             allow_adamw_fallback: bool = False):
+             allow_adamw_fallback: bool = False,
+             resume_state: dict | None = None):
     model.to(runtime.device)
     model.train()
 
     loader_options = dataloader_kwargs(runtime, num_workers)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.sft_batch_size,
-        shuffle=True,
-        drop_last=True,
-        **loader_options,
-    )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.sft_batch_size,
@@ -199,13 +202,83 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
     parameters = tuple(model.parameters())
     non_blocking = runtime.device.type == "cuda"
 
-    steps_per_epoch = math.ceil(len(train_loader) / config.sft_grad_accum_steps)
+    microbatches_per_epoch = len(train_dataset) // config.sft_batch_size
+    if microbatches_per_epoch <= 0:
+        raise ValueError("SFT training split is smaller than one full microbatch")
+    steps_per_epoch = math.ceil(microbatches_per_epoch / config.sft_grad_accum_steps)
     total_steps = steps_per_epoch * config.sft_epochs
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     best_val_loss = float("inf")
     patience_counter = 0
     global_step = 0
     interrupted = False
+    start_epoch = 0
+    epoch_microbatch_offset = 0
+    committed_sampler = ResumableBatchSampler(
+        len(train_dataset), config.sft_batch_size, drop_last=True
+    )
+    resume_contract = {
+        "dataset_size": len(train_dataset),
+        "dataset_fingerprint": sft_dataset_fingerprint(train_dataset),
+        "batch_size": config.sft_batch_size,
+        "grad_accum_steps": config.sft_grad_accum_steps,
+    }
+
+    if resume_state is not None:
+        if int(resume_state.get("sft_resume_schema_version", 0)) != SFT_RESUME_SCHEMA_VERSION:
+            raise ValueError("SFT checkpoint does not contain supported resume state")
+        if resume_state.get("sft_resume_contract") != resume_contract:
+            raise ValueError(
+                "SFT resume contract differs: "
+                f"saved={resume_state.get('sft_resume_contract')}, "
+                f"requested={resume_contract}"
+            )
+        if "optimizer" in resume_state:
+            optimizer.load_state_dict(resume_state["optimizer"])
+        if "scaler" in resume_state:
+            scaler.load_state_dict(resume_state["scaler"])
+        sampler_state = resume_state.get("train_sampler")
+        if not isinstance(sampler_state, dict):
+            raise ValueError("SFT resume checkpoint has no train sampler state")
+        committed_sampler = ResumableBatchSampler.from_state_dict(sampler_state)
+        if committed_sampler.dataset_size != len(train_dataset):
+            raise ValueError("SFT resume dataset size differs from the checkpoint")
+        if committed_sampler.batch_size != config.sft_batch_size:
+            raise ValueError("SFT resume batch size differs from the checkpoint")
+        best_val_loss = float(resume_state.get("best_val_loss", best_val_loss))
+        patience_counter = int(resume_state.get("patience_counter", 0))
+        global_step = int(resume_state.get("step", 0))
+        start_epoch = int(resume_state.get("epoch_index", 0))
+        epoch_microbatch_offset = int(resume_state.get("epoch_microbatch_offset", 0))
+        if not 0 <= epoch_microbatch_offset <= microbatches_per_epoch:
+            raise ValueError("SFT resume microbatch offset is out of range")
+        restore_rng_state(resume_state.get("rng_state"))
+
+    current_epoch = start_epoch
+
+    def save_interrupt_checkpoint(path: str) -> None:
+        atomic_torch_save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
+            "optimizer_warning": "fallback_not_recommended"
+            if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
+            else "",
+            "muon_verified": config.muon_verified,
+            "sft_resume_schema_version": SFT_RESUME_SCHEMA_VERSION,
+            "sft_resume_contract": resume_contract,
+            "step": global_step,
+            "epoch_index": current_epoch,
+            "epoch_microbatch_offset": epoch_microbatch_offset,
+            "best_val_loss": best_val_loss,
+            "patience_counter": patience_counter,
+            "train_sampler": committed_sampler.state_dict(),
+            "rng_state": capture_rng_state(),
+            "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
+            "config": config_to_dict(config),
+            "tokenizer": checkpoint_tokenizer_contract(config),
+        }, path)
     status_writer = TrainingStatusWriter(
         config.checkpoint_dir,
         stage="sft",
@@ -219,7 +292,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
     atexit.register(stop_background_monitor, monitor_info)
 
     try:
-        for epoch in range(config.sft_epochs):
+        for epoch in range(start_epoch, config.sft_epochs):
+            current_epoch = epoch
             model.train()
             epoch_loss = 0.0
             n_batches = 0
@@ -228,9 +302,25 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
             pending_microbatches = 0
             pending_losses = []
 
-            pbar = tqdm(train_loader, desc=f"SFT Epoch {epoch + 1}/{config.sft_epochs}")
+            actual_sampler = ResumableBatchSampler.from_state_dict(
+                committed_sampler.state_dict()
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=actual_sampler,
+                **loader_options,
+            )
+            remaining_microbatches = microbatches_per_epoch - epoch_microbatch_offset
+            train_iter = iter(train_loader)
+            pbar = tqdm(
+                range(remaining_microbatches),
+                desc=f"SFT Epoch {epoch + 1}/{config.sft_epochs}",
+                initial=epoch_microbatch_offset,
+                total=microbatches_per_epoch,
+            )
             try:
-                for batch_idx, (x, y) in enumerate(pbar):
+                for _ in pbar:
+                    x, y = next(train_iter)
                     x = x.to(runtime.device, non_blocking=non_blocking)
                     y = y.to(runtime.device, non_blocking=non_blocking)
                     with autocast_context(runtime):
@@ -242,7 +332,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                     pending_microbatches += 1
                     pending_losses.append(loss.detach())
 
-                    if (batch_idx + 1) % config.sft_grad_accum_steps == 0:
+                    if pending_microbatches == config.sft_grad_accum_steps:
+                        committed_microbatches = pending_microbatches
                         epoch_loss, recorded = _consume_logged_losses(
                             pending_losses,
                             epoch_loss,
@@ -265,6 +356,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                         pending_grads = False
                         pending_microbatches = 0
                         global_step += 1
+                        committed_sampler.advance_batches(committed_microbatches)
+                        epoch_microbatch_offset += committed_microbatches
                         status_writer.update(
                             status="running",
                             epoch=epoch + 1,
@@ -278,6 +371,7 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                 pbar.close()
 
             if pending_grads:
+                committed_microbatches = pending_microbatches
                 epoch_loss, recorded = _consume_logged_losses(
                     pending_losses,
                     epoch_loss,
@@ -298,6 +392,8 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                 )
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                committed_sampler.advance_batches(committed_microbatches)
+                epoch_microbatch_offset += committed_microbatches
                 status_writer.update(
                     status="running",
                     epoch=epoch + 1,
@@ -309,7 +405,10 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
 
             # Validation
             val_loss = _evaluate_sft_loss(model, val_loader, runtime)
-            print(f"Epoch {epoch + 1} | train_loss {epoch_loss / n_batches:.4f} | val_loss {val_loss:.4f}")
+            print(
+                f"Epoch {epoch + 1} | train_loss "
+                f"{epoch_loss / max(n_batches, 1):.4f} | val_loss {val_loss:.4f}"
+            )
             status_writer.update(
                 force=True,
                 status="running",
@@ -360,23 +459,13 @@ def finetune(model: SpakieGPT, train_dataset: ChatSFTDataset, val_dataset,
                         best_val_loss=best_val_loss,
                     )
                     break
+            epoch_microbatch_offset = 0
+            current_epoch = epoch + 1
     except KeyboardInterrupt:
         interrupted = True
         interrupt_path = os.path.join(config.checkpoint_dir, interrupt_checkpoint_name)
-        atomic_torch_save({
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "optimizer_kind": getattr(optimizer, "optimizer_kind", config.sft_optimizer),
-            "optimizer_warning": "fallback_not_recommended"
-            if getattr(optimizer, "optimizer_kind", config.sft_optimizer) == "adamw"
-            else "",
-            "muon_verified": config.muon_verified,
-            "step": global_step,
-            "best_val_loss": best_val_loss,
-            "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,
-            "config": config_to_dict(config),
-            "tokenizer": checkpoint_tokenizer_contract(config),
-        }, interrupt_path)
+        optimizer.zero_grad(set_to_none=True)
+        save_interrupt_checkpoint(interrupt_path)
         status_writer.finish(
             "interrupted",
             message=f"Saved checkpoint to {interrupt_path}",
