@@ -231,7 +231,6 @@ def verify_muon_for_full_mlx_pretrain(args, config) -> None:
 
 
 def run_torch_pretrain(args, config):
-    import torch
     from torch.utils.data import DataLoader
 
     from model.transformer import SpakieGPT

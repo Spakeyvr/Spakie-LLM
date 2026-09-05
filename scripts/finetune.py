@@ -1,7 +1,6 @@
 """CLI entry point for SFT fine-tuning (PyTorch or MLX backend)."""
 
 import argparse
-import json
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -385,8 +384,6 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
 
 
 def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_dir):
-    import mlx.core as mx
-
     from model.transformer_mlx import SpakieGPTMLX
     from runtime.mlx_backend import configure_metal_limits, load_safetensors, resolve_mlx_runtime
     from tokenizer.train_tokenizer import SpakieTokenizer

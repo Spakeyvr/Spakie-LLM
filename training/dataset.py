@@ -9,7 +9,6 @@ from torch.utils.data import Dataset
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
 from tokenizer.train_tokenizer import SpakieTokenizer
 from training.sft_tokenization import (
     encode_sft_example,

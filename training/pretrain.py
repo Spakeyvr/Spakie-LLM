@@ -16,7 +16,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from configs.default import CHECKPOINT_CONFIG_SCHEMA_VERSION, SpakieConfig, config_to_dict
 from model.transformer import SpakieGPT
-from model.utils import count_parameters
 from runtime import RuntimeSettings, autocast_context
 from runtime.backends import create_grad_scaler
 from runtime.checkpoint_io import (

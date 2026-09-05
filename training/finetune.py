@@ -3,7 +3,6 @@
 import atexit
 import math
 import os
-import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,7 +15,7 @@ from model.transformer import SpakieGPT
 from runtime import RuntimeSettings, autocast_context, dataloader_kwargs
 from runtime.checkpoint_io import atomic_torch_save, checkpoint_tokenizer_contract
 from runtime.backends import create_grad_scaler
-from training.dataset import ChatSFTDataset, train_val_split
+from training.dataset import ChatSFTDataset
 from training.monitor import (
     TrainingStatusWriter,
     format_monitor_start_message,

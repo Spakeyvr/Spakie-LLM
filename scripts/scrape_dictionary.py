@@ -19,7 +19,6 @@ from datetime import datetime, timedelta
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
 
 WIKT_API = "https://en.wiktionary.org/w/api.php"
 PAGEVIEWS_API = "https://wikimedia.org/api/rest_v1/metrics/pageviews/top/en.wiktionary/all-access"

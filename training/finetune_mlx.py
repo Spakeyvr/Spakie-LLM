@@ -7,7 +7,6 @@ import copy
 import math
 import os
 import sys
-import time
 from functools import partial
 
 import mlx.core as mx

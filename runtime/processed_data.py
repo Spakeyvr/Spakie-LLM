@@ -86,14 +86,6 @@ def processed_manifest_sha256(processed_dir: str | Path) -> str:
     return sha256_file(path)
 
 
-def read_processed_data_manifest(processed_dir: str | Path) -> dict:
-    path = manifest_path(Path(processed_dir))
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Processed-data manifest {path} must contain an object")
-    return payload
-
-
 def publish_processed_data_manifest(
     train_path: Path,
     val_path: Path,

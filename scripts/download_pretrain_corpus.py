@@ -864,11 +864,6 @@ class SourceState:
             self._seen_key(str(url or "").strip().lower(), namespace="url"),
         )
 
-    def has_seen_identity(
-        self, doc_id: object = "", title: object = "", url: object = ""
-    ) -> bool:
-        return self.has_seen_identity_keys(self.identity_keys(doc_id, title, url))
-
     def has_seen_identity_keys(self, keys: tuple[str, str, str]) -> bool:
         doc_id_key, title_key, url_key = keys
         return bool(

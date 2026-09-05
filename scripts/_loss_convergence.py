@@ -10,14 +10,12 @@ varying is the algorithmic change under test.
 """
 from __future__ import annotations
 import argparse
-import math
 import os
 import sys
 import time
 
 import numpy as np
 import mlx.core as mx
-import mlx.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -25,7 +23,7 @@ from configs.default import get_preset_config
 from model.transformer_mlx import SpakieGPTMLX
 from runtime.mlx_backend import clip_grads, resolve_mlx_runtime
 from training.optimizers_mlx import configure_mlx_optimizer
-from training.pretrain_mlx import _accum_grads, _build_microbatch_step, get_lr as production_get_lr
+from training.pretrain_mlx import _build_microbatch_step, get_lr as production_get_lr
 
 
 def make_copy_dataset(n_examples, seq_len, vocab_size, seed=0):
@@ -74,32 +72,6 @@ def setup_model_and_opt(preset, seed, *, lr, wd, optimizer_kind, ns_steps, perhe
         learning_rate=lr, weight_decay=wd,
     )
     return model, opt, config
-
-
-def get_lr_cosine(step, config):
-    min_lr = config.pretrain_lr * 0.1
-    if step < config.pretrain_warmup_steps:
-        return config.pretrain_lr * step / max(config.pretrain_warmup_steps, 1)
-    if step >= config.pretrain_max_steps:
-        return min_lr
-    progress = (step - config.pretrain_warmup_steps) / (
-        config.pretrain_max_steps - config.pretrain_warmup_steps
-    )
-    return min_lr + 0.5 * (config.pretrain_lr - min_lr) * (1 + math.cos(math.pi * progress))
-
-
-def get_lr_trapezoid(step, config, decay_frac=0.2):
-    """Linear warmup -> constant peak -> linear decay to 10% of peak."""
-    min_lr = config.pretrain_lr * 0.1
-    decay_start = int(config.pretrain_max_steps * (1 - decay_frac))
-    if step < config.pretrain_warmup_steps:
-        return config.pretrain_lr * step / max(config.pretrain_warmup_steps, 1)
-    if step < decay_start:
-        return config.pretrain_lr
-    if step >= config.pretrain_max_steps:
-        return min_lr
-    progress = (step - decay_start) / max(config.pretrain_max_steps - decay_start, 1)
-    return config.pretrain_lr - progress * (config.pretrain_lr - min_lr)
 
 
 def run_one(*, label, preset, lr, wd, optimizer_kind, ns_steps, perhead,

@@ -12,7 +12,6 @@ _D = _CFG["defaults"]
 DEFAULT_PRESET: str = _CFG["default_preset"]
 SUPPORTED_PRESETS: tuple[str, ...] = tuple(_CFG["supported_presets"])
 CHAT_SYSTEM_PROMPT: str = _CFG["chat_system_prompt"]
-DEFAULT_TARGET_TRAIN_TOKENS: int = _D["target_train_tokens"]
 CORPUS_SOURCE_ALIASES: dict[str, str] = _CFG["corpus_source_aliases"]
 
 

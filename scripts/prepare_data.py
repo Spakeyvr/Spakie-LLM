@@ -24,7 +24,7 @@ import threading
 from array import array
 from collections import deque
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -323,8 +323,6 @@ class NearDuplicateIndex:
         from datasketch.lsh import _optimal_param
 
         bands, rows = _optimal_param(threshold, num_perm, 0.5, 0.5)
-        self.num_perm = num_perm
-        self.shingle_size = max(1, shingle_size)
         self._ranges: list[tuple[int, int]] = [
             (i * rows, (i + 1) * rows) for i in range(bands)
         ]
@@ -333,16 +331,6 @@ class NearDuplicateIndex:
         # magnitude; the xxh64 collision probability is negligible here.
         self._tables: list[set[int]] = [set() for _ in range(bands)]
         self._exact_hashes: set[int] = set()
-
-    # Convenience wrapper for the serial path: hash + signature + LSH check.
-    def is_duplicate(self, text: str) -> bool:
-        exact_hash = compute_exact_hash(text)
-        if exact_hash in self._exact_hashes:
-            return True
-        signature = compute_minhash_signature(
-            text, num_perm=self.num_perm, shingle_size=self.shingle_size
-        )
-        return self._check_and_insert(exact_hash, signature)
 
     def is_duplicate_exact(self, exact_hash: int) -> bool:
         """Return True if this xxh64 hash has been seen before. Does not insert."""
@@ -642,13 +630,6 @@ def repeated_line_ratio(text: str) -> float:
     return repeated / max(len(lines), 1)
 
 
-def noise_ratio(text: str) -> float:
-    if not text:
-        return 1.0
-    noisy = sum(not (ch.isalnum() or ch.isspace() or ch in ".,;:!?-_'\"()[]{}") for ch in text)
-    return noisy / len(text)
-
-
 def looks_boilerplate_heavy(text: str) -> bool:
     lower = text.lower()
     markers = (
@@ -671,29 +652,14 @@ _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"\b\S+@\S+\.\S+\b")
 
 
-def mean_word_length(text: str) -> float:
-    words = _SHINGLE_WORD_RE.findall(text)
-    return _mean_word_length_from_words(words)
-
-
 def _mean_word_length_from_words(words: list[str]) -> float:
     if not words:
         return 0.0
     return sum(len(w) for w in words) / len(words)
 
 
-def stopword_hit_count(text: str, max_words: int = 200) -> int:
-    words = _SHINGLE_WORD_RE.findall(text.lower())[:max_words]
-    return _stopword_hit_count_from_words(words)
-
-
 def _stopword_hit_count_from_words(words: list[str]) -> int:
     return sum(1 for w in words if w in _CORE_STOPWORDS)
-
-
-def symbol_word_ratio(text: str) -> float:
-    words = _SHINGLE_WORD_RE.findall(text)
-    return _symbol_word_ratio_from_words(text, len(words))
 
 
 def _symbol_word_ratio_from_words(text: str, word_count: int) -> float:
@@ -702,18 +668,6 @@ def _symbol_word_ratio_from_words(text: str, word_count: int) -> float:
     hash_count = text.count("#")
     ellipsis_count = text.count("...") + text.count("…")
     return (hash_count + ellipsis_count) / word_count
-
-
-def top_char_share(text: str) -> float:
-    counts: dict[str, int] = defaultdict(int)
-    total = 0
-    for ch in text:
-        if not ch.isspace():
-            counts[ch] += 1
-            total += 1
-    if total == 0:
-        return 0.0
-    return max(counts.values()) / total
 
 
 # Characters that don't count as "noise" alongside alphanumerics and whitespace.
@@ -726,8 +680,7 @@ def noise_and_top_char_share(text: str) -> tuple[float, float]:
     Both metrics otherwise walk every character in Python (``isalnum`` /
     ``isspace`` per char), which dominated the quality filter. ``Counter`` does
     the tally at C speed, then predicates run once per *distinct* character
-    (typically <200) instead of once per occurrence. Results are identical to
-    calling ``noise_ratio(text)`` and ``top_char_share(text)`` separately.
+    (typically <200) instead of once per occurrence.
     """
     if not text:
         return 1.0, 0.0
@@ -766,12 +719,6 @@ def _ngram_str_len(ngram_tuple: tuple[str, ...]) -> int:
     return sum(len(w) for w in ngram_tuple) + max(0, len(ngram_tuple) - 1)
 
 
-def top_ngram_char_share(text: str, n: int) -> float:
-    """Gopher-style: characters in the single most common word n-gram, over total chars."""
-    words = _SHINGLE_WORD_RE.findall(text.lower())
-    return _top_ngram_char_share_from_words(words, n, len(text))
-
-
 def _top_ngram_char_share_from_words(words: list[str], n: int, text_len: int) -> float:
     if len(words) < _MIN_WORDS_FOR_NGRAM_METRIC:
         return 0.0
@@ -780,12 +727,6 @@ def _top_ngram_char_share_from_words(words: list[str], n: int, text_len: int) ->
         return 0.0
     top_ngram, top_count = max(counts.items(), key=lambda kv: kv[1])
     return (_ngram_str_len(top_ngram) * top_count) / max(text_len, 1)
-
-
-def dup_ngram_char_share(text: str, n: int) -> float:
-    """Gopher-style: characters covered by any word n-gram appearing more than once."""
-    words = _SHINGLE_WORD_RE.findall(text.lower())
-    return _dup_ngram_char_share_from_words(words, n, len(text))
 
 
 def _dup_ngram_char_share_from_words(words: list[str], n: int, text_len: int) -> float:
@@ -1347,15 +1288,6 @@ class TokenizerPipeline:
             raise RuntimeError("TokenizerPipeline.submit after close_input")
         self._in_q.put(batch)
 
-    def try_get_ready(self) -> tuple[list[PendingTokenization], list[list[int]]] | None:
-        try:
-            item = self._out_q.get_nowait()
-        except queue.Empty:
-            return None
-        if item is self._SENTINEL:
-            return None
-        return item
-
     def get_ready_blocking(
         self,
     ) -> tuple[list[PendingTokenization], list[list[int]]] | None:
@@ -1534,11 +1466,6 @@ def corpus_quality_gate(report: dict, config: SpakieConfig) -> dict:
         "failures": failures,
         "warnings": warnings,
     }
-
-
-def corpus_quality_gate_failures(report: dict, config: SpakieConfig) -> list[str]:
-    """Return actionable reasons a full corpus must not be published."""
-    return list(corpus_quality_gate(report, config)["failures"])
 
 
 def _source_layout_from_resume_journal(

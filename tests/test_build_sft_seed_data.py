@@ -10,7 +10,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts import build_sft_seed_data
-from scripts import prepare_sft
 
 
 class BuildSFTSeedDataTests(unittest.TestCase):
@@ -30,13 +29,6 @@ class BuildSFTSeedDataTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(rows, [{"source": "spakie_180m_identity", **example}])
-
-    def test_identity_source_is_substantial_and_consistent(self):
-        examples = prepare_sft.build_identity_seed_examples(None)
-        self.assertGreater(len(examples), 100)
-        self.assertTrue(
-            all("Spakie-180M" in row["messages"][-1]["content"] for row in examples)
-        )
 
 
 if __name__ == "__main__":

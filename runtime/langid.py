@@ -146,11 +146,3 @@ def is_probably_english(
         return False
     score, label = predictions[0]
     return label == "__label__en" and float(score) >= config.langid_min_confidence
-
-
-def reset_langid_cache_for_tests() -> None:
-    global _MODEL, _LOAD_ATTEMPTED, _LAST_FAILURE_AT
-    with _LOCK:
-        _MODEL = None
-        _LOAD_ATTEMPTED = False
-        _LAST_FAILURE_AT = 0.0

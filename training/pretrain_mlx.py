@@ -368,15 +368,6 @@ def _capture_rng() -> dict:
     }
 
 
-def _restore_rng(state: dict | None) -> None:
-    if not state:
-        return
-    if "python" in state:
-        random.setstate(state["python"])
-    if "numpy" in state and state["numpy"] is not None:
-        np.random.set_state(state["numpy"])
-
-
 class AsyncCheckpointWriter:
     """Serializes safetensors writes onto a worker thread.
 
@@ -403,12 +394,6 @@ class AsyncCheckpointWriter:
         thread = threading.Thread(target=_work, daemon=False)
         self._thread = thread
         thread.start()
-
-    def write_sync(self, path: str, flat: dict[str, mx.array], meta: dict) -> None:
-        self.join()
-        if flat:
-            mx.eval(*flat.values())
-        save_safetensors_checkpoint(path, flat, meta)
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:

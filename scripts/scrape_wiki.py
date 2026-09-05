@@ -18,7 +18,6 @@ import time
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs.default import SpakieConfig
 
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 HEADERS = {"User-Agent": "SpakieLLM/1.0 (educational language model project)"}

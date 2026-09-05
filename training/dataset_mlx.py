@@ -338,14 +338,6 @@ class ResumableBatchSamplerMLX:
         )
 
 
-def sequence_length_at(dataset, idx: int, *, pad_id: int = 0, ignore_index: int = -100) -> int:
-    x, y = dataset[idx]
-    keep = (x != pad_id) | (y != ignore_index)
-    if not keep.any():
-        return 1
-    return int(np.nonzero(keep)[0].max()) + 1
-
-
 def sequence_lengths(dataset, *, pad_id: int = 0, ignore_index: int = -100) -> np.ndarray:
     direct = getattr(dataset, "sequence_lengths", None)
     if callable(direct):
@@ -964,9 +956,3 @@ def trim_after_last_supervised_bucket(
     if target_len == x.shape[1]:
         return x, y
     return np.ascontiguousarray(x[:, :target_len]), np.ascontiguousarray(y[:, :target_len])
-
-
-def iterate_batches(dataset, sampler: ResumableBatchSamplerMLX):
-    """Yield stacked numpy batches from a sampler. Callers convert to mx.array."""
-    for indices in sampler:
-        yield stack_batch(dataset, indices)

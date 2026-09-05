@@ -22,13 +22,6 @@ def _subset_tree_by_names(tree, names: set[str]):
     return tree_unflatten([(k, v) for k, v in tree_flatten(tree) if k in names and v is not None])
 
 
-def _split_tree_by_ndim(tree, *, split_ndim: int = 2):
-    flat = tree_flatten(tree)
-    high = [(k, v) for k, v in flat if v is not None and len(v.shape) >= split_ndim]
-    low = [(k, v) for k, v in flat if v is not None and len(v.shape) < split_ndim]
-    return tree_unflatten(high), tree_unflatten(low)
-
-
 def _flatten_arrays(tree) -> dict[str, mx.array]:
     return {k: v for k, v in tree_flatten(tree) if isinstance(v, mx.array)}
 

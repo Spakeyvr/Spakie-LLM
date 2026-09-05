@@ -105,10 +105,6 @@ def is_muon_parameter_name(name: str, ndim: int) -> bool:
     return False
 
 
-def is_qkv_parameter_name(name: str) -> bool:
-    return muon_projection_split_count(name) > 1
-
-
 def muon_projection_split_count(name: str) -> int:
     """Number of independent attention projections fused in ``name``."""
     if name.endswith("attn.qkv.weight"):

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map
 
 
 MLX_PRECISION_CHOICES = ("auto", "fp32", "fp16", "bf16")
@@ -74,20 +73,6 @@ def configure_metal_limits(
         setter(limit)
         applied["cache_limit"] = limit
     return applied
-
-
-def flatten_tree(tree: Any) -> dict[str, mx.array]:
-    """Flatten a PyTree of arrays into a dotted-path dict of mx.arrays."""
-    return dict(tree_flatten(tree))
-
-
-def unflatten_tree(flat: dict[str, mx.array]) -> Any:
-    return tree_unflatten(list(flat.items()))
-
-
-def save_safetensors(path: str, tree: Any, metadata: dict[str, str] | None = None) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    mx.save_safetensors(path, flatten_tree(tree), metadata=metadata or {})
 
 
 def load_safetensors(path: str) -> dict[str, mx.array]:
@@ -185,25 +170,3 @@ def clip_grads(grads: Any, max_norm: float) -> tuple[Any, mx.array]:
         return (x.astype(mx.float32) * scale).astype(x.dtype)
 
     return tree_map(_scale, grads), norm
-
-
-def add_grad_trees(a: Any, b: Any) -> Any:
-    """Sum two grad PyTrees elementwise. Skips Nones."""
-
-    def _add(x, y):
-        if x is None:
-            return y
-        if y is None:
-            return x
-        return x + y
-
-    return tree_map(_add, a, b)
-
-
-def scale_grad_tree(grads: Any, factor: float) -> Any:
-    def _mul(x):
-        if x is None:
-            return None
-        return x * factor
-
-    return tree_map(_mul, grads)

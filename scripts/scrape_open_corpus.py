@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import html
 import json
-import os
 import random
 import re
 import time
