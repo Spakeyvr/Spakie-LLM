@@ -300,7 +300,9 @@ class SpakieGPT(nn.Module):
                     x = block_result
 
         x = self.ln_f(x)
-        logits = self.lm_head(x)
+        # Promote before the projection: casting rounded BF16 logits is too late.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            logits = F.linear(x.float(), self.lm_head.weight.float())
 
         loss = None
         if targets is not None:

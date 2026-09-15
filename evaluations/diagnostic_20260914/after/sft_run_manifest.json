@@ -1,0 +1,29 @@
+{
+  "source_checkpoint": "checkpoints/92m/pretrain_interrupt.safetensors",
+  "dataset": "data/chat/train.jsonl",
+  "output_dir": "checkpoints/92m/precision_recovery",
+  "epochs": 1,
+  "batch_size": 16,
+  "grad_accum_steps": 4,
+  "learning_rate": 1.5e-05,
+  "precision": "bf16 with float32 output head and loss",
+  "command": "SPAKIE_MONITOR=0 .venv/bin/python scripts/finetune.py --preset 92m --backend mlx --source-checkpoint checkpoints/92m/pretrain_interrupt.safetensors --train-jsonl data/chat/train.jsonl --output-dir checkpoints/92m/precision_recovery --output-name sft_best.safetensors --epochs 1 --sft-batch-size 16 --sft-grad-accum 4 --lr 1.5e-5 --pretokenize-sft --no-model-prompt --mlx-compile --mlx-prefetch",
+  "source_checkpoint_sha256": "2e463f3a0fe61d43f63b204c7e57041bfdf29d92569a362bb8af2edccac637ba",
+  "dataset_sha256": "835d4411f23d88b32140f3a69e56a123c2af8c528703ba0a681dc46de72e880d",
+  "implementation_sha256": {
+    "model/transformer_mlx.py": "eebcb426f51012469ca39f0e08f1aed2cdf088cfa7dcd2e537b04394bbfc54be",
+    "model/transformer.py": "4540c177954eb73d6a73ff1108e28bc33df318b68c76de7f9b14d33552c429d2",
+    "model/fused_ce_mlx.py": "8d0b53643705bb3236d35676d281868c1247269c69ead5264a81f16dbf262b6e",
+    "inference/generation_utils.py": "f32990d80b9bad0afac30a931bf521b8eed213b819a10d59677f685d7cd8f8b4",
+    "scripts/prepare_data.py": "47984bd63e31f03ab98a6035ddbfc588e72101bab64dec65ef95e748136844d7",
+    "scripts/finetune.py": "0c526360c294da27cc49f43f56812d5af2517bb299fad975fb76c4c4b9034948"
+  },
+  "result": {
+    "status": "interrupted_at_user_request",
+    "step": 396,
+    "total_steps": 3249,
+    "checkpoint": "checkpoints/92m/precision_recovery/sft_interrupt.safetensors",
+    "completed_epoch": false,
+    "reason": "User requested stopping GPU training due to Mac heat and responsiveness."
+  }
+}

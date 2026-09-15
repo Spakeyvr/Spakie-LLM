@@ -125,25 +125,23 @@ def _attention_with_dropout(
 
 @mx.custom_function
 def _linear_cross_entropy_mean(flat_x: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
-    logits = flat_x @ weight.T
-    if logits.dtype == mx.float16:
-        logits = logits.astype(mx.float32)
+    # Promote before GEMM. Large common logit offsets destroy BF16 ranking
+    # resolution even though exact-arithmetic softmax is offset-invariant.
+    logits = flat_x.astype(mx.float32) @ weight.astype(mx.float32).T
     return nn.losses.cross_entropy(logits, targets, reduction="mean")
 
 
 @_linear_cross_entropy_mean.vjp
 def _linear_cross_entropy_mean_vjp(primals, cotangent, output):
     flat_x, weight, targets = primals
-    logits = flat_x @ weight.T
-    if logits.dtype == mx.float16:
-        logits = logits.astype(mx.float32)
+    logits = flat_x.astype(mx.float32) @ weight.astype(mx.float32).T
     probs = mx.softmax(logits, axis=-1)
     target_idx = targets[:, None]
     target_updates = mx.take_along_axis(probs, target_idx, axis=1) - 1
     grad_logits = mx.put_along_axis(probs, target_idx, target_updates, axis=1) / flat_x.shape[0]
     grad_logits = grad_logits * cotangent
-    grad_x = grad_logits @ weight
-    grad_weight = grad_logits.T @ flat_x
+    grad_x = (grad_logits @ weight.astype(mx.float32)).astype(flat_x.dtype)
+    grad_weight = (grad_logits.T @ flat_x.astype(mx.float32)).astype(weight.dtype)
     return grad_x, grad_weight, mx.zeros_like(targets)
 
 
@@ -775,7 +773,7 @@ class SpakieGPTMLX(nn.Module):
         # optimization (not a numerical change) and is skipped whenever the
         # caller actually wants logits back (inference, no targets).
         if targets is None or return_cache or cache is not None:
-            logits = x @ W.T
+            logits = x.astype(mx.float32) @ W.astype(mx.float32).T
             loss = None
             if targets is not None:
                 flat_logits = logits.flatten(0, 1)
@@ -830,11 +828,11 @@ class SpakieGPTMLX(nn.Module):
                     return fused_linear_cross_entropy_mean(flat_x, W, flat_targets)
                 return _linear_cross_entropy_mean(flat_x, W, flat_targets)
             if self.config.loss_layout == "flat":
-                flat_logits = flat_x @ W.T
+                flat_logits = flat_x.astype(mx.float32) @ W.astype(mx.float32).T
                 return _ce_with_optional_mask(
                     flat_logits, flat_targets, ignore_index, flat_logits.dtype
                 )
-            logits = x @ W.T
+            logits = x.astype(mx.float32) @ W.astype(mx.float32).T
             if ignore_index is None:
                 return nn.losses.cross_entropy(logits, targets, axis=-1, reduction="mean")
             else:
@@ -849,7 +847,7 @@ class SpakieGPTMLX(nn.Module):
             j = min(i + chunk, N)
             cx = flat_x[i:j]
             ct = flat_targets[i:j]
-            clogits = cx @ W.T
+            clogits = cx.astype(mx.float32) @ W.astype(mx.float32).T
             if ignore_index is None:
                 cl = nn.losses.cross_entropy(clogits, ct, reduction="sum").astype(mx.float32)
                 loss_sum = loss_sum + cl
@@ -887,7 +885,7 @@ def _indexed_cross_entropy_mean(
     targets: mx.array,
     mask: mx.array,
 ) -> mx.array:
-    logits = hidden @ weight.T
+    logits = hidden.astype(mx.float32) @ weight.astype(mx.float32).T
     per_tok = nn.losses.cross_entropy(logits, targets, reduction="none")
     loss_mask = mask.astype(per_tok.dtype)
     denom = mx.maximum(loss_mask.sum(), mx.array(1.0, dtype=loss_mask.dtype))

@@ -1,0 +1,12 @@
+{"checkpoint": "pretrain_interrupt", "dtype": "mlx.core.bfloat16", "no_cache": true, "prompt": "The capital of France is", "answer": "the city of Chartres.\n\nHistory\n\nThe first written mention of"}
+{"checkpoint": "pretrain_interrupt", "dtype": "mlx.core.bfloat16", "no_cache": true, "prompt": "The chemical formula for water is", "answer": "100000000000000"}
+{"checkpoint": "pretrain_interrupt", "dtype": "mlx.core.bfloat16", "no_cache": true, "prompt": "17 + 26 =", "answer": "11.\n\n## How many 1000 is in"}
+{"checkpoint": "pretrain_interrupt", "dtype": "mlx.core.float32", "no_cache": true, "prompt": "The capital of France is", "answer": "the city of Chartres.\n\nHistory\n\nThe first written mention of"}
+{"checkpoint": "pretrain_interrupt", "dtype": "mlx.core.float32", "no_cache": true, "prompt": "The chemical formula for water is", "answer": ":\n\n[(C_2H_2O_3)_"}
+{"checkpoint": "pretrain_interrupt", "dtype": "mlx.core.float32", "no_cache": true, "prompt": "17 + 26 =", "answer": "100.\n\n### Square Root\n\n\u221a100"}
+{"checkpoint": "sft_interrupt", "dtype": "mlx.core.bfloat16", "no_cache": true, "prompt": "The capital of France is", "answer": "Paris, and the capital of the country is Paris."}
+{"checkpoint": "sft_interrupt", "dtype": "mlx.core.bfloat16", "no_cache": true, "prompt": "The chemical formula for water is", "answer": "given by:\n\ndH = 1/2\n\nwhere d"}
+{"checkpoint": "sft_interrupt", "dtype": "mlx.core.bfloat16", "no_cache": true, "prompt": "17 + 26 =", "answer": "112\n\n#### 112\n\nThe answer is"}
+{"checkpoint": "sft_interrupt", "dtype": "mlx.core.float32", "no_cache": true, "prompt": "The capital of France is", "answer": "Paris."}
+{"checkpoint": "sft_interrupt", "dtype": "mlx.core.float32", "no_cache": true, "prompt": "The chemical formula for water is", "answer": ":\n\nmH = m(g(H)) + m(g"}
+{"checkpoint": "sft_interrupt", "dtype": "mlx.core.float32", "no_cache": true, "prompt": "17 + 26 =", "answer": "120\n\n#### 120\n\nThe answer is"}

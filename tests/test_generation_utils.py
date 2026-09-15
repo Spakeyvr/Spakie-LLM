@@ -141,12 +141,12 @@ class GenerationUtilityTests(unittest.TestCase):
     def test_repetition_penalty_applies_once_per_unique_token_numpy(self):
         logits = np.asarray([4.0, -4.0, 1.0], dtype=np.float32)
         apply_repetition_penalty(logits, [0, 0, 1, 1, 1], 2.0)
-        np.testing.assert_array_equal(logits, np.asarray([2.0, -8.0, 1.0]))
+        np.testing.assert_allclose(logits, np.asarray([4.0 - np.log(2), -4.0 - np.log(2), 1.0]), rtol=1e-6)
 
     def test_repetition_penalty_has_identical_torch_semantics(self):
         logits = torch.tensor([4.0, -4.0, 1.0])
         apply_repetition_penalty(logits, [0, 0, 1, 1, 1], 2.0)
-        torch.testing.assert_close(logits, torch.tensor([2.0, -8.0, 1.0]))
+        torch.testing.assert_close(logits, torch.tensor([4.0 - np.log(2), -4.0 - np.log(2), 1.0], dtype=torch.float32))
 
     def test_repetition_penalty_rejects_nonpositive_value(self):
         with self.assertRaisesRegex(ValueError, "must be positive"):

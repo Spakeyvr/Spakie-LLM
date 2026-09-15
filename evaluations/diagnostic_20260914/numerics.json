@@ -1,0 +1,162 @@
+[
+  {
+    "prompt": "The capital of France is",
+    "logit_min": -252.33897399902344,
+    "logit_max": -210.4644775390625,
+    "cache_max_diff": 0.08563232421875,
+    "torch_max_diff": 0.0326080322265625,
+    "argmax": [
+      269,
+      269,
+      269
+    ],
+    "top5": [
+      {
+        "token": "the",
+        "logit": -210.4644775390625
+      },
+      {
+        "token": "at",
+        "logit": -210.97415161132812
+      },
+      {
+        "token": "in",
+        "logit": -211.111328125
+      },
+      {
+        "token": "Saint",
+        "logit": -211.1727294921875
+      },
+      {
+        "token": "L",
+        "logit": -211.27220153808594
+      }
+    ],
+    "bf16_unique_logits": 42,
+    "fp32_unique_logits": 24306,
+    "bf16_top_logit_ties": 5,
+    "bf16_argmax": 269,
+    "bf16_top20_unique_values": 3,
+    "penalty_1_2_top_token_logit_drop": -42.0928955078125
+  },
+  {
+    "prompt": "The chemical formula for water is",
+    "logit_min": -274.9105529785156,
+    "logit_max": -233.2115478515625,
+    "cache_max_diff": 0.104095458984375,
+    "torch_max_diff": 0.11199951171875,
+    "argmax": [
+      23859,
+      23859,
+      23859
+    ],
+    "top5": [
+      {
+        "token": ":",
+        "logit": -233.2115478515625
+      },
+      {
+        "token": "",
+        "logit": -233.29701232910156
+      },
+      {
+        "token": "\"",
+        "logit": -233.69000244140625
+      },
+      {
+        "token": "P",
+        "logit": -233.74864196777344
+      },
+      {
+        "token": "[",
+        "logit": -233.8572540283203
+      }
+    ],
+    "bf16_unique_logits": 34,
+    "fp32_unique_logits": 24254,
+    "bf16_top_logit_ties": 2,
+    "bf16_argmax": 23803,
+    "bf16_top20_unique_values": 3,
+    "penalty_1_2_top_token_logit_drop": -46.642311096191406
+  },
+  {
+    "prompt": "17 + 26 =",
+    "logit_min": -278.41461181640625,
+    "logit_max": -233.68597412109375,
+    "cache_max_diff": 0.096527099609375,
+    "torch_max_diff": 0.10919189453125,
+    "argmax": [
+      23803,
+      23803,
+      23803
+    ],
+    "top5": [
+      {
+        "token": "",
+        "logit": -233.68597412109375
+      },
+      {
+        "token": "\n",
+        "logit": -237.94277954101562
+      },
+      {
+        "token": "-",
+        "logit": -238.00564575195312
+      },
+      {
+        "token": "(",
+        "logit": -239.03623962402344
+      },
+      {
+        "token": "1",
+        "logit": -239.12142944335938
+      }
+    ],
+    "bf16_unique_logits": 31,
+    "fp32_unique_logits": 24174,
+    "bf16_top_logit_ties": 1,
+    "bf16_argmax": 23803,
+    "bf16_top20_unique_values": 5,
+    "penalty_1_2_top_token_logit_drop": -46.7371940612793
+  },
+  {
+    "prompt": "The capital of France is Paris. It is known for",
+    "logit_min": -273.4543762207031,
+    "logit_max": -229.7127685546875,
+    "cache_max_diff": 0.092254638671875,
+    "torch_max_diff": 0.09918212890625,
+    "argmax": [
+      631,
+      631,
+      631
+    ],
+    "top5": [
+      {
+        "token": "its",
+        "logit": -229.7127685546875
+      },
+      {
+        "token": "the",
+        "logit": -232.31155395507812
+      },
+      {
+        "token": "being",
+        "logit": -233.1177520751953
+      },
+      {
+        "token": "a",
+        "logit": -233.3098907470703
+      },
+      {
+        "token": "many",
+        "logit": -233.691162109375
+      }
+    ],
+    "bf16_unique_logits": 34,
+    "fp32_unique_logits": 24299,
+    "bf16_top_logit_ties": 1,
+    "bf16_argmax": 631,
+    "bf16_top20_unique_values": 7,
+    "penalty_1_2_top_token_logit_drop": -45.94255447387695
+  }
+]

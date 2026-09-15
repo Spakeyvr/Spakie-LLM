@@ -1,0 +1,6 @@
+{
+  "checkpoint": "pretrain_interrupt",
+  "max_logit_difference": 2.0,
+  "same_argmax": true,
+  "finite": true
+}

@@ -54,7 +54,7 @@ DEFAULT_TOKENIZE_BATCH_CHARS = 8_000_000
 MAX_RECOMMENDED_TOKENIZER_THREADS = 16
 SHARD_RUN_MANIFEST = "shard_run_manifest.json"
 SHARD_RESUME_JOURNAL = "accepted_documents.bin"
-PREPARATION_SCHEMA_VERSION = 4
+PREPARATION_SCHEMA_VERSION = 5
 _JOURNAL_HEADER = struct.Struct("<HIIQH")
 
 
@@ -733,9 +733,20 @@ def _dup_ngram_char_share_from_words(words: list[str], n: int, text_len: int) ->
     if len(words) < _MIN_WORDS_FOR_NGRAM_METRIC:
         return 0.0
     counts = _word_ngram_counts(words, n)
-    dup_chars = sum(
-        _ngram_str_len(ngram) * count for ngram, count in counts.items() if count > 1
-    )
+    # Count the union of repeated spans, not every overlapping n-gram.
+    # One repeated sentence otherwise contributes its characters up to n times,
+    # making a purported character fraction exceed 1 and rejecting useful text.
+    covered_until = 0
+    dup_chars = 0
+    for start in range(len(words) - n + 1):
+        if counts[tuple(words[start:start + n])] <= 1:
+            continue
+        first = max(start, covered_until)
+        end = start + n
+        if first < end:
+            dup_chars += sum(len(word) for word in words[first:end])
+            dup_chars += end - first - (1 if first == start else 0)
+            covered_until = end
     return dup_chars / max(text_len, 1)
 
 
@@ -1222,15 +1233,22 @@ def should_keep_document(text: str, config: SpakieConfig, source: str) -> tuple[
         profile.get("max_url_email_line_ratio", config.max_url_email_line_ratio)
     ):
         return False, "link_farm"
-    if _top_ngram_char_share_from_words(words_lower, 2, text_len) > float(
+    # Reusing LaTeX operators such as \frac, \left and \sin is mathematical
+    # syntax, not repeated prose. Keep the original text for all other checks,
+    # including repeated-line detection and document deduplication.
+    repetition_words = (
+        _SHINGLE_WORD_RE.findall(re.sub(r"\\[A-Za-z]+", "", lowered))
+        if source_kind == "math" else words_lower
+    )
+    if _top_ngram_char_share_from_words(repetition_words, 2, text_len) > float(
         profile.get("max_top_2gram_char_share", config.max_top_2gram_char_share)
     ):
         return False, "repetitive_2gram"
-    if _top_ngram_char_share_from_words(words_lower, 3, text_len) > float(
+    if _top_ngram_char_share_from_words(repetition_words, 3, text_len) > float(
         profile.get("max_top_3gram_char_share", config.max_top_3gram_char_share)
     ):
         return False, "repetitive_3gram"
-    if _dup_ngram_char_share_from_words(words_lower, 5, text_len) > float(
+    if _dup_ngram_char_share_from_words(repetition_words, 5, text_len) > float(
         profile.get("max_dup_5gram_char_share", config.max_dup_5gram_char_share)
     ):
         return False, "duplicate_5gram"

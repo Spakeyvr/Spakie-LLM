@@ -1,0 +1,383 @@
+{
+  "step": 219,
+  "best_val_loss": Infinity,
+  "patience_counter": 0,
+  "preset_name": "92m",
+  "optimizer_kind": "adamw",
+  "optimizer_warning": "fallback_not_recommended",
+  "muon_verified": true,
+  "sft_resume_schema_version": 1,
+  "epoch_index": 0,
+  "epoch_microbatch_offset": 876,
+  "sft_resume_contract": {
+    "dataset_size": 207907,
+    "dataset_fingerprint": "a21cf5c9524a6167c6817ba0c3524f0e4226b1451d3ef94367de489c07b2086d",
+    "batch_size": 16,
+    "grad_accum_steps": 4,
+    "sampler": "sortish",
+    "pack": false,
+    "training_scope": null
+  },
+  "config_schema_version": 3,
+  "config": {
+    "preset_name": "92m",
+    "vocab_size": 24576,
+    "n_layers": 12,
+    "n_heads": 12,
+    "n_kv_heads": 4,
+    "d_model": 768,
+    "d_ff": 3072,
+    "mlp_type": "swiglu",
+    "norm_type": "rmsnorm",
+    "qk_norm": true,
+    "position_encoding": "rope",
+    "rope_theta": 100000.0,
+    "loss_layout": "custom",
+    "residual_type": "serial",
+    "attention_backend": "sdpa",
+    "swiglu_hidden": 2048,
+    "max_seq_len": 2048,
+    "dropout": 0.0,
+    "bias": false,
+    "activation_checkpointing": false,
+    "mlp_checkpointing": false,
+    "compact_valid_mlp": false,
+    "compact_valid_projections": false,
+    "addmm_residual_projections": false,
+    "mlp_addmm_linears": false,
+    "fused_residual_rmsnorm": false,
+    "fused_cross_entropy": false,
+    "grouped_muon": false,
+    "compile_muon_ns": false,
+    "muon_route": "all",
+    "contiguous_linear_inputs": false,
+    "loss_chunk_size": 0,
+    "pretrain_batch_size": 16,
+    "pretrain_grad_accum_steps": 4,
+    "pretrain_lr": 0.0006,
+    "pretrain_target_tokens": 8800000000,
+    "pretrain_max_steps": 67139,
+    "pretrain_warmup_steps": 200,
+    "pretrain_weight_decay": 0.1,
+    "pretrain_grad_clip": 1.0,
+    "pretrain_eval_interval": 250,
+    "pretrain_eval_batches": 20,
+    "pretrain_checkpoint_interval": 0,
+    "pretrain_patience": 5,
+    "pretrain_optimizer": "muon",
+    "pretrain_lr_schedule": "trapezoid",
+    "pretrain_trapezoid_decay_frac": 0.2,
+    "pretrain_vmap_accum_step": false,
+    "pretrain_vmap_sync_warmup_steps": 0,
+    "pretrain_vmap_group_size": 0,
+    "pretrain_vmap_mem_budget_frac": 0.7,
+    "sft_batch_size": 16,
+    "sft_grad_accum_steps": 4,
+    "sft_lr": 1.5e-05,
+    "sft_epochs": 1,
+    "sft_weight_decay": 0.01,
+    "sft_grad_clip": 1.0,
+    "sft_patience": 5,
+    "sft_download_max_examples": 100000,
+    "sft_optimizer": "adamw",
+    "sft_allow_unconfigured_sources": false,
+    "sft_refusal_sources": [
+      "safety_refusal",
+      "uncertainty_calibration"
+    ],
+    "allow_adamw_fallback": false,
+    "muon_momentum": 0.95,
+    "muon_nesterov": true,
+    "muon_ns_steps": 10,
+    "muon_ns_coefficients": [
+      3.4445,
+      -4.775,
+      2.0315
+    ],
+    "muon_eps": 1e-07,
+    "muon_adjust_lr_fn": "match_rms_adamw",
+    "muon_qkv_split": true,
+    "muon_verified": true,
+    "temperature": 0.7,
+    "top_k": 50,
+    "top_p": 1.0,
+    "raw_data_dir": "data/raw",
+    "processed_data_dir": "data/processed",
+    "chat_data_dir": "data/chat",
+    "chat_raw_dir": "data/chat_raw",
+    "eval_data_dir": "data/eval",
+    "tokenizer_prefix": "tokenizer/spakie",
+    "checkpoint_root_dir": "checkpoints",
+    "checkpoint_dir": "checkpoints/92m",
+    "target_train_tokens": 10000000000,
+    "target_processed_tokens": 10526315790,
+    "large_corpus_dir": "data/raw/large_corpus",
+    "corpus_report_path": "data/processed/corpus_report.json",
+    "token_shard_dir": "data/processed/shards",
+    "token_shard_size": 5000000,
+    "min_doc_chars": 400,
+    "source_min_doc_chars": {
+      "wikipedia_snapshot": 200,
+      "wikipedia": 200,
+      "arxiv": 220,
+      "stackexchange": 180,
+      "openwebmath": 180,
+      "finemath": 180,
+      "python_edu": 80,
+      "open_corpus": 180,
+      "dictionary": 80
+    },
+    "max_repeated_line_ratio": 0.25,
+    "max_noise_ratio": 0.35,
+    "mean_word_length_min": 3.0,
+    "mean_word_length_max": 10.0,
+    "min_stopword_count": 2,
+    "max_symbol_word_ratio": 0.1,
+    "max_top_2gram_char_share": 0.2,
+    "max_top_3gram_char_share": 0.18,
+    "max_dup_5gram_char_share": 0.15,
+    "max_top_char_share": 0.3,
+    "max_url_email_line_ratio": 0.3,
+    "minimum_source_completion_ratio": 0.95,
+    "maximum_source_mix_deviation": 0.02,
+    "minimum_corpus_completion_ratio": 0.85,
+    "minimum_kind_completion_ratio": 0.5,
+    "maximum_kind_mix_deviation": 0.06,
+    "maximum_unplanned_source_share": 0.05,
+    "train_split_fraction": 0.95,
+    "estimated_chars_per_token": 4.0,
+    "near_dup_jaccard_threshold": 0.8,
+    "near_dup_num_perm": 128,
+    "near_dup_shingle_size": 5,
+    "langid_min_confidence": 0.65,
+    "langid_model_path": "data/models/lid.176.ftz",
+    "langid_model_url": "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz",
+    "corpus_source_plan": {
+      "fineweb-edu": {
+        "kind": "web",
+        "target_tokens": 4000000000,
+        "target_raw_chars": 16000000000,
+        "enabled": true
+      },
+      "dolma": {
+        "kind": "web",
+        "target_tokens": 450000000,
+        "target_raw_chars": 1800000000,
+        "enabled": false
+      },
+      "refinedweb": {
+        "kind": "web",
+        "target_tokens": 250000000,
+        "target_raw_chars": 1000000000,
+        "enabled": true
+      },
+      "fineweb_sample": {
+        "kind": "web",
+        "target_tokens": 250000000,
+        "target_raw_chars": 1000000000,
+        "enabled": true
+      },
+      "c4_en": {
+        "kind": "web",
+        "target_tokens": 0,
+        "target_raw_chars": 0,
+        "enabled": false
+      },
+      "gutenberg": {
+        "kind": "books",
+        "target_tokens": 500000000,
+        "target_raw_chars": 2000000000,
+        "enabled": true
+      },
+      "wikipedia_snapshot": {
+        "kind": "reference",
+        "target_tokens": 1000000000,
+        "target_raw_chars": 4000000000,
+        "enabled": true
+      },
+      "stackexchange": {
+        "kind": "technical",
+        "target_tokens": 250000000,
+        "target_raw_chars": 1000000000,
+        "enabled": true
+      },
+      "openwebmath": {
+        "kind": "math",
+        "target_tokens": 300000000,
+        "target_raw_chars": 1200000000,
+        "enabled": true
+      },
+      "arxiv": {
+        "kind": "technical",
+        "target_tokens": 250000000,
+        "target_raw_chars": 1000000000,
+        "enabled": true
+      },
+      "finemath": {
+        "kind": "math",
+        "target_tokens": 1200000000,
+        "target_raw_chars": 4800000000,
+        "enabled": true
+      },
+      "python_edu": {
+        "kind": "code",
+        "target_tokens": 1500000000,
+        "target_raw_chars": 6000000000,
+        "enabled": true
+      },
+      "cosmopedia_v2": {
+        "kind": "synthetic_education",
+        "target_tokens": 500000000,
+        "target_raw_chars": 2000000000,
+        "enabled": true
+      }
+    },
+    "filter_profiles": {
+      "prose": {
+        "apply_word_length": true,
+        "apply_stopwords": true,
+        "apply_language_id": true,
+        "max_symbol_word_ratio": 0.1,
+        "max_noise_ratio": 0.35,
+        "max_repeated_line_ratio": 0.25,
+        "max_url_email_line_ratio": 0.3,
+        "max_top_2gram_char_share": 0.2,
+        "max_top_3gram_char_share": 0.18,
+        "max_dup_5gram_char_share": 0.15,
+        "max_top_char_share": 0.3
+      },
+      "math": {
+        "apply_word_length": false,
+        "apply_stopwords": false,
+        "apply_language_id": true,
+        "max_symbol_word_ratio": 0.45,
+        "max_noise_ratio": 0.5,
+        "max_repeated_line_ratio": 0.45,
+        "max_url_email_line_ratio": 0.35,
+        "max_top_2gram_char_share": 0.35,
+        "max_top_3gram_char_share": 0.32,
+        "max_dup_5gram_char_share": 0.35,
+        "max_top_char_share": 0.4
+      },
+      "code": {
+        "apply_word_length": false,
+        "apply_stopwords": false,
+        "apply_language_id": false,
+        "max_symbol_word_ratio": 1.0,
+        "max_noise_ratio": 0.6,
+        "max_repeated_line_ratio": 0.6,
+        "max_url_email_line_ratio": 0.5,
+        "max_top_2gram_char_share": 0.5,
+        "max_top_3gram_char_share": 0.48,
+        "max_dup_5gram_char_share": 0.45,
+        "max_top_char_share": 0.5
+      }
+    },
+    "sft_source_limits": {
+      "DeepSeek-distill-V2": {
+        "enabled": false,
+        "limit": 0
+      },
+      "custom": {
+        "enabled": true,
+        "limit": 0
+      },
+      "spakie_180m_identity": {
+        "enabled": true,
+        "limit": 0
+      },
+      "assistant_behavior": {
+        "enabled": true,
+        "limit": 0
+      },
+      "anti_echo": {
+        "enabled": true,
+        "limit": 0
+      },
+      "factual_repairs": {
+        "enabled": true,
+        "limit": 0
+      },
+      "safety_refusal": {
+        "enabled": true,
+        "limit": 3000
+      },
+      "uncertainty_calibration": {
+        "enabled": true,
+        "limit": 3000
+      },
+      "format_compliance_curriculum": {
+        "enabled": false,
+        "limit": 0
+      },
+      "nemotron_instruction_following_chat_v3": {
+        "enabled": true,
+        "download_limit": 200000,
+        "limit": 10000
+      },
+      "openhermes_2_5": {
+        "enabled": true,
+        "download_limit": 1000000,
+        "limit": 10000
+      },
+      "alpaca": {
+        "enabled": false,
+        "limit": 12000
+      },
+      "no_robots": {
+        "enabled": false,
+        "limit": 8000
+      },
+      "general_assistant_instruction_qa_smoltalk_expansion": {
+        "enabled": false,
+        "limit": 8000
+      },
+      "smoltalk": {
+        "enabled": true,
+        "download_limit": 400000,
+        "limit": 35000
+      },
+      "squad": {
+        "enabled": true,
+        "limit": 10000
+      },
+      "triviaqa": {
+        "enabled": true,
+        "limit": 5000
+      },
+      "sciq": {
+        "enabled": true,
+        "limit": 8000
+      },
+      "arc_challenge": {
+        "enabled": true,
+        "limit": 1200
+      },
+      "openbookqa": {
+        "enabled": true,
+        "limit": 5000
+      },
+      "boolq": {
+        "enabled": true,
+        "limit": 7000
+      }
+    }
+  },
+  "tokenizer": {
+    "schema_version": 1,
+    "sha256": "97b06d9eed0c1fd301930d4d5304b994dd25f9cd6762bc4f6e11eb42a4e97092",
+    "vocab_size": 24576,
+    "special_token_ids": {
+      "<pad>": 0,
+      "<unk>": 1,
+      "<s>": 2,
+      "</s>": 3,
+      "<|user|>": 4,
+      "<|assistant|>": 5,
+      "<|system|>": 6,
+      "<|json|>": 7
+    }
+  },
+  "checkpoint_generation": "8dd005d97fee41b1af97db9827610806",
+  "file_sha256": "63f71f33a25b1064887b2fa2d293760043255896494c7b372717db898e8e77b0"
+}

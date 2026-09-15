@@ -8,6 +8,7 @@ catch algebra/index/mask bugs when porting — not to regress on bitwise identit
 from __future__ import annotations
 
 import os
+import importlib.util
 import sys
 import subprocess
 import tempfile
@@ -591,6 +592,7 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         self.assertLess(np.max(np.abs(first_np[0] - packed_np[0, :4])), 1e-5)
         self.assertLess(np.max(np.abs(second_np[0] - packed_np[0, 4:7])), 1e-5)
 
+    @unittest.skipIf(importlib.util.find_spec("mlx_mfa") is None, "optional mlx-mfa unavailable")
     def test_mfa_varlen_packed_segments_match_separate_mlx_logits(self):
         import mlx.core as mx
 

@@ -8,8 +8,9 @@ and N=B*T that softmax+scatter touches the (N, vocab) tensor several times.
 ``fused_linear_cross_entropy_mean`` keeps the two matmuls (which MLX already runs
 on tuned Metal GEMM kernels) but replaces the softmax/scatter chain with a single
 Metal kernel that reads the logits once and writes ``grad_logits`` once. Numerics
-match the reference path: the loss logsumexp is accumulated in fp32, and
-``grad_logits`` is emitted in the logits dtype exactly like the reference.
+match the reference path: projection, logsumexp, and logit gradients are fp32.
+Gradients are cast back to the parameter/input dtype only after the backward
+matmuls, preserving mixed-precision optimizer and activation contracts.
 """
 
 from __future__ import annotations
@@ -153,17 +154,17 @@ def _bwd_grad_logits(logits: mx.array, targets: mx.array, scale: mx.array) -> mx
 def fused_linear_cross_entropy_mean(
     flat_x: mx.array, weight: mx.array, targets: mx.array
 ) -> mx.array:
-    logits = flat_x @ weight.T
+    logits = flat_x.astype(mx.float32) @ weight.astype(mx.float32).T
     return _fwd_loss(logits, targets)
 
 
 @fused_linear_cross_entropy_mean.vjp
 def _fused_linear_cross_entropy_mean_vjp(primals, cotangent, output):
     flat_x, weight, targets = primals
-    logits = flat_x @ weight.T
+    logits = flat_x.astype(mx.float32) @ weight.astype(mx.float32).T
     n = flat_x.shape[0]
     scale = cotangent / n
     grad_logits = _bwd_grad_logits(logits, targets, scale)
-    grad_x = grad_logits @ weight
-    grad_weight = grad_logits.T @ flat_x
+    grad_x = (grad_logits @ weight.astype(mx.float32)).astype(flat_x.dtype)
+    grad_weight = (grad_logits.T @ flat_x.astype(mx.float32)).astype(weight.dtype)
     return grad_x, grad_weight, mx.zeros_like(targets)

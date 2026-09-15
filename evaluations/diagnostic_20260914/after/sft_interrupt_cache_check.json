@@ -1,0 +1,6 @@
+{
+  "checkpoint": "sft_interrupt",
+  "max_logit_difference": 0.16644287109375,
+  "same_argmax": true,
+  "finite": true
+}

@@ -61,17 +61,18 @@ def apply_repetition_penalty(
 ) -> Logits:
     """Apply one repetition penalty per unique generated token, in place.
 
-    This follows the common sign-aware definition and intentionally does not
-    compound the penalty when a token has appeared multiple times.
+    Divide each repeated token's unnormalized probability by ``penalty``.
+    Subtracting log(penalty) is invariant to a common logit offset and does
+    not compound when a token has appeared multiple times.
     ``logits`` may be a NumPy vector or a one-dimensional Torch tensor.
     """
-    if penalty <= 0:
+    if not math.isfinite(penalty) or penalty <= 0:
         raise ValueError("repetition_penalty must be positive")
     if penalty == 1.0:
         return logits
+    log_penalty = math.log(penalty)
     for token_id in set(generated_token_ids):
-        value = logits[token_id]
-        logits[token_id] = value / penalty if value > 0 else value * penalty
+        logits[token_id] -= log_penalty
     return logits
 
 

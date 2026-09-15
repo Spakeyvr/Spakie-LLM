@@ -1,0 +1,32 @@
+{
+  "rows": 218849,
+  "unique_messages": 218849,
+  "duplicate_rows": 0,
+  "most_repeated": [
+    [
+      "a0ffaf627872c55faae66fa7035eae2fcc5108c5ff965b764495f74a61ffc063",
+      1
+    ],
+    [
+      "e6afaf05a8af359a7116b04778d5082c3a088bf80150c28703f48009f99cc9f6",
+      1
+    ],
+    [
+      "bec0d4c4c6c57dc95432c77db8a5b0afed5160a58783633049d893f7d368b20b",
+      1
+    ],
+    [
+      "980f464fae0fc857fd77f4f89262677f601a3a23465ac4a677ba3e541d4957fc",
+      1
+    ],
+    [
+      "d99d55a06be06ca12773d574f363b6cbad8ab9cbfe1ec64af27e8598356a28d2",
+      1
+    ]
+  ],
+  "roles": {
+    "user": 223437,
+    "assistant": 223437
+  },
+  "median_chars": 818
+}

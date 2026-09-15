@@ -4,6 +4,27 @@ Spakie-LLM is a GPT-style language model project with parallel PyTorch and MLX r
 
 ## Setup
 
+### Numerical precision and recovery runs
+
+Both backends compute the output projection and cross-entropy in float32,
+including when transformer weights/activations use BF16. Promoting before the
+projection preserves token-score differences when trained logits have a large
+common offset. This uses more head compute and memory than BF16 projection.
+The shared repetition penalty divides repeated tokens' unnormalized probability
+by the specified factor (`1.2` means a factor of `1/1.2`), once per unique token.
+It no longer depends on the sign or absolute offset of logits.
+
+Use `scripts/finetune.py --output-dir checkpoints/92m/my_run` to isolate a fresh
+SFT run's checkpoints and status. Specify `--source-checkpoint` explicitly when
+comparing runs. An interrupted checkpoint is not a completed SFT result; compare
+held-out answers as well as validation loss after a full epoch.
+
+Data preparation schema 5 counts overlapping repeated five-word spans only once.
+Existing arrays remain unchanged. New filtering requires a fresh preparation
+run; old partial shards must not be mixed with the revised filtering contract.
+
+### Installation
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate

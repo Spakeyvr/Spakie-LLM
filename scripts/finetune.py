@@ -297,7 +297,7 @@ def run_torch_finetune(args, config, jsonl_path, output_name, output_checkpoint_
     print(f"Device: {device.type}")
     print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
-    print(f"Checkpoint dir: {config.checkpoint_dir}")
+    print(f"Checkpoint dir: {output_checkpoint_dir}")
     print(f"DataLoader workers: {args.num_workers}")
     print_optimizer_banner(config.sft_optimizer, stage="SFT")
 
@@ -405,7 +405,7 @@ def run_mlx_finetune(args, config, jsonl_path, output_name, output_checkpoint_di
     print(f"Device: metal (mlx)")
     print(f"Precision: {runtime.precision}")
     print(f"Preset: {config.preset_name}")
-    print(f"Checkpoint dir: {config.checkpoint_dir}")
+    print(f"Checkpoint dir: {output_checkpoint_dir}")
     print_optimizer_banner(config.sft_optimizer, stage="SFT")
     print(
         f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | "
@@ -561,6 +561,7 @@ def main():
     parser.add_argument("--no-model-prompt", action="store_true",
                         help="Skip the interactive source model picker and use the default checkpoint")
     parser.add_argument("--output-name", type=str, default="", help="Filename for the best SFT checkpoint")
+    parser.add_argument("--output-dir", type=str, default="", help="Separate checkpoint and training-status directory for this run")
     parser.add_argument("--smoke", action="store_true", help="Run a one-epoch subset smoke test")
     parser.add_argument("--max-examples", type=int, default=0, help="Optional cap on loaded SFT examples")
     parser.add_argument("--epochs", type=int, default=0, help="Override number of SFT epochs")
@@ -801,6 +802,8 @@ def main():
     apply_sft_cli_overrides(config, args)
     args.source_checkpoint = resolved_source_checkpoint
     output_checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_sft") if args.smoke else config.checkpoint_dir
+    if args.output_dir:
+        output_checkpoint_dir = args.output_dir
 
     default_jsonl = os.path.join(config.chat_data_dir, "train.jsonl")
     jsonl_path = args.train_jsonl or default_jsonl
@@ -813,4 +816,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nFine-tuning interrupted.")
+        raise SystemExit(130)

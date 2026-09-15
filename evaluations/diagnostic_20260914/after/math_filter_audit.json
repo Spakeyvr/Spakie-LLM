@@ -1,0 +1,79 @@
+{
+  "before": {
+    "kept": 508,
+    "duplicate_5gram": 428,
+    "repeated_lines": 58,
+    "link_farm": 5,
+    "symbol_heavy": 1
+  },
+  "after": {
+    "kept": 811,
+    "repeated_lines": 58,
+    "duplicate_5gram": 124,
+    "link_farm": 5,
+    "symbol_heavy": 1,
+    "boilerplate": 1
+  },
+  "original_rejection_examples": [
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 2,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 4,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 6,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 9,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 16,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 17,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 21,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 23,
+      "now": "duplicate_5gram"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 27,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 30,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 31,
+      "now": "kept"
+    },
+    {
+      "file": "data/raw/large_corpus/finemath/shard-00000.jsonl",
+      "line": 34,
+      "now": "kept"
+    }
+  ]
+}
