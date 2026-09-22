@@ -61,6 +61,14 @@ python3 tokenizer/train_tokenizer.py
 Tokenizer samples pass the canonical domain-aware filters and are streamed in
 deterministic weighted-fair order using the final corpus plan. The five-million
 sample cap therefore follows the intended mix instead of lexical path order.
+Samples retain indentation, tabs, and line breaks through JSONL spooling and
+SentencePiece's iterator interface; repeated-space removal is disabled. These
+settings apply to newly trained tokenizers. Existing checkpoints must keep their
+original tokenizer: changing it requires new token arrays and a separately
+planned training or migration experiment.
+The inspection-only `.vocab` file escapes control characters using JSON string
+escapes (without surrounding quotes), so every token occupies one TSV row;
+the `.model` file retains the actual characters used by both model backends.
 
 3. Prepare fresh pretraining arrays:
 

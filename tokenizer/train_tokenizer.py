@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -51,8 +50,8 @@ def _iter_path_texts(paths: list[Path]) -> Iterator[str]:
                         if text:
                             yield text
             else:
-                text = path.read_text(encoding="utf-8", errors="replace").strip()
-                if text:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
                     yield text
         except OSError:
             continue
@@ -61,49 +60,24 @@ def _iter_path_texts(paths: list[Path]) -> Iterator[str]:
 def iter_sentencepiece_chunks(
     text: str, *, max_bytes: int = TOKENIZER_MAX_SENTENCE_BYTES
 ) -> Iterator[str]:
-    """Yield non-empty one-line samples that fit SentencePiece's byte limit."""
+    """Bound UTF-8 samples without changing indentation, tabs, or newlines.
+
+    These are iterator records, not lines in SentencePiece's text-file format.
+    Concatenating the chunks reconstructs the input exactly. A boundary may
+    split a word, but never a Unicode code point.
+    """
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
-    # Paragraph boundaries preserve useful local context. Whitespace inside a
-    # sample is normalized because SentencePiece consumes one sentence per line.
-    for paragraph in re.split(r"\n\s*\n", text):
-        words = paragraph.split()
-        if not words:
-            continue
-        current: list[str] = []
-        current_bytes = 0
-        for word in words:
-            encoded = word.encode("utf-8")
-            separator = 1 if current else 0
-            if current and current_bytes + separator + len(encoded) > max_bytes:
-                yield " ".join(current)
-                current = []
-                current_bytes = 0
-                separator = 0
-            if len(encoded) > max_bytes:
-                if current:
-                    yield " ".join(current)
-                    current = []
-                    current_bytes = 0
-                raw = encoded
-                while raw:
-                    cut = min(max_bytes, len(raw))
-                    while cut > 0:
-                        try:
-                            piece = raw[:cut].decode("utf-8")
-                            break
-                        except UnicodeDecodeError:
-                            cut -= 1
-                    if cut == 0:
-                        break
-                    if piece:
-                        yield piece
-                    raw = raw[cut:]
-                continue
-            current.append(word)
-            current_bytes += separator + len(encoded)
-        if current:
-            yield " ".join(current)
+    raw = text.encode("utf-8")
+    start = 0
+    while start < len(raw):
+        end = min(start + max_bytes, len(raw))
+        while end < len(raw) and end > start and raw[end] & 0xC0 == 0x80:
+            end -= 1
+        if end == start:
+            raise ValueError("max_bytes cannot fit a Unicode code point")
+        yield raw[start:end].decode("utf-8")
+        start = end
 
 
 def _source_name(root: Path, path: Path) -> str:
@@ -214,7 +188,7 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
     tmp_file = tempfile.NamedTemporaryFile(
         mode="w",
         prefix="spakie-tokenizer-",
-        suffix=".txt",
+        suffix=".jsonl",
         delete=False,
         encoding="utf-8",
     )
@@ -246,7 +220,9 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
                 text_transform=_clean_tokenizer_texts(config),
                 on_sample=note_sample,
             ):
-                tmp.write(sentence)
+                # JSONL spooling keeps collection bounded while retaining
+                # embedded newlines and indentation in each iterator record.
+                tmp.write(json.dumps(sentence, ensure_ascii=False))
                 tmp.write("\n")
                 count += 1
                 bytes_written += len(sentence.encode("utf-8")) + 1
@@ -268,24 +244,37 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
         )
         print(f"Collected {count:,} samples ({bytes_written / (1024 ** 3):.2f} GiB): {mix}")
         print(f"Training {config.vocab_size:,}-piece SentencePiece tokenizer …", flush=True)
-        spm.SentencePieceTrainer.train(
-            input=tmp_path,
-            model_prefix=str(temporary_prefix),
-            vocab_size=config.vocab_size,
-            model_type="bpe",
-            pad_id=0,
-            unk_id=1,
-            bos_id=2,
-            eos_id=3,
-            user_defined_symbols=SPECIAL_TOKENS,
-            byte_fallback=True,
-            normalization_rule_name="identity",
-            add_dummy_prefix=False,   # no leading-space artifact on first token
-            split_digits=True,        # each digit is its own token (better for arithmetic)
-            character_coverage=0.9999,
-            max_sentence_length=TOKENIZER_MAX_SENTENCE_BYTES,
-            num_threads=os.cpu_count(),
-        )
+        with (
+            open(tmp_path, encoding="utf-8") as samples,
+            open(str(temporary_prefix) + ".model", "wb") as model_file,
+        ):
+            spm.SentencePieceTrainer.train(
+                sentence_iterator=(json.loads(line) for line in samples),
+                model_writer=model_file,
+                vocab_size=config.vocab_size,
+                model_type="bpe",
+                pad_id=0,
+                unk_id=1,
+                bos_id=2,
+                eos_id=3,
+                user_defined_symbols=SPECIAL_TOKENS,
+                byte_fallback=True,
+                normalization_rule_name="identity",
+                remove_extra_whitespaces=False,
+                add_dummy_prefix=False,   # no leading-space artifact on first token
+                split_digits=True,        # each digit is its own token (better for arithmetic)
+                character_coverage=0.9999,
+                max_sentence_length=TOKENIZER_MAX_SENTENCE_BYTES,
+                num_threads=os.cpu_count(),
+            )
+        # Literal newline/tab pieces are valid in the binary model, but break
+        # SentencePiece's plain TSV vocabulary export. Escape this inspection
+        # file only; runtime token IDs and pieces come from the binary model.
+        trained = spm.SentencePieceProcessor(model_file=str(temporary_prefix) + ".model")
+        with open(str(temporary_prefix) + ".vocab", "w", encoding="utf-8") as vocab_file:
+            for index in range(trained.get_piece_size()):
+                piece = json.dumps(trained.id_to_piece(index), ensure_ascii=False)[1:-1]
+                vocab_file.write(f"{piece}\t{trained.get_score(index)}\n")
         os.replace(
             str(temporary_prefix) + ".vocab",
             str(output_prefix) + ".vocab",

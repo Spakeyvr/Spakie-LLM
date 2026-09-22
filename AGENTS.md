@@ -2,6 +2,18 @@
 
 This file provides guidance to AI agents when working with code in this repository.
 
+## Repository hygiene
+
+- Keep maintained user documentation in `README.md`; do not create standalone
+  task plans, completion reports, or benchmark diaries in the repository root.
+- Put disposable experiment reports, logs, snapshots, and generated artifacts
+  under the ignored `evaluations/` directory (or `bench_results/` for benchmarks).
+  Prefer a chat summary when a persistent report is unnecessary.
+- Keep reusable evaluation code in `scripts/` and regression tests in `tests/`.
+  They must work without local evaluation output directories.
+- Before finishing, check `git status --short` for accidental generated files.
+  Ignore specific artifact directories, never all Markdown files or `tests/`.
+
 ## Setup
 
 ```bash

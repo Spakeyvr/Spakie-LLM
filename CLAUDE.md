@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Follow the repository hygiene rules in [AGENTS.md](AGENTS.md): keep temporary
+reports and generated runs in ignored output directories, and keep reusable
+code and tests independent of those outputs.
+
 ## Setup
 
 ```bash

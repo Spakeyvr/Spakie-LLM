@@ -17,9 +17,9 @@ checkpoints/
 # Benchmark outputs
 bench_results/
 
-# Bulky generated evaluation outputs (keep reports and experiment logs)
-evaluations/**/results/
-evaluations/**/*_training_loss.csv
+# Local evaluation runs: reports, plans, logs, snapshots, and model artifacts.
+# Reusable evaluation code and regression tests belong in scripts/ and tests/.
+/evaluations/
 
 # Tokenizer model (generated)
 tokenizer/spakie.model

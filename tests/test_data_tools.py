@@ -828,7 +828,7 @@ class TokenizerSamplingTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     train_tokenizer.train_tokenizer(config, max_sentences=10)
 
-            leftovers = list(Path(tmpdir).glob("spakie-tokenizer-*.txt"))
+            leftovers = list(Path(tmpdir).glob("spakie-tokenizer-*"))
 
         self.assertEqual(leftovers, [])
 
