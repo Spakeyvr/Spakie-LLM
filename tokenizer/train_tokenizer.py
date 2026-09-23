@@ -93,6 +93,9 @@ def iter_training_texts(
     source_weights: dict[str, int] | None = None,
     text_transform: Callable[[str, str], str | None] | None = None,
     on_sample: Callable[[str, int], None] | None = None,
+    sampling_unit: str = "samples",
+    on_source_exhausted: Callable[[str], None] | None = None,
+    stop_on_source_exhaustion: bool = False,
 ):
     """Yield a deterministic weighted sample across corpus sources.
 
@@ -101,6 +104,8 @@ def iter_training_texts(
     fair scheduling follows the final corpus plan while keeping memory bounded
     by source count and retaining deterministic output.
     """
+    if sampling_unit not in ("samples", "bytes"):
+        raise ValueError("sampling_unit must be samples or bytes")
     root = Path(raw_root)
     grouped: dict[str, list[Path]] = {}
     for path in sorted(root.rglob("*")):
@@ -122,18 +127,28 @@ def iter_training_texts(
     }
     active = {source: source_chunks(source) for source in sorted(grouped)}
     credit = {source: 0.0 for source in active}
+    emitted_bytes = {source: 0 for source in active}
     while active:
-        total_weight = sum(weights[source] for source in active)
-        for source in active:
-            credit[source] += weights[source] / total_weight
-        source = max(sorted(active), key=lambda name: credit[name])
+        if sampling_unit == "bytes":
+            source = min(sorted(active), key=lambda name: emitted_bytes[name] / weights[name])
+        else:
+            total_weight = sum(weights[source] for source in active)
+            for source in active:
+                credit[source] += weights[source] / total_weight
+            source = max(sorted(active), key=lambda name: credit[name])
         try:
             sample = next(active[source])
+            size = len(sample.encode("utf-8"))
             if on_sample is not None:
-                on_sample(source, len(sample.encode("utf-8")))
+                on_sample(source, size)
+            emitted_bytes[source] += size
             yield sample
             credit[source] -= 1.0
         except StopIteration:
+            if on_source_exhausted is not None:
+                on_source_exhausted(source)
+            if stop_on_source_exhaustion:
+                return
             del active[source]
             del credit[source]
 
@@ -169,7 +184,9 @@ def _clean_tokenizer_texts(config: SpakieConfig) -> Callable[[str, str], str | N
     return transform
 
 
-def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_000_000):
+def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_000_000,
+                    *, sampling_unit: str = "samples", max_bytes: int | None = None,
+                    stop_on_source_exhaustion: bool = False):
     """Train SentencePiece from cleaned text weighted to the corpus plan.
 
     Args:
@@ -177,11 +194,19 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
         max_sentences: Cap on bounded samples written to the training file. Prevents
                        multi-GB temp files when training on large corpora.
     """
+    if sampling_unit not in ("samples", "bytes"):
+        raise ValueError("sampling_unit must be samples or bytes")
+    if max_bytes is not None and max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
     config = config or SpakieConfig()
+    from runtime.corpus_contracts import validate_raw_code_provenance
+    validate_raw_code_provenance(config.raw_data_dir)
     max_sentences = max(1, int(max_sentences))
     count = 0
     bytes_written = 0
     source_counts: Counter[str] = Counter()
+    source_bytes: Counter[str] = Counter()
+    exhausted_sources: list[str] = []
     current_source = ""
     output_prefix = Path(config.tokenizer_prefix)
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -200,7 +225,6 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
     def note_sample(source: str, _sample_bytes: int) -> None:
         nonlocal current_source
         current_source = source
-        source_counts[source] += 1
 
     try:
         source_weights = {
@@ -219,20 +243,35 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
                 source_weights=source_weights,
                 text_transform=_clean_tokenizer_texts(config),
                 on_sample=note_sample,
+                sampling_unit=sampling_unit,
+                on_source_exhausted=exhausted_sources.append,
+                stop_on_source_exhaustion=stop_on_source_exhaustion,
             ):
+                if max_bytes is not None:
+                    remaining = max_bytes - bytes_written
+                    if remaining <= 0:
+                        break
+                    sentence = sentence.encode("utf-8")[:remaining].decode("utf-8", errors="ignore")
+                    if not sentence:
+                        if count == 0:
+                            raise ValueError("max_bytes cannot fit the first UTF-8 character")
+                        break
                 # JSONL spooling keeps collection bounded while retaining
                 # embedded newlines and indentation in each iterator record.
                 tmp.write(json.dumps(sentence, ensure_ascii=False))
                 tmp.write("\n")
                 count += 1
-                bytes_written += len(sentence.encode("utf-8")) + 1
+                size = len(sentence.encode("utf-8"))
+                bytes_written += size
+                source_counts[current_source] += 1
+                source_bytes[current_source] += size
                 progress.update(1)
                 if count % 1_000 == 0:
                     progress.set_postfix_str(
                         f"{bytes_written / (1024 ** 3):.2f} GiB, {current_source}",
                         refresh=False,
                     )
-                if count >= max_sentences:
+                if count >= max_sentences or (max_bytes is not None and bytes_written >= max_bytes):
                     break
 
         if count == 0:
@@ -243,6 +282,12 @@ def train_tokenizer(config: SpakieConfig | None = None, max_sentences: int = 5_0
             for source, amount in source_counts.most_common()
         )
         print(f"Collected {count:,} samples ({bytes_written / (1024 ** 3):.2f} GiB): {mix}")
+        print("Tokenizer sampling: " + json.dumps({
+            "sampling_unit": sampling_unit, "utf8_bytes": bytes_written,
+            "source_samples": dict(source_counts), "source_utf8_bytes": dict(source_bytes),
+            "exhausted_sources": exhausted_sources,
+            "stop_on_source_exhaustion": stop_on_source_exhaustion,
+        }, sort_keys=True), flush=True)
         print(f"Training {config.vocab_size:,}-piece SentencePiece tokenizer …", flush=True)
         with (
             open(tmp_path, encoding="utf-8") as samples,
@@ -497,8 +542,28 @@ def main() -> None:
         default=5_000_000,
         help="Maximum cleaned SentencePiece samples (default: 5,000,000)",
     )
+    parser.add_argument('--raw-data-dir', help='Input corpus root, for an isolated rebuild')
+    parser.add_argument('--output-prefix', help='Output tokenizer prefix without .model')
+    parser.add_argument('--langid-model-path', help='Use an existing local language-ID model')
+    parser.add_argument('--sampling-unit', choices=('samples', 'bytes'), default='samples',
+                        help='Balance corpus weights by chunk count (default) or UTF-8 bytes')
+    parser.add_argument('--max-bytes', type=int,
+                        help='Optional upper bound on cleaned UTF-8 fitting bytes')
+    parser.add_argument('--stop-on-source-exhaustion', action='store_true',
+                        help='Stop collection when a source runs out instead of redistributing its weight')
     args = parser.parse_args()
-    train_tokenizer(max_sentences=max(1, args.max_sentences))
+    config = SpakieConfig()
+    if args.raw_data_dir:
+        config.raw_data_dir = args.raw_data_dir
+    if args.output_prefix:
+        config.tokenizer_prefix = args.output_prefix
+    if args.langid_model_path:
+        config.langid_model_path = args.langid_model_path
+    if args.max_bytes is not None and args.max_bytes <= 0:
+        parser.error('--max-bytes must be positive')
+    train_tokenizer(config, max_sentences=max(1, args.max_sentences),
+                    sampling_unit=args.sampling_unit, max_bytes=args.max_bytes,
+                    stop_on_source_exhaustion=args.stop_on_source_exhaustion)
 
 
 if __name__ == "__main__":

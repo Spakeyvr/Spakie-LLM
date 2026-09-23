@@ -15,6 +15,11 @@ class PretrainAblationTests(unittest.TestCase):
         self.assertEqual(len({tuple(command) for command in commands}), 6)
         self.assertTrue(all("--target_tokens" in command for command in commands))
         self.assertTrue(all("--pretrain-lr" in command for command in commands))
+        self.assertTrue(all(command[command.index("--seed") + 1] == "42" for command in commands))
+
+    def test_seed_override_is_shared_across_the_matrix(self):
+        commands = build_commands(parse_args(["--seed", "29"]))
+        self.assertTrue(all(command[command.index("--seed") + 1] == "29" for command in commands))
 
     def test_torch_matrix_includes_device(self):
         args = parse_args([

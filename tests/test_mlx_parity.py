@@ -52,6 +52,26 @@ def _skip_if_no_mlx():
 
 @unittest.skipIf(_skip_if_no_mlx(), "MLX/Metal unavailable")
 class TorchMLXForwardParityTests(unittest.TestCase):
+    def test_explicit_seed_repeats_mlx_initialization_without_resetting_resume_rng(self):
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
+        from model.transformer_mlx import SpakieGPTMLX
+        from scripts.train import seed_fresh_run
+
+        def weights(seed):
+            seed_fresh_run(seed, "mlx")
+            model = SpakieGPTMLX(self._tiny_config())
+            return np.concatenate([np.asarray(value).ravel() for _, value in tree_flatten(model.parameters())])
+
+        first = weights(17)
+        np.testing.assert_array_equal(first, weights(17))
+        self.assertFalse(np.array_equal(first, weights(29)))
+        mx.random.seed(17)
+        expected = np.asarray(mx.random.uniform(shape=(8,)))
+        mx.random.seed(17)
+        seed_fresh_run(29, "mlx", resuming=True)
+        np.testing.assert_array_equal(expected, np.asarray(mx.random.uniform(shape=(8,))))
+
     @staticmethod
     def _tiny_config() -> SpakieConfig:
         return SpakieConfig(

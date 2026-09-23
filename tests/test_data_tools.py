@@ -1,6 +1,8 @@
 import _thread
+import ast
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -96,6 +98,69 @@ class CompactResumeIndexTests(unittest.TestCase):
             download_pretrain_corpus.exit_process(130)
 
         hard_exit.assert_called_once_with(130)
+
+    def test_exit_helper_preserves_status_without_waiting_for_foreign_threads(self):
+        for code in (0, 1, 130):
+            with self.subTest(exit_code=code):
+                script = (
+                    "import threading\n"
+                    "from scripts.download_pretrain_corpus import exit_process\n"
+                    "threading.Thread(target=threading.Event().wait, daemon=False).start()\n"
+                    "print('durable work finished')\n"
+                    f"exit_process({code})\n"
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", script],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, code)
+                self.assertIn("durable work finished", result.stdout)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_exception_reports_failure_without_waiting_for_foreign_threads(self):
+        script = (
+            "import argparse, runpy, threading\n"
+            "def fail(*args, **kwargs):\n"
+            "    threading.Thread(target=threading.Event().wait, daemon=False).start()\n"
+            "    raise RuntimeError('injected CLI failure')\n"
+            "argparse.ArgumentParser.parse_args = fail\n"
+            "runpy.run_path('scripts/download_pretrain_corpus.py', run_name='__main__')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("RuntimeError: injected CLI failure", result.stderr)
+
+    def test_interrupted_progress_write_preserves_previous_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = download_pretrain_corpus.SourceState(
+                Path(tmpdir),
+                download_pretrain_corpus.SourceBudget("arxiv", "technical", 400, 0, 100),
+                resume=False,
+            )
+            try:
+                state.save()
+                previous = state.progress_path.read_bytes()
+                state.progress["hf_rows_seen"] = 7
+
+                def interrupted_dump(value, handle, **kwargs):
+                    handle.write('{"partial":')
+                    raise KeyboardInterrupt
+
+                with patch.object(download_pretrain_corpus.json, "dump", interrupted_dump):
+                    with self.assertRaises(KeyboardInterrupt):
+                        state.save()
+                self.assertEqual(state.progress_path.read_bytes(), previous)
+                self.assertEqual(json.loads(previous)["hf_rows_seen"], 0)
+                state.save()
+                self.assertEqual(json.loads(state.progress_path.read_text())["hf_rows_seen"], 7)
+                self.assertFalse(state.progress_path.with_suffix(".json.tmp").exists())
+            finally:
+                state.close()
 
     def test_ctrl_c_returns_without_waiting_for_blocked_source_worker(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -258,6 +323,9 @@ class CompactResumeIndexTests(unittest.TestCase):
                 )
             state.close()
 
+            written = [json.loads(line) for file in Path(tmpdir).glob('*.jsonl') for line in file.read_text().splitlines()]
+            self.assertEqual(written[0]['text'], FakeStream().rows[0]['text'])
+
         self.assertEqual(state.progress["docs_written"], 1)
 
     def test_python_edu_materialized_migration_keeps_output_accounting(self):
@@ -294,6 +362,7 @@ class CompactResumeIndexTests(unittest.TestCase):
 
         self.assertEqual(migrated["estimated_tokens"], 123)
         self.assertEqual(migrated["docs_written"], 2)
+        self.assertTrue(migrated["python_edu_requires_fresh_download"])
         self.assertEqual(migrated["hf_variant_index"], 0)
         self.assertEqual(migrated["hf_rows_seen"], 0)
         self.assertEqual(
@@ -728,6 +797,82 @@ class TargetedDataSplitTests(unittest.TestCase):
 
 
 class TokenizerSamplingTests(unittest.TestCase):
+    def test_byte_weighting_handles_unequal_utf8_chunk_lengths(self):
+        import itertools
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for source, text in (("aaa", "é" * 150), ("zzz", "z" * 100)):
+                path = root / "large_corpus" / source / "data.jsonl"
+                path.parent.mkdir(parents=True)
+                path.write_text((json.dumps({"text": text}) + "\n") * 200)
+            observations = []
+            def collect():
+                seen = []
+                samples = list(itertools.islice(train_tokenizer.iter_training_texts(
+                    str(root), source_weights={"aaa": 3, "zzz": 1}, sampling_unit="bytes",
+                    on_sample=lambda source, size: seen.append((source, size))), 60))
+                observations.append(seen)
+                return samples
+            self.assertEqual(collect(), collect())
+            self.assertEqual(observations[0], observations[1])
+            a = sum(size for source, size in observations[0] if source == "aaa")
+            b = sum(size for source, size in observations[0] if source == "zzz")
+            self.assertLessEqual(abs(a - 3 * b), 300)
+            self.assertTrue(all(size == (300 if source == "aaa" else 100)
+                                for source, size in observations[0]))
+
+    def test_byte_sampling_reports_and_can_stop_on_exhaustion(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for source, count in (("aaa", 1), ("zzz", 8)):
+                path = root / "large_corpus" / source / "data.jsonl"
+                path.parent.mkdir(parents=True)
+                path.write_text((json.dumps({"text": source}) + "\n") * count)
+            for unit in ("samples", "bytes"):
+                with self.subTest(sampling_unit=unit):
+                    exhausted = []
+                    stopped = list(train_tokenizer.iter_training_texts(
+                        str(root), sampling_unit=unit, stop_on_source_exhaustion=True,
+                        on_source_exhausted=exhausted.append))
+                    self.assertEqual(stopped, ["aaa", "zzz"])
+                    self.assertEqual(exhausted, ["aaa"])
+                    exhausted.clear()
+                    continued = list(train_tokenizer.iter_training_texts(
+                        str(root), sampling_unit=unit, on_source_exhausted=exhausted.append))
+                    self.assertEqual(len(continued), 9)
+                    self.assertEqual(exhausted, ["aaa", "zzz"])
+
+    def test_tokenizer_byte_budget_does_not_split_unicode(self):
+        real_named_temporary_file = tempfile.NamedTemporaryFile
+        captured = []
+        def samples(*args, **kwargs):
+            kwargs["on_sample"]("aaa", 6)
+            yield "ééé"
+        def trainer(**kwargs):
+            captured.extend(kwargs["sentence_iterator"])
+            raise KeyboardInterrupt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpakieConfig(tokenizer_prefix=str(Path(tmpdir) / "tokenizer"))
+            with patch.object(train_tokenizer, "iter_training_texts", side_effect=samples), \
+                 patch.object(train_tokenizer.spm.SentencePieceTrainer, "train", side_effect=trainer), \
+                 patch.object(train_tokenizer.tempfile, "NamedTemporaryFile",
+                              side_effect=lambda **kw: real_named_temporary_file(dir=tmpdir, **kw)):
+                with self.assertRaises(KeyboardInterrupt):
+                    train_tokenizer.train_tokenizer(config, max_bytes=5)
+            self.assertFalse(list(Path(tmpdir).glob("*.model")))
+            self.assertFalse(list(Path(tmpdir).glob(".*.tmp*")))
+            self.assertFalse(list(Path(tmpdir).glob("spakie-tokenizer-*")))
+        self.assertEqual(captured, ["éé"])
+
+    def test_tokenizer_byte_budget_too_small_has_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = SpakieConfig(tokenizer_prefix=str(Path(tmpdir) / "tokenizer"))
+            with patch.object(train_tokenizer, "iter_training_texts", return_value=iter(["é"])), \
+                 patch.object(train_tokenizer.spm.SentencePieceTrainer, "train") as trainer:
+                with self.assertRaisesRegex(ValueError, "first UTF-8 character"):
+                    train_tokenizer.train_tokenizer(config, max_bytes=1)
+            trainer.assert_not_called()
+
     def test_training_texts_interleave_sources_deterministically(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -839,7 +984,29 @@ class PretrainCleaningTests(unittest.TestCase):
         cleaned = download_pretrain_corpus.normalize_text(
             text, preserve_indentation=True
         )
-        self.assertEqual(cleaned, "def outer():\n    if True:\n        return 1")
+        self.assertEqual(cleaned, "def outer():\n    if True:\n        return 1   \n")
+
+    def test_code_cleaning_preserves_literal_values_through_download_and_prepare(self):
+        text = ('def render():\r\n'
+                '    return """<strong>hello</strong>  \r\n'
+                'navigation\r\n\r\n\r\n'
+                '\t<p>content</p>  \r\n"""\r\n')
+        expected = text.replace("\r\n", "\n")
+        downloaded = download_pretrain_corpus.normalize_text(text, preserve_indentation=True)
+        cleaned = prepare_data.clean_text(downloaded, "python_edu")
+        self.assertEqual(cleaned, expected)
+        self.assertEqual(ast.dump(ast.parse(cleaned)), ast.dump(ast.parse(text)))
+        # Execute only this controlled test fixture, never downloaded code.
+        original_namespace, cleaned_namespace = {}, {}
+        exec(text, original_namespace)
+        exec(cleaned, cleaned_namespace)
+        self.assertEqual(original_namespace["render"](), cleaned_namespace["render"]())
+
+    def test_prose_cleanup_still_removes_navigation_and_collapses_whitespace(self):
+        self.assertEqual(
+            prepare_data.clean_text("<p>A  fact.</p>\nnavigation\n\n\nMore text.", "wikipedia_snapshot"),
+            "A fact.\n\nMore text.",
+        )
 
     def test_structured_cleaning_preserves_math_code_and_indexing(self):
         text = "  def f(x):\n    return values[1] if x < y else values[2]  "

@@ -187,7 +187,7 @@ def load_no_robots(limit: int, seed: int) -> list[dict]:
     for row in rows:
         category = trim(row.get("category", ""))
         # The Chat category intentionally contains role-play personas. Those
-        # conflict with Spakie-180M's stable identity, so keep the other
+        # conflict with Spakie's stable identity, so keep the other
         # human-written instruction categories and preserve their task prompt.
         if category.lower() == "chat":
             continue
@@ -474,7 +474,8 @@ def main() -> int:
         return 1
 
     print(f"\nRaw SFT files written to {args.output_dir}/.")
-    print("Next: run `python3 scripts/prepare_sft.py` to merge into data/chat/train.jsonl.")
+    print("Next: run `python3 scripts/build_sft_seed_data.py`, then "
+          "`python3 scripts/prepare_sft.py` to merge into data/chat/train.jsonl.")
     return 0
 
 

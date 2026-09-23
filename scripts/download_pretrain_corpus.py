@@ -18,6 +18,7 @@ import queue
 import re
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -104,7 +105,7 @@ DEFAULT_HF_WORKERS = 4
 DEFAULT_SOURCE_RETRIES = 3
 PYTHON_EDU_DATASET = "Avelina/python-edu-cleaned"
 PYTHON_EDU_REVISION = "3fedf55e02e72dd1fd68963f991f5e91adcb0f8d"
-PYTHON_EDU_FILTER_SCHEMA_VERSION = 2
+PYTHON_EDU_FILTER_SCHEMA_VERSION = 4
 
 
 _HTTP_CLIENTS = threading.local()
@@ -436,13 +437,12 @@ def html_to_text(raw_html: str) -> str:
 def normalize_text(text: str, *, preserve_indentation: bool = False) -> str:
     text = re.sub(r"\r\n?", "\n", text)
     if preserve_indentation:
-        # Code indentation is semantic. Only discard trailing horizontal
-        # whitespace; never collapse leading spaces or tabs.
-        text = "\n".join(line.rstrip(" \t") for line in text.split("\n"))
-    else:
-        text = re.sub(r"[ \t]+", " ", text)
+        # Blank lines and trailing spaces are semantic inside multiline
+        # strings too. Normalize source line endings, not string contents.
+        return text
+    text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip("\n") if preserve_indentation else text.strip()
+    return text.strip()
 
 
 def sanitize_filename(name: str, max_len: int = 120) -> str:
@@ -451,7 +451,7 @@ def sanitize_filename(name: str, max_len: int = 120) -> str:
     return (name or "shard")[:max_len]
 
 
-def pick_first(record: dict, fields: tuple[str, ...]) -> str:
+def pick_first(record: dict, fields: tuple[str, ...], *, preserve_whitespace: bool = False) -> str:
     for field in fields:
         value = record
         for component in field.split("."):
@@ -460,7 +460,7 @@ def pick_first(record: dict, fields: tuple[str, ...]) -> str:
                 break
             value = value.get(component)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return value if preserve_whitespace else value.strip()
     return ""
 
 
@@ -814,6 +814,8 @@ class SourceState:
         progress["remaining_tokens_estimate"] = max(self.budget.target_tokens_estimate - int(progress.get("estimated_tokens", 0)), 0)
         progress["remaining_chars"] = max(self.budget.target_chars - int(progress.get("chars_written", 0)), 0)
         if self.budget.source_name == "python_edu":
+            from runtime.corpus_contracts import mark_retained_lossy_code
+            mark_retained_lossy_code(progress, source_dir=self.source_dir if self.resume else None)
             progress["python_edu_dataset"] = PYTHON_EDU_DATASET
             progress["python_edu_revision"] = PYTHON_EDU_REVISION
             progress["python_edu_filter_schema_version"] = PYTHON_EDU_FILTER_SCHEMA_VERSION
@@ -827,8 +829,10 @@ class SourceState:
         if self.hf_dataset is not None:
             self.progress["hf_stream_state"] = self.hf_dataset.state_dict()
         self._refresh_progress_metadata(self.progress)
-        with self.progress_path.open("w", encoding="utf-8") as handle:
+        temp_path = self.progress_path.with_suffix(".json.tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
             json.dump(self.progress, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, self.progress_path)
 
     def _flush_seen(self, path: Path, values: set[str]) -> None:
         if not values:
@@ -987,7 +991,7 @@ def load_hf_stream(source_name: str, preferred_variant: int | None = None):
 
 def format_hf_record(source_name: str, row: dict, variant: dict) -> dict | None:
     spec = HF_DATASETS[source_name]
-    text = pick_first(row, spec["text_fields"])
+    text = pick_first(row, spec["text_fields"], preserve_whitespace=source_name == 'python_edu')
     if not text:
         return None
     title = pick_first(row, spec["title_fields"])
@@ -1497,6 +1501,8 @@ def migrate_python_edu_to_materialized(
     # Stream states are dataset-specific. Keep all committed output, token
     # counts, and seen-ID indexes, but replay the new bulk stream from its
     # beginning; accepted blob IDs make that replay duplicate-safe.
+    from runtime.corpus_contracts import mark_retained_lossy_code
+    mark_retained_lossy_code(progress, source_dir=progress_path.parent)
     progress["hf_variant_index"] = 0
     progress["hf_rows_seen"] = 0
     progress["python_edu_dataset"] = PYTHON_EDU_DATASET
@@ -1545,6 +1551,7 @@ def should_defer_legacy_cursor(progress: dict, budget: SourceBudget) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download a large pretraining corpus into JSONL shards")
     parser.add_argument("--sources", type=str, default="all", help="Comma-separated list of sources")
+    parser.add_argument("--output-dir", type=str, default="", help="Corpus source directory; use a new path to preserve existing downloads")
     parser.add_argument("--target_tokens_estimate", type=int, default=0, help="Estimated processed token target")
     parser.add_argument("--max_docs", type=int, default=0, help="Optional per-source document cap")
     parser.add_argument(
@@ -1590,6 +1597,8 @@ def main() -> int:
     STOP_EVENT.clear()
 
     config = SpakieConfig()
+    if args.output_dir:
+        config.large_corpus_dir = args.output_dir
     root = Path(config.large_corpus_dir)
     root.mkdir(parents=True, exist_ok=True)
 
@@ -1863,15 +1872,15 @@ def main() -> int:
 
 
 def exit_process(exit_code: int) -> None:
-    """Exit promptly after a flushed Ctrl+C shutdown.
+    """Finish the CLI after main has closed writers and saved source progress.
 
     Hugging Face/fsspec may leave non-daemon retry workers alive after the
-    downloader's own source workers have saved and closed. A normal
-    ``sys.exit(130)`` waits for those third-party workers during interpreter
-    shutdown, which can produce retries against closed file descriptors.
+    downloader's own source workers have saved and closed. Arrow can also
+    deadlock in native thread-pool destruction after a successful download.
+    Avoid third-party interpreter teardown for every completed CLI outcome,
+    preserving the exact status code. Imported callers can use main() normally;
+    this process-exit helper belongs only at the executable boundary.
     """
-    if exit_code != 130:
-        raise SystemExit(exit_code)
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
@@ -1887,4 +1896,8 @@ if __name__ == "__main__":
         STOP_EVENT.set()
         log("\nInterrupted while downloading pretraining data.")
         code = 130
+    except Exception:
+        STOP_EVENT.set()
+        traceback.print_exc()
+        code = 1
     exit_process(code)

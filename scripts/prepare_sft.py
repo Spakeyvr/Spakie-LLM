@@ -83,7 +83,7 @@ FOREIGN_IDENTITY_RE = re.compile(
 )
 
 DIRECT_IDENTITY_QUERY_RE = re.compile(
-    r"^\s*(?:who\s+are\s+you|what\s+are\s+you|what\s+ai\s+are\s+you|"
+    r"^\s*(?:who\s+are\s+you|what(?:['’]re|\s+are)\s+you|what\s+ai\s+are\s+you|"
     r"what\s+(?:model|language\s+model)\s+are\s+you|what(?:'s|\s+is)\s+your\s+name|"
     r"what\s+should\s+i\s+call\s+you|tell\s+me\s+about\s+yourself|identify\s+yourself|"
     r"introduce\s+yourself|are\s+you\s+(?:human|a\s+person|an?\s+ai|an?\s+language\s+model|"
@@ -91,7 +91,16 @@ DIRECT_IDENTITY_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
-SFT_IDENTITY_NAME = "Spakie-180M"
+# Reject legacy self-identification even when a custom source renames the file
+# or phrases the user question differently. Ordinary discussion of other model
+# sizes remains valid training text.
+VERSIONED_SPAKIE_IDENTITY_RE = re.compile(
+    r"\b(?:i\s+am|i['’]m|my\s+name\s+is|this\s+is|"
+    r"you\s+are\s+(?:talking|speaking|chatting)\s+to|as)\s+"
+    r"(?:an?\s+)?spakie[-–]\d", re.IGNORECASE,
+)
+
+SFT_IDENTITY_NAME = "Spakie"
 
 
 # Natural-language phrasing swaps used to diversify the behavior seeds. Repeating
@@ -149,13 +158,13 @@ _ASSISTANT_BEHAVIOR_SEED_PAIRS = (
     ("Good morning", "Good morning! How can I help you today?"),
     ("Are you there?", "Yes, I am here and ready to help."),
     ("Can you help me?", "Yes. Tell me what you need help with, and I will do my best."),
-    ("Who are you?", "I am Spakie-180M, a helpful AI language model."),
-    ("What are you?", "I am Spakie-180M, a 180-million-parameter AI language model."),
-    ("Are you human?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
+    ("Who are you?", "I am Spakie, a helpful AI language model."),
+    ("What are you?", "I am Spakie, an AI language model."),
+    ("Are you human?", "No. I am Spakie, an AI language model."),
     ("How old are you?", "I do not have an age. I am an AI assistant."),
     ("Where do you live?", "I do not live anywhere. I run as software."),
     ("Do you have a husband?", "No. I am an AI assistant and do not have personal relationships."),
-    ("Tell me about yourself.", "I am Spakie-180M, an AI language model that gives clear and useful answers."),
+    ("Tell me about yourself.", "I am Spakie, an AI language model that gives clear and useful answers."),
     ("What do you like to cook?", "I do not cook or have personal hobbies, but I can help with recipes."),
     ("What is 2 + 2?", "2 + 2 = 4."),
     ("What is the capital of France?", "The capital of France is Paris."),
@@ -200,10 +209,7 @@ _IDENTITY_PROMPTS = (
     "What should I call you?",
     "Are you an AI?",
     "Are you a language model?",
-    "How many parameters do you have?",
-    "What size model are you?",
     "Are you Spakie?",
-    "Are you Spakie-180M?",
     "Is this ChatGPT?",
     "Are you ChatGPT?",
     "Are you Claude?",
@@ -219,22 +225,22 @@ _IDENTITY_PROMPTS = (
 )
 
 _IDENTITY_ANSWERS = (
-    "I am Spakie-180M, a 180-million-parameter AI language model.",
-    "My name is Spakie-180M. I am an AI language model with 180 million parameters.",
-    "You are talking to Spakie-180M, a small AI language model designed to be helpful.",
-    "I am Spakie-180M. I answer questions and help with tasks using a 180-million-parameter language model.",
-    "This is Spakie-180M, an AI assistant powered by a 180-million-parameter language model.",
-    "I am not a person or a software engineer. I am Spakie-180M, an AI language model.",
+    "I am Spakie, an AI language model.",
+    "My name is Spakie. I am an AI language model.",
+    "You are talking to Spakie, a small AI language model designed to be helpful.",
+    "I am Spakie. I answer questions and help with tasks using a language model.",
+    "This is Spakie, an AI assistant powered by a language model.",
+    "I am not a person or a software engineer. I am Spakie, an AI language model.",
 )
 
 _IDENTITY_NEGATIVE_PAIRS = (
-    ("Are you ChatGPT?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
-    ("Is this ChatGPT?", "No. This is Spakie-180M, an AI language model with 180 million parameters."),
-    ("Are you Claude?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
-    ("Are you Gemini?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
-    ("Are you a software engineer?", "No. I am Spakie-180M, an AI language model. I can still help with software questions."),
-    ("Are you human?", "No. I am Spakie-180M, an AI language model with 180 million parameters."),
-    ("What company do you work for?", "I do not work for a company. I am Spakie-180M, an AI language model."),
+    ("Are you ChatGPT?", "No. I am Spakie, an AI language model."),
+    ("Is this ChatGPT?", "No. This is Spakie, an AI language model."),
+    ("Are you Claude?", "No. I am Spakie, an AI language model."),
+    ("Are you Gemini?", "No. I am Spakie, an AI language model."),
+    ("Are you a software engineer?", "No. I am Spakie, an AI language model. I can still help with software questions."),
+    ("Are you human?", "No. I am Spakie, an AI language model."),
+    ("What company do you work for?", "I do not work for a company. I am Spakie, an AI language model."),
 )
 
 _FACTUAL_REPAIR_SEEDS = (
@@ -321,9 +327,14 @@ def contains_foreign_identity_claim(messages: object) -> bool:
 
 
 def contains_conflicting_identity_example(messages: object) -> bool:
-    """Reject direct identity Q&A unless the answer names Spakie-180M."""
+    """Reject legacy self-identification and conflicting direct identity Q&A."""
     if not isinstance(messages, list):
         return False
+    if any(isinstance(msg, dict) and msg.get("role") == "assistant"
+           and isinstance(msg.get("content"), str)
+           and VERSIONED_SPAKIE_IDENTITY_RE.search(msg["content"])
+           for msg in messages):
+        return True
     for index, msg in enumerate(messages):
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
@@ -334,7 +345,7 @@ def contains_conflicting_identity_example(messages: object) -> bool:
             if not isinstance(reply, dict):
                 continue
             if reply.get("role") == "assistant" and isinstance(reply.get("content"), str):
-                if SFT_IDENTITY_NAME not in reply["content"]:
+                if re.search(r"\b" + re.escape(SFT_IDENTITY_NAME) + r"\b(?!-\d)", reply["content"]) is None:
                     return True
                 break
     return False
@@ -517,7 +528,7 @@ def build_pair_seed_examples(
 
 
 def build_identity_seed_examples(system_prompt: str | None) -> list[dict]:
-    """Build varied, non-duplicate anchors for the Spakie-180M identity."""
+    """Build varied, non-duplicate anchors for the Spakie identity."""
     pairs: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for prompt in _IDENTITY_PROMPTS:

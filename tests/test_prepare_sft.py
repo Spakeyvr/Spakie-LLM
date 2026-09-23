@@ -143,7 +143,7 @@ class PrepareSFTTests(unittest.TestCase):
         )
         self.assertFalse(
             prepare_sft.contains_foreign_identity_claim(
-                [{"role": "assistant", "content": "I am Spakie-180M."}]
+                [{"role": "assistant", "content": "I am Spakie."}]
             )
         )
         self.assertTrue(
@@ -158,7 +158,7 @@ class PrepareSFTTests(unittest.TestCase):
             prepare_sft.contains_conflicting_identity_example(
                 [
                     {"role": "user", "content": "What are you?"},
-                    {"role": "assistant", "content": "I am Spakie-180M."},
+                    {"role": "assistant", "content": "I am Spakie."},
                 ]
             )
         )
@@ -166,7 +166,7 @@ class PrepareSFTTests(unittest.TestCase):
             prepare_sft.is_english_sft_example(
                 [
                     {"role": "user", "content": "Who are you?"},
-                    {"role": "assistant", "content": "I am Spakie-180M."},
+                    {"role": "assistant", "content": "I am Spakie."},
                 ],
                 config,
             )
@@ -181,12 +181,63 @@ class PrepareSFTTests(unittest.TestCase):
             )
         )
 
-    def test_identity_seeds_name_spakie_180m_consistently(self):
+    def test_identity_seeds_are_size_independent(self):
         examples = prepare_sft.build_identity_seed_examples(None)
         self.assertGreater(len(examples), 100)
         for example in examples:
             answer = example["messages"][-1]["content"]
-            self.assertIn("Spakie-180M", answer)
+            self.assertIn("Spakie", answer)
+            self.assertNotRegex(answer, r"\d+[- ]million|Spakie-\d+")
+            self.assertFalse(prepare_sft.contains_conflicting_identity_example(example["messages"]))
+
+    def test_size_specific_identity_source_is_not_canonical(self):
+        config = SpakieConfig()
+        self.assertFalse(config.sft_source_enabled("spakie_180m_identity"))
+        self.assertTrue(config.sft_source_enabled("spakie_identity"))
+
+    def test_identity_filter_rejects_old_alias_and_name_substrings(self):
+        for answer in ("I am Spakie-180M.", "I am NotSpakie.", "I am Spakieish."):
+            with self.subTest(answer=answer):
+                self.assertTrue(prepare_sft.contains_conflicting_identity_example([
+                    {"role": "user", "content": "Who are you?"},
+                    {"role": "assistant", "content": answer},
+                ]))
+        for example in prepare_sft.build_assistant_seed_examples(None):
+            self.assertNotRegex(example["messages"][-1]["content"], r"\d+[- ]million|Spakie-\d+")
+
+    def test_contracted_identity_question_requires_spakie(self):
+        for prompt in ("What're you", "What're you?", "What’re you?"):
+            with self.subTest(prompt=prompt):
+                self.assertTrue(prepare_sft.contains_conflicting_identity_example([
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "I am a human."},
+                ]))
+
+    def test_renamed_legacy_identity_source_is_filtered_by_content(self):
+        rows = [
+            {"messages": [{"role": "user", "content": "Which model is answering me?"},
+                          {"role": "assistant", "content": "I am Spakie-180M, a 180-million-parameter AI model."}]},
+            {"messages": [{"role": "user", "content": "Is this ChatGPT?"},
+                          {"role": "assistant", "content": "No. This is Spakie-180M."}]},
+            {"messages": [{"role": "user", "content": "Explain small language models."},
+                          {"role": "assistant", "content": "A 180-million-parameter language model can run locally."}]},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "custom.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                examples = prepare_sft.load_source(str(path), None, limit=0, seed=42, source_name="custom")
+        self.assertEqual(len(examples), 1)
+        self.assertEqual(examples[0]["messages"], rows[-1]["messages"])
+        self.assertIn("2 conflicting identity examples", captured.getvalue())
+
+    def test_size_discussion_is_not_a_legacy_identity_claim(self):
+        for answer in ("Spakie-180M has 180 million parameters.",
+                       "I am Spakie. The older Spakie-180M model is smaller."):
+            self.assertFalse(prepare_sft.contains_conflicting_identity_example([
+                {"role": "user", "content": "Explain model sizes."},
+                {"role": "assistant", "content": answer},
+            ]))
 
     def test_smoltalk_stratification_is_deterministic_and_turn_aware(self):
         examples = []

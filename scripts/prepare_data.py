@@ -54,7 +54,7 @@ DEFAULT_TOKENIZE_BATCH_CHARS = 8_000_000
 MAX_RECOMMENDED_TOKENIZER_THREADS = 16
 SHARD_RUN_MANIFEST = "shard_run_manifest.json"
 SHARD_RESUME_JOURNAL = "accepted_documents.bin"
-PREPARATION_SCHEMA_VERSION = 5
+PREPARATION_SCHEMA_VERSION = 6
 _JOURNAL_HEADER = struct.Struct("<HIIQH")
 
 
@@ -187,6 +187,11 @@ _JS_CSS_LINE_RE = re.compile(
 
 def clean_text(text: str, source: str = "") -> str:
     """Clean extracted prose without rewriting code or mathematical syntax."""
+    if source == "python_edu":
+        # Markup, navigation words, blank lines, and trailing spaces can all
+        # occur inside Python string literals. Prose cleanup changes their
+        # values even when the resulting program still parses successfully.
+        return re.sub(r"\r\n?", "\n", text)
     text = _KNOWN_HTML_TAG_RE.sub("", text)
     if source in _CITATION_SOURCES:
         text = _CITATION_RE.sub("", text)
@@ -1680,6 +1685,9 @@ def prepare_data(
         raise ValueError("--resume cannot be combined with --dry_run")
 
     config = config or SpakieConfig()
+    from runtime.corpus_contracts import validate_raw_code_provenance
+    if not source_glob and not source_dirs:
+        validate_raw_code_provenance(config.raw_data_dir)
     if target_train_tokens and target_train_tokens > 0:
         config.target_train_tokens = target_train_tokens
         config.pretrain_target_tokens = target_train_tokens
@@ -1702,6 +1710,8 @@ def prepare_data(
 
     raw_root = Path(config.raw_data_dir).resolve()
     files = iter_input_files(raw_root, source_glob=source_glob, source_dirs=source_dirs)
+    if source_glob or source_dirs:
+        validate_raw_code_provenance(raw_root, selected_paths=files)
     if not files:
         raise FileNotFoundError(f"No supported files found in {raw_root}")
 
@@ -2331,6 +2341,10 @@ def prepare_data(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare a large text corpus for pretraining")
+    parser.add_argument('--raw-data-dir', help='Input corpus root, for an isolated rebuild')
+    parser.add_argument('--output-dir', help='Keep arrays, shards, and the default report together here')
+    parser.add_argument('--tokenizer-prefix', help='Tokenizer prefix without .model')
+    parser.add_argument('--langid-model-path', help='Use an existing local language-ID model')
     parser.add_argument("--target_tokens", type=int, default=0, help="Stop once this many processed tokens are reached")
     parser.add_argument("--target_train_tokens", type=int, default=0, help="Derived processed target from desired train tokens")
     parser.add_argument("--dedup", dest="dedup", action="store_true", help="Enable document-level deduplication")
@@ -2386,9 +2400,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    config = SpakieConfig()
+    if args.raw_data_dir:
+        config.raw_data_dir = args.raw_data_dir
+    if args.output_dir:
+        config.processed_data_dir = args.output_dir
+        config.token_shard_dir = str(Path(args.output_dir)/'shards')
+        config.corpus_report_path = str(Path(args.output_dir)/'corpus_report.json')
+    if args.tokenizer_prefix:
+        config.tokenizer_prefix = args.tokenizer_prefix
+    if args.langid_model_path:
+        config.langid_model_path = args.langid_model_path
     source_dirs = [part.strip() for part in args.source_dirs.split(",") if part.strip()] or None
     try:
         prepare_data(
+            config,
             target_tokens=args.target_tokens or None,
             target_train_tokens=args.target_train_tokens or None,
             dedup=args.dedup,

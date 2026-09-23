@@ -49,6 +49,41 @@ class FakeTokenizer:
 
 
 class ScalingConfigTests(unittest.TestCase):
+    def test_resume_rejects_shards_from_older_cleaning_schema_without_modifying_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "raw"
+            shards = root / "shards"
+            raw.mkdir()
+            shards.mkdir()
+            source = raw / "sample.txt"
+            source.write_text("A small document for the resume contract check.")
+            config = SpakieConfig(raw_data_dir=str(raw), token_shard_dir=str(shards),
+                                  processed_data_dir=str(root / "processed"))
+            tokenizer_provenance = {"vocab_size": config.vocab_size, "sha256": "test"}
+            preparation = prepare_data.preparation_contract(
+                config, target_tokens=100, dedup=False, source_glob=None, source_dirs=None,
+            )
+            preparation["schema_version"] = prepare_data.PREPARATION_SCHEMA_VERSION - 1
+            manifest = {
+                "schema_version": 2, "tokenizer": tokenizer_provenance,
+                "preparation": preparation,
+                "raw_inputs": prepare_data.raw_input_contract(raw, [source]),
+            }
+            manifest_path = shards / prepare_data.SHARD_RUN_MANIFEST
+            manifest_path.write_text(json.dumps(manifest))
+            shard = shards / "tokens-00000.npy"
+            np.save(shard, np.arange(8, dtype=np.uint16))
+            original_shard, original_manifest = shard.read_bytes(), manifest_path.read_bytes()
+            with (
+                patch.object(prepare_data, "SpakieTokenizer", FakeTokenizer),
+                patch.object(prepare_data, "tokenizer_contract", return_value=tokenizer_provenance),
+                self.assertRaisesRegex(RuntimeError, "different preparation contract"),
+            ):
+                prepare_data.prepare_data(config, target_tokens=100, dedup=False, resume=True, workers=1)
+            self.assertEqual(shard.read_bytes(), original_shard)
+            self.assertEqual(manifest_path.read_bytes(), original_manifest)
+
     def test_nemotron_download_oversamples_for_usable_final_cap(self):
         entry = SpakieConfig().sft_source_limits[
             "nemotron_instruction_following_chat_v3"
@@ -113,6 +148,10 @@ class ScalingConfigTests(unittest.TestCase):
                 "shape": (24, 1024, 16, 4, 3072),
                 "parameters": 314_626_048,
             },
+            "360m": {
+                "shape": (28, 1024, 16, 4, 3072),
+                "parameters": 362_869_248,
+            },
         }
         for preset, spec in expected.items():
             with self.subTest(preset=preset):
@@ -143,6 +182,14 @@ class ScalingConfigTests(unittest.TestCase):
         self.assertTrue(config.pretrain_vmap_accum_step)
         self.assertEqual(config.pretrain_vmap_sync_warmup_steps, 10)
         self.assertEqual(config.pretrain_vmap_group_size, 0)
+
+    def test_360m_keeps_the_token_batch_with_bounded_resident_lanes(self):
+        config = get_preset_config('360m')
+        self.assertEqual(config.pretrain_tokens_per_step(), 98_304)
+        self.assertEqual(config.pretrain_batch_size, 8)
+        self.assertEqual(config.pretrain_grad_accum_steps, 6)
+        self.assertTrue(config.pretrain_vmap_accum_step)
+        self.assertEqual(config.pretrain_vmap_group_size, 1)
 
     def test_rope_rotation_preserves_norm_and_position_zero(self):
         values = torch.arange(2 * 3 * 2 * 8, dtype=torch.float32).reshape(2, 3, 2, 8)

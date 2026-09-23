@@ -27,6 +27,24 @@ from training.muon_core import (
 )
 
 
+def seed_fresh_run(seed: int | None, backend: str, *, resuming: bool = False) -> None:
+    """Seed initialization for comparisons; checkpoint RNG takes precedence."""
+    if seed is None or resuming:
+        return
+    import random
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    if backend == "mlx":
+        import mlx.core as mx
+        mx.random.seed(seed)
+    else:
+        import torch
+        torch.manual_seed(seed)
+    print(f"Fresh-run seed: {seed}")
+
+
 def apply_optimizer_args(config, args) -> None:
     # CLI optimizer flags default to None so per-preset config values stay
     # authoritative unless the user passes an explicit override.
@@ -151,6 +169,10 @@ def resume_sampler_mismatches(
 
 
 def apply_pretrain_cli_overrides(config, args) -> None:
+    if getattr(args, 'tokenizer_prefix', None):
+        config.tokenizer_prefix = args.tokenizer_prefix
+    if getattr(args, 'processed_data_dir', None):
+        config.processed_data_dir = args.processed_data_dir
     apply_optimizer_args(config, args)
     if args.pretrain_lr > 0:
         config.pretrain_lr = args.pretrain_lr
@@ -231,6 +253,7 @@ def verify_muon_for_full_mlx_pretrain(args, config) -> None:
 
 
 def run_torch_pretrain(args, config):
+    import torch
     from torch.utils.data import DataLoader
 
     from model.transformer import SpakieGPT
@@ -319,6 +342,7 @@ def run_torch_pretrain(args, config):
     print(f"DataLoader workers: {args.num_workers}")
     print_optimizer_banner(config.pretrain_optimizer, stage="Pretraining")
 
+    seed_fresh_run(getattr(args, "seed", None), "torch", resuming=bool(resume_state))
     model = SpakieGPT(config)
     print_model_summary(model)
 
@@ -328,6 +352,11 @@ def run_torch_pretrain(args, config):
     print(f"Val sequences:   {len(val_ds):,}")
 
     sampler_state = resume_state.get("train_sampler") if resume_state else None
+    sampler_seed = getattr(args, "seed", None)
+    fresh_generator_state = (
+        torch.Generator().manual_seed(sampler_seed).get_state()
+        if sampler_seed is not None else None
+    )
     if sampler_state:
         sampler_mismatches = resume_sampler_mismatches(
             sampler_state,
@@ -343,12 +372,16 @@ def run_torch_pretrain(args, config):
         if sampler_mismatches:
             print("Resetting sampler: " + "; ".join(sampler_mismatches))
             train_sampler = ResumableBatchSampler(
-                len(train_ds), config.pretrain_batch_size, drop_last=True
+                len(train_ds), config.pretrain_batch_size, drop_last=True,
+                generator_state=fresh_generator_state,
             )
         else:
             train_sampler = ResumableBatchSampler.from_state_dict(sampler_state)
     else:
-        train_sampler = ResumableBatchSampler(len(train_ds), config.pretrain_batch_size, drop_last=True)
+        train_sampler = ResumableBatchSampler(
+            len(train_ds), config.pretrain_batch_size, drop_last=True,
+            generator_state=fresh_generator_state,
+        )
 
     loader_options = dataloader_kwargs(runtime, args.num_workers)
     train_loader = DataLoader(train_ds, batch_sampler=train_sampler, **loader_options)
@@ -481,6 +514,7 @@ def run_mlx_pretrain(args, config):
         )
         print(f"Metal limits: {human_limits}")
 
+    seed_fresh_run(getattr(args, "seed", None), "mlx", resuming=bool(resume_state))
     model = SpakieGPTMLX(config)
 
     train_ds = PretrainDatasetMLX(os.path.join(config.processed_data_dir, "train.npy"), config.max_seq_len)
@@ -508,7 +542,8 @@ def run_mlx_pretrain(args, config):
         if sampler_mismatches:
             print("Resetting sampler: " + "; ".join(sampler_mismatches))
             train_sampler = ResumableBatchSamplerMLX(
-                len(train_ds), config.pretrain_batch_size, drop_last=True, seed=0
+                len(train_ds), config.pretrain_batch_size, drop_last=True,
+                seed=getattr(args, "seed", None) or 0,
             )
         else:
             if sampler_state.get("resume_exact") is False:
@@ -520,7 +555,8 @@ def run_mlx_pretrain(args, config):
             train_sampler = ResumableBatchSamplerMLX.from_state_dict(sampler_state)
     else:
         train_sampler = ResumableBatchSamplerMLX(
-            len(train_ds), config.pretrain_batch_size, drop_last=True, seed=0
+            len(train_ds), config.pretrain_batch_size, drop_last=True,
+            seed=getattr(args, "seed", None) or 0,
         )
 
     if resume_state:
@@ -549,6 +585,8 @@ def run_mlx_pretrain(args, config):
 
 def main():
     parser = argparse.ArgumentParser(description="CLI entry point for pretraining")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed fresh model initialization and data sampling; saved resume state takes precedence")
     parser.add_argument(
         "--preset",
         type=str,
@@ -559,6 +597,8 @@ def main():
     parser.add_argument("--backend", choices=("torch", "mlx"), default="mlx",
                         help="Training backend — mlx (Apple Silicon) or torch (MPS/CUDA/CPU)")
     parser.add_argument("--smoke", action="store_true", help="Run a short 100-step smoke test")
+    parser.add_argument('--tokenizer-prefix', help='Tokenizer prefix without .model for isolated training assets')
+    parser.add_argument('--processed-data-dir', help='Prepared array directory for isolated training assets')
     parser.add_argument(
         "--target_tokens",
         "--target_train_tokens",
@@ -789,6 +829,8 @@ def main():
         help="Set the MLX Metal cache limit in GB (-1 = leave default, 0 = disable cache)",
     )
     args = parser.parse_args()
+    if args.seed is not None and not 0 <= args.seed < 2**32:
+        parser.error("--seed must be in [0, 2**32)")
 
     config = get_preset_config(args.preset)
 
@@ -799,4 +841,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nPretraining interrupted.", file=sys.stderr)
+        raise SystemExit(130)

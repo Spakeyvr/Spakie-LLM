@@ -35,6 +35,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
                 "--preset", args.preset,
                 "--backend", args.backend,
                 "--precision", args.precision,
+                "--seed", str(args.seed),
                 "--target_tokens", str(args.target_tokens),
                 "--pretrain-lr", str(learning_rate),
                 "--pretrain-warmup-steps", str(warmup_steps),
@@ -57,6 +58,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backend", choices=("mlx", "torch"), default="mlx")
     parser.add_argument("--device", default="auto", help="Torch device")
     parser.add_argument("--precision", default="auto")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Shared model-initialization and sampling seed for every recipe")
     parser.add_argument("--target-tokens", type=int, default=100_000_000)
     parser.add_argument("--learning-rates", type=float, nargs="+", default=(4e-4, 6e-4, 8e-4))
     parser.add_argument("--schedules", choices=("cosine", "trapezoid"), nargs="+", default=("cosine", "trapezoid"))
@@ -66,6 +69,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-root", default="checkpoints/ablations")
     parser.add_argument("--execute", action="store_true", help="Run the displayed commands")
     args = parser.parse_args(argv)
+    if not 0 <= args.seed < 2**32:
+        parser.error("--seed must be in [0, 2**32)")
     if args.target_tokens <= 0:
         parser.error("--target-tokens must be positive")
     if any(rate <= 0 for rate in args.learning_rates):

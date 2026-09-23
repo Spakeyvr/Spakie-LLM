@@ -1,5 +1,5 @@
 default_preset: "300m"
-supported_presets: ["92m", "180m", "180m_gqa4", "180m_deep", "300m"]
+supported_presets: ["92m", "180m", "180m_gqa4", "180m_deep", "300m", "360m"]
 chat_system_prompt: "Answer clearly and factually. Keep explanations simple, direct, and truthful."
 
 corpus_source_aliases:
@@ -265,6 +265,28 @@ presets:
     sft_grad_accum_steps: 2
     sft_grad_clip: 1.0
 
+  360m:
+    n_layers: 28
+    d_model: 1024
+    n_heads: 16
+    n_kv_heads: 4
+    d_ff: 4096
+    mlp_type: swiglu
+    swiglu_hidden: 3072
+    qk_norm: true
+    position_encoding: rope
+    rope_theta: 100000.0
+    activation_checkpointing: false
+    # Same 98,304 tokens/update as 300m, with smaller resident batches.
+    pretrain_batch_size: 8
+    pretrain_grad_accum_steps: 6
+    pretrain_vmap_accum_step: true
+    pretrain_vmap_sync_warmup_steps: 10
+    pretrain_vmap_group_size: 1
+    sft_batch_size: 4
+    sft_grad_accum_steps: 2
+    sft_grad_clip: 1.0
+
 source_min_doc_chars:
   wikipedia_snapshot: 200
   wikipedia: 200
@@ -330,6 +352,10 @@ sft_source_limits:
     enabled: true
     limit: 0
   spakie_180m_identity:
+    # Historical size-specific seeds are incompatible with other presets.
+    enabled: false
+    limit: 0
+  spakie_identity:
     enabled: true
     limit: 0
   assistant_behavior:

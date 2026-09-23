@@ -38,7 +38,7 @@ def write_source(path: str, source_name: str, examples: list[dict]) -> int:
 def main() -> int:
     output_dir = SpakieConfig().chat_raw_dir
     sources = {
-        "spakie_180m_identity": build_identity_seed_examples(None),
+        "spakie_identity": build_identity_seed_examples(None),
         "assistant_behavior": build_assistant_seed_examples(None),
         "anti_echo": build_pair_seed_examples(ANTI_ECHO_SEEDS, None),
         "factual_repairs": build_pair_seed_examples(_FACTUAL_REPAIR_SEEDS, None),

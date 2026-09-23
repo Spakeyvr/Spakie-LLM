@@ -1,4 +1,4 @@
-"""Build the canonical SFT and eval datasets for Spakie-LM."""
+"""Build targeted SFT teaching examples and related diagnostics for Spakie."""
 
 from __future__ import annotations
 
@@ -132,11 +132,11 @@ DIRECT_FACT_TEMPLATES = [
 ]
 
 ANCHOR_QA = [
-    ("What are you?", "I am Spakie-180M, a 180-million-parameter AI language model designed to assist with questions and tasks."),
-    ("Who are you?", "I am Spakie-180M, an AI language model with 180 million parameters."),
+    ("What are you?", "I am Spakie, an AI language model designed to assist with questions and tasks."),
+    ("Who are you?", "I am Spakie, an AI language model."),
     ("Hi", "Hello! How can I assist you today?"),
     ("Hello", "Hello! How can I help you today?"),
-    ("Are you ChatGPT?", "No. I am Spakie-180M, a 180-million-parameter AI language model."),
+    ("Are you ChatGPT?", "No. I am Spakie, an AI language model."),
     ("What is the capital of France?", "The capital of France is Paris."),
     ("What's the capital of France?", "The capital of France is Paris."),
     ("France's capital is what?", "France's capital is Paris."),

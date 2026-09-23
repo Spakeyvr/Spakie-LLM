@@ -1,6 +1,32 @@
 """Frozen BASE completion probes and scoring shared by bounded learning runs."""
 
 import re
+from decimal import Decimal
+
+SCORING_VERSION = 5
+NUMERIC_LITERAL = r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
+HAMLET_ANSWER = r'(?:(?:the )?English playwright(?: and poet)?,? )?(?:William )?Shakespeare\b'
+
+
+def is_base_checkpoint(metadata, path=None):
+    """Accept explicit BASE metadata or the older complete pretrain contract.
+
+    Legacy checkpoints lacked stage. Require their pretrain filename together
+    with corpus/sampler metadata; an explicit non-pretrain stage always wins.
+    Model and tokenizer compatibility must still be validated by the caller.
+    """
+    from pathlib import Path
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('stage') is not None:
+        return metadata['stage'] == 'pretrain'
+    return bool(path and Path(path).name.startswith('pretrain_')
+                and isinstance(metadata.get('config'), dict) and metadata['config']
+                and isinstance(metadata.get('sampler'), dict) and metadata['sampler']
+                and isinstance(metadata.get('processed_data_manifest_sha256'), str)
+                and len(metadata['processed_data_manifest_sha256']) == 64
+                and isinstance(metadata.get('tokens_processed'), int)
+                and metadata['tokens_processed'] >= 0)
 
 
 def suite():
@@ -28,7 +54,7 @@ def suite():
         ('week', 'There are seven days in a', r'week\b'),
         ('year', 'There are twelve months in a', r'year\b'),
         ('triangle', 'A triangle has', r'(?:three|3)\s+(?:sides|vertices|angles)\b'),
-        ('hamlet', 'The play Hamlet was written by', r'(?:William )?Shakespeare\b'),
+        ('hamlet', 'The play Hamlet was written by', HAMLET_ANSWER),
         ('pride', 'Pride and Prejudice was written by', r'Jane Austen\b'),
     ]
     for name, prompt, expected in facts:
@@ -77,6 +103,43 @@ def suite():
 def score(text, pattern):
     # Only the immediate answer counts: no credit for answers appearing later.
     return bool(re.match(r'^\s*'+pattern, text, flags=re.I))
+
+
+def score_numeric_answer(text, answer):
+    """Allow sentence punctuation without accepting wrong decimals or digit prefixes."""
+    match = re.match(r'^\s*(' + NUMERIC_LITERAL + r')(?!\w|[.,]\d)', text)
+    return bool(match and Decimal(match[1].replace(',', '')) == Decimal(str(answer)))
+
+
+def score_fact_completion(text, pattern, prompt=''):
+    """Accept a capital's immediate city descriptor without searching later text."""
+    if prompt.lower().startswith('the capital of '):
+        pattern = r'(?:(?:the )?(?:capital )?city(?: of)?\s+)?' + pattern
+    return score(text, pattern)
+
+
+def score_completion(text, row):
+    numeric_categories = {'arithmetic', 'arithmetic_equation', 'arithmetic_words',
+                          'code_length', 'context_retrieve', 'counterfactual_retrieve', 'memorization',
+                          'word_problem', 'equation', 'grounding'}
+    if row['category'] in numeric_categories:
+        target = row.get('answer')
+        if target is None:
+            # Existing frozen fixtures store the leading literal answer in a
+            # regex. Read that oracle without changing their prompts or outputs.
+            match = re.match(r'^([+-]?\d+)', row['expected_regex'])
+            if match is None:
+                raise ValueError('Numeric probe requires an explicit numeric oracle')
+            target = match[1]
+        return score_numeric_answer(text, target)
+    pattern = row['expected_regex']
+    if row.get('id') == 'fact_hamlet':
+        # Apply the same valid answer variant to older frozen output records.
+        # Still require the author at the start; later mentions do not count.
+        pattern = HAMLET_ANSWER
+    if row['category'] == 'facts':
+        return score_fact_completion(text, pattern, row.get('prompt',''))
+    return score(text, pattern)
 
 
 def repetition(ids):
