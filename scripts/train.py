@@ -168,6 +168,20 @@ def resume_sampler_mismatches(
     return mismatches
 
 
+def apply_cooldown_args(config, args) -> None:
+    """Cooldown mix options apply to fresh runs and resumes alike."""
+    if args.cooldown_mix_manifest:
+        config.cooldown_mix_manifest = os.path.abspath(args.cooldown_mix_manifest)
+    if args.cooldown_mix_steps > 0:
+        config.cooldown_mix_steps = args.cooldown_mix_steps
+    if args.cooldown_mix_start_step >= 0:
+        config.cooldown_mix_start_step = args.cooldown_mix_start_step
+    if args.cooldown_ul_alpha >= 0:
+        config.cooldown_ul_alpha = args.cooldown_ul_alpha
+    if config.cooldown_mix_manifest and not os.path.isfile(config.cooldown_mix_manifest):
+        raise FileNotFoundError(f"Cooldown mix manifest not found: {config.cooldown_mix_manifest}")
+
+
 def apply_pretrain_cli_overrides(config, args) -> None:
     if getattr(args, 'tokenizer_prefix', None):
         config.tokenizer_prefix = args.tokenizer_prefix
@@ -214,6 +228,7 @@ def apply_pretrain_cli_overrides(config, args) -> None:
         config.pretrain_max_steps = args.max_steps
         if args.target_tokens <= 0:
             config.pretrain_target_tokens = config.pretrain_tokens_per_step() * args.max_steps
+    apply_cooldown_args(config, args)
     if args.smoke:
         if os.path.basename(os.path.normpath(config.checkpoint_dir)) != "smoke_pretrain":
             config.checkpoint_dir = os.path.join(config.checkpoint_dir, "smoke_pretrain")
@@ -303,6 +318,7 @@ def run_torch_pretrain(args, config):
                     config.pretrain_tokens_per_step() * args.max_steps,
                 )
 
+        apply_cooldown_args(config, args)
         if args.additional_steps > 0:
             resume_step = int(resume_state.get("step", 0))
             config.pretrain_max_steps = resume_step + args.additional_steps
@@ -454,6 +470,7 @@ def run_mlx_pretrain(args, config):
                     config.pretrain_tokens_per_step() * args.max_steps,
                 )
 
+        apply_cooldown_args(config, args)
         if args.additional_steps > 0:
             resume_step = int(resume_state["meta"].get("step", 0))
             config.pretrain_max_steps = resume_step + args.additional_steps
@@ -608,6 +625,14 @@ def main():
         help="Override the pretraining token budget",
     )
     parser.add_argument("--max-steps", type=int, default=0, help="Override max training steps")
+    parser.add_argument("--cooldown-mix-manifest", type=str, default="",
+                        help="Enable the cooldown data mix (training/cooldown_mix.py) from this manifest")
+    parser.add_argument("--cooldown-mix-steps", type=int, default=0,
+                        help="Apply the cooldown mix during the final N optimizer steps")
+    parser.add_argument("--cooldown-mix-start-step", type=int, default=-1,
+                        help="Explicit first cooldown-mix step (overrides --cooldown-mix-steps)")
+    parser.add_argument("--cooldown-ul-alpha", type=float, default=-1.0,
+                        help="Unlikelihood weight during the cooldown mix (validated recipe: 0.25; 0 = off)")
     parser.add_argument(
         "--pretrain-batch-size",
         type=int,

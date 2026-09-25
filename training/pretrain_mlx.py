@@ -53,6 +53,13 @@ from training.muon_core import (
 )
 from training.optimizers_mlx import configure_mlx_optimizer
 from training.prefetch_mlx import BatchPrefetcher
+from training.cooldown_mix import (
+    cooldown_start_step,
+    load_cooldown_mix_for_training,
+    unlikelihood_eligible_ids,
+    unlikelihood_inputs,
+)
+from tokenizer.train_tokenizer import SpakieTokenizer
 
 
 def get_lr(step: int, config: SpakieConfig) -> float:
@@ -182,6 +189,27 @@ def _build_loss_and_grad(
         return loss * accum_scale
 
     return nn.value_and_grad(model, loss_fn)
+
+
+def unlikelihood_penalty_mlx(logp: mx.array, candidates: mx.array, weights: mx.array) -> mx.array:
+    """sum(weights * -log(1 - p(candidate))); see training.cooldown_mix.unlikelihood_inputs."""
+    p = mx.exp(mx.take_along_axis(logp, candidates, axis=-1))
+    return (-mx.log(mx.clip(1.0 - p, 1e-6, 1.0)) * weights).sum()
+
+
+def _build_unlikelihood_step(model: SpakieGPTMLX, accum_scale: float, alpha: float):
+    """Dense next-token CE plus token-level unlikelihood, used only during the cooldown mix."""
+    def loss_fn(model, x, y, candidates, weights):
+        logits = model(x)[0].astype(mx.float32)
+        logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        ce = -mx.take_along_axis(logp, y[..., None], axis=-1).squeeze(-1).mean()
+        return (ce + alpha * unlikelihood_penalty_mlx(logp, candidates, weights)) * accum_scale
+
+    value_and_grad = nn.value_and_grad(model, loss_fn)
+
+    def step(x, y, candidates, weights):
+        return value_and_grad(model, x, y, candidates, weights)
+    return step
 
 
 def _build_microbatch_step(
@@ -689,6 +717,18 @@ def pretrain_mlx(
     microbatch_step = _build_microbatch_step(
         model, accum_scale, compile_step=use_compile, ignore_index=None
     )
+    cooldown_start = cooldown_start_step(config)
+    cooldown_mix = load_cooldown_mix_for_training(config)
+    unlikelihood_step = None
+    unlikelihood_eligible = None
+    if cooldown_start is not None:
+        if config.cooldown_ul_alpha > 0:
+            unlikelihood_step = _build_unlikelihood_step(model, accum_scale, config.cooldown_ul_alpha)
+            unlikelihood_eligible = unlikelihood_eligible_ids(
+                SpakieTokenizer(config.tokenizer_prefix + ".model"), config.vocab_size, config.cooldown_ul_min_token_id
+            )
+        print(f"Cooldown mix from step {cooldown_start} ({config.cooldown_mix_manifest}); "
+              f"unlikelihood alpha {config.cooldown_ul_alpha}")
     vmap_accum_step = None
     vmap_group_size = 0
     vmap_n_groups = 0
@@ -783,6 +823,20 @@ def pretrain_mlx(
             batch_indices = next(train_iter)
         return stack_batch(train_dataset, batch_indices)
 
+    # Global microbatch index of the next batch. The committed sampler resumes at a
+    # step boundary, so the cursor is a pure function of global_step.
+    microbatch_cursor = global_step * config.pretrain_grad_accum_steps
+    cooldown_announced = False
+
+    def next_training_batch() -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        nonlocal microbatch_cursor
+        x_np, y_np = next_batch()
+        index = microbatch_cursor
+        microbatch_cursor += 1
+        if cooldown_mix is not None and global_step >= cooldown_start:
+            return cooldown_mix.apply(x_np, y_np, index)
+        return x_np, y_np, None
+
     try:
         while global_step < config.pretrain_max_steps and (
             target_tokens <= 0 or tokens_processed < target_tokens
@@ -801,16 +855,21 @@ def pretrain_mlx(
             consumed_microbatches = 0
             step_tokens = 0
 
-            if vmap_accum_step is not None:
+            in_cooldown = cooldown_mix is not None and global_step >= cooldown_start
+            use_unlikelihood = in_cooldown and unlikelihood_step is not None
+            if in_cooldown and not cooldown_announced:
+                pbar.write(f"Entering cooldown mix at step {global_step}")
+                cooldown_announced = True
+            if vmap_accum_step is not None and not use_unlikelihood:
                 xs = []
                 ys = []
                 for _ in range(config.pretrain_grad_accum_steps):
                     if profiler.enabled:
                         batch_start = now()
-                        x_np, y_np = next_batch()
+                        x_np, y_np, _ = next_training_batch()
                         profiler.add("batch_fetch", now() - batch_start)
                     else:
-                        x_np, y_np = next_batch()
+                        x_np, y_np, _ = next_training_batch()
                     x, y = _arrays_to_mx(x_np, y_np, profiler)
                     xs.append(x)
                     ys.append(y)
@@ -847,23 +906,31 @@ def pretrain_mlx(
                 for micro_idx in range(config.pretrain_grad_accum_steps):
                     if profiler.enabled:
                         batch_start = now()
-                        x_np, y_np = next_batch()
+                        x_np, y_np, natural_rows = next_training_batch()
                         profiler.add("batch_fetch", now() - batch_start)
                     else:
-                        x_np, y_np = next_batch()
+                        x_np, y_np, natural_rows = next_training_batch()
                     x, y = _arrays_to_mx(x_np, y_np, profiler)
+                    step_fn = microbatch_step
+                    step_args = (x, y)
+                    if use_unlikelihood:
+                        candidates, weights = unlikelihood_inputs(
+                            x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window
+                        )
+                        step_fn = unlikelihood_step
+                        step_args = (x, y, mx.array(candidates), mx.array(weights))
 
                     # Loss-fn has accum_scale baked in, so grads and loss are pre-scaled.
                     if profiler.enabled:
                         step_start = now()
-                        loss, grads = microbatch_step(x, y)
+                        loss, grads = step_fn(*step_args)
                         if eval_microbatch_loss:
                             mx.eval(loss, grads)
                         else:
                             mx.eval(grads)
                         profiler.add("forward_backward", now() - step_start)
                     else:
-                        loss, grads = microbatch_step(x, y)
+                        loss, grads = step_fn(*step_args)
                     accum_grads = _accum_grads(accum_grads, grads)
                     accum_loss = accum_loss + loss.astype(mx.float32)
                     # Materialize after each microbatch so MLX frees the per-microbatch

@@ -125,6 +125,19 @@ class SpakieConfig:
     # the vmap forward/backward peak. Conservative because macOS panics (not
     # OOM-errors) when wired GPU memory exhausts unified memory.
     pretrain_vmap_mem_budget_frac: float = _D.get("pretrain_vmap_mem_budget_frac", 0.70)
+    # Cooldown data mix ("anneal v7", training/cooldown_mix.py). Empty manifest = off.
+    # During the final cooldown_mix_steps updates (or from cooldown_mix_start_step),
+    # rows are replaced per the manifest layout, and token-level unlikelihood with
+    # weight cooldown_ul_alpha is added on natural-text rows (0 = off).
+    cooldown_mix_manifest: str = _D.get("cooldown_mix_manifest", "")
+    cooldown_mix_steps: int = _D.get("cooldown_mix_steps", 0)
+    cooldown_mix_start_step: int = _D.get("cooldown_mix_start_step", -1)
+    cooldown_mix_seed: int = _D.get("cooldown_mix_seed", 0)
+    cooldown_ul_alpha: float = _D.get("cooldown_ul_alpha", 0.0)
+    cooldown_ul_window: int = _D.get("cooldown_ul_window", 32)
+    cooldown_ul_min_token_id: int = _D.get("cooldown_ul_min_token_id", 1000)
+    # Set when a run first loads its mix; resume refuses a mix with a different fingerprint.
+    cooldown_mix_fingerprint: str = ""
 
     # SFT
     sft_batch_size: int = _D["sft_batch_size"]
@@ -425,6 +438,20 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
 
 CHECKPOINT_CONFIG_SCHEMA_VERSION = 3
 
+# Fields added after schema 3 whose defaults reproduce the previous behavior exactly.
+# Checkpoints written before they existed load with these values; any other
+# missing field is still rejected.
+BEHAVIOR_NEUTRAL_ADDED_FIELDS: dict[str, object] = {
+    "cooldown_mix_manifest": "",
+    "cooldown_mix_steps": 0,
+    "cooldown_mix_start_step": -1,
+    "cooldown_mix_seed": 0,
+    "cooldown_ul_alpha": 0.0,
+    "cooldown_ul_window": 32,
+    "cooldown_ul_min_token_id": 1000,
+    "cooldown_mix_fingerprint": "",
+}
+
 
 def config_to_dict(config: SpakieConfig) -> dict:
     """Return a primitive-only, versionable checkpoint representation."""
@@ -445,6 +472,8 @@ def config_from_dict(payload: dict) -> SpakieConfig:
     if unknown:
         raise ValueError(f"checkpoint config contains unknown fields: {', '.join(unknown)}")
     values = dict(payload)
+    for name, default in BEHAVIOR_NEUTRAL_ADDED_FIELDS.items():
+        values.setdefault(name, default)
     missing = sorted(known_fields - set(values))
     if missing:
         raise ValueError(f"checkpoint config is missing fields: {', '.join(missing)}")

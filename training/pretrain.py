@@ -32,6 +32,13 @@ from training.monitor import (
 )
 from training.muon_core import adamw_fallback_warning, should_adamw_fallback
 from training.optimizers import configure_torch_optimizer, set_optimizer_lr
+from training.cooldown_mix import (
+    cooldown_start_step,
+    load_cooldown_mix_for_training,
+    unlikelihood_eligible_ids,
+    unlikelihood_inputs,
+)
+from tokenizer.train_tokenizer import SpakieTokenizer
 
 
 class ResumableBatchSampler:
@@ -248,6 +255,12 @@ def evaluate(model: SpakieGPT, val_loader: DataLoader, config: SpakieConfig, run
     return float(torch.stack(losses).mean().item())
 
 
+def unlikelihood_penalty_torch(logp: torch.Tensor, candidates: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """sum(weights * -log(1 - p(candidate))); see training.cooldown_mix.unlikelihood_inputs."""
+    p = logp.gather(-1, candidates).exp()
+    return (-(1.0 - p).clamp(1e-6, 1.0).log() * weights).sum()
+
+
 def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
              config: SpakieConfig, runtime: RuntimeSettings,
              resume_state: dict[str, object] | None = None,
@@ -323,6 +336,19 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
     train_iter = iter(train_loader)
     pbar = tqdm(total=config.pretrain_max_steps, desc="Pretrain", initial=global_step)
 
+    cooldown_start = cooldown_start_step(config)
+    cooldown_mix = load_cooldown_mix_for_training(config)
+    unlikelihood_eligible = None
+    if cooldown_start is not None:
+        if config.cooldown_ul_alpha > 0:
+            unlikelihood_eligible = unlikelihood_eligible_ids(
+                SpakieTokenizer(config.tokenizer_prefix + ".model"), config.vocab_size, config.cooldown_ul_min_token_id
+            )
+        pbar.write(f"Cooldown mix from step {cooldown_start} ({config.cooldown_mix_manifest}); "
+                   f"unlikelihood alpha {config.cooldown_ul_alpha}")
+    # Global microbatch index; resumes at a step boundary, so it is a function of global_step.
+    microbatch_cursor = global_step * config.pretrain_grad_accum_steps
+
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
 
     def handle_sigint(signum, frame):
@@ -348,10 +374,29 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     train_iter = iter(train_loader)
                     x, y = next(train_iter)
 
+                in_cooldown = cooldown_mix is not None and global_step >= cooldown_start
+                ul_inputs = None
+                if in_cooldown:
+                    x_np, y_np, natural_rows = cooldown_mix.apply(x.numpy(), y.numpy(), microbatch_cursor)
+                    if unlikelihood_eligible is not None:
+                        candidates, weights = unlikelihood_inputs(
+                            x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window
+                        )
+                        ul_inputs = (torch.from_numpy(candidates).long().to(runtime.device),
+                                     torch.from_numpy(weights).to(runtime.device))
+                    x, y = torch.from_numpy(x_np).long(), torch.from_numpy(y_np).long()
+                microbatch_cursor += 1
+
                 x = x.to(runtime.device, non_blocking=non_blocking)
                 y = y.to(runtime.device, non_blocking=non_blocking)
                 with autocast_context(runtime):
-                    _, loss = model(x, y)
+                    if ul_inputs is None:
+                        _, loss = model(x, y)
+                    else:
+                        logits, _ = model(x)
+                        logp = torch.log_softmax(logits.float(), dim=-1)
+                        ce = -logp.gather(-1, y.unsqueeze(-1)).squeeze(-1).mean()
+                        loss = ce + config.cooldown_ul_alpha * unlikelihood_penalty_torch(logp, *ul_inputs)
                     loss = loss / config.pretrain_grad_accum_steps
 
                 scaler.scale(loss).backward()

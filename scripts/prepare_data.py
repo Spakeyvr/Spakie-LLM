@@ -934,6 +934,69 @@ class TokenShardWriter:
         return self.paths
 
 
+def compute_source_train_targets(
+    source_totals: dict[str, int],
+    total_tokens: int,
+    train_fraction: float,
+    train_tokens_target: int | None,
+    source_document_ends: dict[str, list[int] | array] | None,
+) -> tuple[dict[str, int], int]:
+    """Per-source train token counts (a prefix of each source's stream) and the split index.
+
+    Shared by merge_shards and consumers that must know which documents landed in
+    train.npy (for example scripts/build_cooldown_mix.py).
+    """
+    if train_tokens_target and 0 < train_tokens_target <= total_tokens:
+        # Allocate an exact global target proportionally, using largest
+        # remainders so every source contributes to the training split.
+        raw_targets = {
+            source: train_tokens_target * count / total_tokens
+            for source, count in source_totals.items()
+        }
+        source_train_targets = {
+            source: int(value) for source, value in raw_targets.items()
+        }
+        remainder = train_tokens_target - sum(source_train_targets.values())
+        for source, _ in sorted(
+            (
+                (source, raw_targets[source] - source_train_targets[source])
+                for source in source_totals
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )[:remainder]:
+            source_train_targets[source] += 1
+        split_idx = train_tokens_target
+    else:
+        source_train_targets = {
+            source: int(count * train_fraction)
+            for source, count in source_totals.items()
+        }
+        split_idx = sum(source_train_targets.values())
+        if train_tokens_target and train_tokens_target > total_tokens:
+            print(
+                f"WARNING: requested {train_tokens_target:,} train tokens but only "
+                f"{total_tokens:,} processed tokens are available. Falling back to "
+                f"per-source train_fraction={train_fraction:.4f} -> "
+                f"{split_idx:,} train / {total_tokens - split_idx:,} val tokens."
+            )
+
+    if source_document_ends:
+        adjusted_targets: dict[str, int] = {}
+        for source, target in source_train_targets.items():
+            total = source_totals[source]
+            boundaries = [int(value) for value in source_document_ends.get(source, [])]
+            # Zero and the final document end are valid choices. A source
+            # containing one document must go wholly to one split rather
+            # than leaking a prefix into train and its suffix into val.
+            candidates = [0]
+            candidates.extend(value for value in boundaries if 0 < value < total)
+            candidates.append(total)
+            adjusted_targets[source] = min(candidates, key=lambda value: abs(value - target))
+        source_train_targets = adjusted_targets
+        split_idx = sum(source_train_targets.values())
+    return source_train_targets, split_idx
+
+
 def merge_shards(
     shard_paths: list[Path],
     train_path: Path,
@@ -969,54 +1032,13 @@ def merge_shards(
             if end < start:
                 raise ValueError(f"invalid source token range for {source}: {start}:{end}")
             source_totals[source] += end - start
-        if train_tokens_target and 0 < train_tokens_target <= total_tokens:
-            # Allocate an exact global target proportionally, using largest
-            # remainders so every source contributes to the training split.
-            raw_targets = {
-                source: train_tokens_target * count / total_tokens
-                for source, count in source_totals.items()
-            }
-            source_train_targets = {
-                source: int(value) for source, value in raw_targets.items()
-            }
-            remainder = train_tokens_target - sum(source_train_targets.values())
-            for source, _ in sorted(
-                (
-                    (source, raw_targets[source] - source_train_targets[source])
-                    for source in source_totals
-                ),
-                key=lambda item: (-item[1], item[0]),
-            )[:remainder]:
-                source_train_targets[source] += 1
-            split_idx = train_tokens_target
-        else:
-            source_train_targets = {
-                source: int(count * train_fraction)
-                for source, count in source_totals.items()
-            }
-            split_idx = sum(source_train_targets.values())
-            if train_tokens_target and train_tokens_target > total_tokens:
-                print(
-                    f"WARNING: requested {train_tokens_target:,} train tokens but only "
-                    f"{total_tokens:,} processed tokens are available. Falling back to "
-                    f"per-source train_fraction={train_fraction:.4f} -> "
-                    f"{split_idx:,} train / {total_tokens - split_idx:,} val tokens."
-                )
-
-        if source_document_ends:
-            adjusted_targets: dict[str, int] = {}
-            for source, target in source_train_targets.items():
-                total = source_totals[source]
-                boundaries = [int(value) for value in source_document_ends.get(source, [])]
-                # Zero and the final document end are valid choices. A source
-                # containing one document must go wholly to one split rather
-                # than leaking a prefix into train and its suffix into val.
-                candidates = [0]
-                candidates.extend(value for value in boundaries if 0 < value < total)
-                candidates.append(total)
-                adjusted_targets[source] = min(candidates, key=lambda value: abs(value - target))
-            source_train_targets = adjusted_targets
-            split_idx = sum(source_train_targets.values())
+        source_train_targets, split_idx = compute_source_train_targets(
+            dict(source_totals),
+            total_tokens,
+            train_fraction,
+            train_tokens_target,
+            source_document_ends,
+        )
 
     if train_tokens_target and train_tokens_target > split_idx and source_train_targets is None:
         if train_tokens_target > total_tokens:
