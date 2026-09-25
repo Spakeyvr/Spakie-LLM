@@ -852,7 +852,7 @@ class TokenizerSamplingTests(unittest.TestCase):
             captured.extend(kwargs["sentence_iterator"])
             raise KeyboardInterrupt
         with tempfile.TemporaryDirectory() as tmpdir:
-            config = SpakieConfig(tokenizer_prefix=str(Path(tmpdir) / "tokenizer"))
+            config = SpakieConfig(tokenizer_prefix=str(Path(tmpdir) / "tokenizer"), raw_data_dir=tmpdir)
             with patch.object(train_tokenizer, "iter_training_texts", side_effect=samples), \
                  patch.object(train_tokenizer.spm.SentencePieceTrainer, "train", side_effect=trainer), \
                  patch.object(train_tokenizer.tempfile, "NamedTemporaryFile",
@@ -866,7 +866,7 @@ class TokenizerSamplingTests(unittest.TestCase):
 
     def test_tokenizer_byte_budget_too_small_has_clear_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            config = SpakieConfig(tokenizer_prefix=str(Path(tmpdir) / "tokenizer"))
+            config = SpakieConfig(tokenizer_prefix=str(Path(tmpdir) / "tokenizer"), raw_data_dir=tmpdir)
             with patch.object(train_tokenizer, "iter_training_texts", return_value=iter(["é"])), \
                  patch.object(train_tokenizer.spm.SentencePieceTrainer, "train") as trainer:
                 with self.assertRaisesRegex(ValueError, "first UTF-8 character"):
@@ -954,7 +954,8 @@ class TokenizerSamplingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config = SpakieConfig(
-                tokenizer_prefix=str(Path(tmpdir) / "tokenizer" / "spakie")
+                tokenizer_prefix=str(Path(tmpdir) / "tokenizer" / "spakie"),
+                raw_data_dir=tmpdir,
             )
             with (
                 patch.object(

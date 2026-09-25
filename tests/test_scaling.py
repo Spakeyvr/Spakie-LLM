@@ -1,5 +1,6 @@
 import json
 import math
+import shutil
 import numpy as np
 import sys
 import tempfile
@@ -379,7 +380,10 @@ class ScalingConfigTests(unittest.TestCase):
             def __init__(self, _path):
                 pass
 
-        config = SpakieConfig(vocab_size=24_576)
+        # Hermetic: an empty raw dir, not whatever data/raw the checkout holds.
+        raw_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, raw_dir, ignore_errors=True)
+        config = SpakieConfig(vocab_size=24_576, raw_data_dir=raw_dir)
         with (
             patch.object(prepare_data, "SpakieTokenizer", OldTokenizer),
             patch.object(
