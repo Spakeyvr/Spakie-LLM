@@ -198,12 +198,16 @@ def unlikelihood_penalty_mlx(logp: mx.array, candidates: mx.array, weights: mx.a
 
 
 def _build_unlikelihood_step(model: SpakieGPTMLX, accum_scale: float, alpha: float):
-    """Dense next-token CE plus token-level unlikelihood, used only during the cooldown mix."""
+    """Dense next-token CE plus token-level unlikelihood, used only during the cooldown mix.
+
+    Only CE is scaled by accum_scale: unlikelihood weights are already normalized over the
+    whole optimizer step's natural rows.
+    """
     def loss_fn(model, x, y, candidates, weights):
         logits = model(x)[0].astype(mx.float32)
         logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         ce = -mx.take_along_axis(logp, y[..., None], axis=-1).squeeze(-1).mean()
-        return (ce + alpha * unlikelihood_penalty_mlx(logp, candidates, weights)) * accum_scale
+        return ce * accum_scale + alpha * unlikelihood_penalty_mlx(logp, candidates, weights)
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
 
@@ -857,6 +861,15 @@ def pretrain_mlx(
 
             in_cooldown = cooldown_mix is not None and global_step >= cooldown_start
             use_unlikelihood = in_cooldown and unlikelihood_step is not None
+            step_natural_rows = (
+                cooldown_mix.natural_rows_in_step(
+                    global_step * config.pretrain_grad_accum_steps,
+                    config.pretrain_batch_size,
+                    config.pretrain_grad_accum_steps,
+                )
+                if use_unlikelihood
+                else None
+            )
             if in_cooldown and not cooldown_announced:
                 pbar.write(f"Entering cooldown mix at step {global_step}")
                 cooldown_announced = True
@@ -915,7 +928,8 @@ def pretrain_mlx(
                     step_args = (x, y)
                     if use_unlikelihood:
                         candidates, weights = unlikelihood_inputs(
-                            x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window
+                            x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window,
+                            natural_rows=step_natural_rows,
                         )
                         step_fn = unlikelihood_step
                         step_args = (x, y, mx.array(candidates), mx.array(weights))

@@ -363,6 +363,10 @@ class NearDuplicateIndex:
         self._exact_hashes.add(exact_hash)
         return False
 
+    def collides(self, signature: np.ndarray) -> bool:
+        """Read-only near-duplicate check against inserted documents (no insert)."""
+        return any(key in table for table, key in zip(self._tables, self.band_keys(signature)))
+
     def band_keys(self, signature: np.ndarray) -> tuple[int, ...]:
         return tuple(
             xxhash.xxh64_intdigest(signature[start:end].tobytes())
@@ -1200,6 +1204,10 @@ def merge_shards(
             preparation=preparation_provenance,
             raw_inputs=raw_input_provenance,
             max_token_id=max_token_id,
+            split={
+                "train_split_fraction": float(train_fraction),
+                "train_tokens_target": int(train_tokens_target or 0),
+            },
         )
         return split_idx, expected_val_tokens
     except BaseException:

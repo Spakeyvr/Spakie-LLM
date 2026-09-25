@@ -367,6 +367,15 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
             consumed_microbatches = 0
             step_tokens = 0
 
+            step_natural_rows = (
+                cooldown_mix.natural_rows_in_step(
+                    global_step * config.pretrain_grad_accum_steps,
+                    config.pretrain_batch_size,
+                    config.pretrain_grad_accum_steps,
+                )
+                if cooldown_mix is not None and global_step >= cooldown_start and unlikelihood_eligible is not None
+                else None
+            )
             for micro_step in range(config.pretrain_grad_accum_steps):
                 try:
                     x, y = next(train_iter)
@@ -380,7 +389,8 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                     x_np, y_np, natural_rows = cooldown_mix.apply(x.numpy(), y.numpy(), microbatch_cursor)
                     if unlikelihood_eligible is not None:
                         candidates, weights = unlikelihood_inputs(
-                            x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window
+                            x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window,
+                            natural_rows=step_natural_rows,
                         )
                         ul_inputs = (torch.from_numpy(candidates).long().to(runtime.device),
                                      torch.from_numpy(weights).to(runtime.device))
@@ -392,12 +402,15 @@ def pretrain(model: SpakieGPT, train_loader: DataLoader, val_loader: DataLoader,
                 with autocast_context(runtime):
                     if ul_inputs is None:
                         _, loss = model(x, y)
+                        loss = loss / config.pretrain_grad_accum_steps
                     else:
+                        # Only CE is accumulation-scaled; unlikelihood weights are already
+                        # normalized over the optimizer step's natural rows.
                         logits, _ = model(x)
                         logp = torch.log_softmax(logits.float(), dim=-1)
                         ce = -logp.gather(-1, y.unsqueeze(-1)).squeeze(-1).mean()
-                        loss = ce + config.cooldown_ul_alpha * unlikelihood_penalty_torch(logp, *ul_inputs)
-                    loss = loss / config.pretrain_grad_accum_steps
+                        loss = (ce / config.pretrain_grad_accum_steps
+                                + config.cooldown_ul_alpha * unlikelihood_penalty_torch(logp, *ul_inputs))
 
                 scaler.scale(loss).backward()
                 detached = loss.detach()

@@ -135,6 +135,11 @@ class CooldownMix:
             offset = min(offset, span)
         return np.asarray(tokens[offset: offset + self.seq_len + 1], dtype=np.int32)
 
+    def natural_rows_in_step(self, first_microbatch_index: int, rows: int, microbatches: int) -> int:
+        """Natural-text rows across one optimizer step (the unlikelihood normalizer)."""
+        start = first_microbatch_index * rows
+        return sum(self.is_natural(self.component_for_row(g)) for g in range(start, start + rows * microbatches))
+
     def apply(self, x: np.ndarray, y: np.ndarray, microbatch_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Replace non-historical rows in place-safe copies; return (x, y, natural_row_mask)."""
         rows = x.shape[0]
@@ -204,17 +209,19 @@ def previous_token_candidates(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def unlikelihood_inputs(x: np.ndarray, y: np.ndarray, natural: np.ndarray, eligible: np.ndarray,
-                        window: int) -> tuple[np.ndarray, np.ndarray]:
+                        window: int, natural_rows: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Candidate ids and weights for token-level unlikelihood (Welleck et al., 2019).
 
     The penalty is sum(weights * -log(1 - p(candidate))). Candidates are recent eligible
     content tokens other than the true next token, on natural-text rows only. Weights
-    average over positions and natural rows so the term matches the validated recipe.
+    average over positions and over ``natural_rows`` (pass the optimizer step's total so
+    the objective does not depend on how the step is split into microbatches; defaults to
+    this microbatch's natural rows). Callers must not rescale the term by grad accumulation.
     """
     candidates = previous_token_candidates(x, window)
     valid = (candidates >= 0) & (candidates != y[..., None])
     safe = np.maximum(candidates, 0)
     valid &= eligible[safe]
     valid &= natural[:, None, None]
-    denominator = x.shape[1] * max(int(natural.sum()), 1)
+    denominator = x.shape[1] * max(int(natural.sum()) if natural_rows is None else int(natural_rows), 1)
     return safe.astype(np.int32), valid.astype(np.float32) / denominator

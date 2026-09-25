@@ -6,11 +6,12 @@ a quality cycle over every source plus Wikipedia definitions/leads, verified
 worked addition, and alternating pairwise-magnitude / context-retrieval
 documents.
 
-Split membership is read from prepare_data's accepted-document journal and the
-shared per-source train allocation, so no validation document enters the mix:
-source samples must be documents placed in train.npy; Wikipedia leads/definitions
-may come from any article except validation documents (prepare_data stops reading
-a source once its budget is met, so most articles were never processed at all).
+Split membership is read from prepare_data's accepted-document journal, using the
+split settings recorded with the processed arrays, and the recomputed train total
+must equal the committed train.npy size. Source samples must be documents placed in
+train.npy. Wikipedia leads/definitions may come from any article (prepare_data stops
+reading a source once its budget is met) except validation articles and their MinHash
+near-duplicates, checked with prepare_data's own LSH banding.
 Run this after prepare_data has finished.
 """
 from __future__ import annotations
@@ -45,9 +46,42 @@ def sha(path: Path) -> str:
     return digest.hexdigest()
 
 
-def split_document_hashes(shard_dir: Path, config) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict]:
-    """Sorted exact hashes (per source) of documents prepare_data placed in train.npy and in val.npy."""
-    from scripts.prepare_data import SHARD_RESUME_JOURNAL, compute_source_train_targets, iter_accepted_documents
+def recorded_split_settings(processed_dir: Path) -> dict:
+    """Split and dedup settings that produced processed_dir, read from its committed manifest.
+
+    Manifests published before the "split" record existed carry no train-token target;
+    split_document_hashes then accepts only a candidate target that exactly reproduces
+    the committed train.npy size.
+    """
+    manifest = json.loads((processed_dir / 'processed_data_manifest.json').read_text())
+    prep = (manifest.get('preparation') or {}).get('config') or {}
+    missing = [k for k in ('train_split_fraction', 'near_dup_jaccard_threshold', 'near_dup_num_perm',
+                           'near_dup_shingle_size') if k not in prep]
+    if missing:
+        raise ValueError(f'processed data lacks recorded preparation settings: {missing}')
+    split = manifest.get('split') or {}
+    if split:
+        candidates = [int(split['train_tokens_target'])]
+    else:
+        from configs.default import SpakieConfig
+        candidates = [int(SpakieConfig().target_train_tokens), 0]
+        report = processed_dir / 'corpus_report.json'
+        if report.is_file():
+            candidates.insert(0, int(json.loads(report.read_text()).get('target_train_tokens', 0)))
+    return {'train_split_fraction': float(split.get('train_split_fraction', prep['train_split_fraction'])),
+            'target_train_tokens_candidates': list(dict.fromkeys(candidates)),
+            'split_recorded_in_manifest': bool(split),
+            'train_tokens': int(manifest['train']['tokens']),
+            'near_dup_jaccard_threshold': float(prep['near_dup_jaccard_threshold']),
+            'near_dup_num_perm': int(prep['near_dup_num_perm']),
+            'near_dup_shingle_size': int(prep['near_dup_shingle_size'])}
+
+
+def split_document_hashes(shard_dir: Path, settings: dict, near_dup_sources: tuple[str, ...] = ()):
+    """Per-source sorted exact hashes of train.npy and val.npy documents, plus a near-duplicate
+    index of validation documents for near_dup_sources."""
+    from scripts.prepare_data import (NearDuplicateIndex, SHARD_RESUME_JOURNAL, compute_source_train_targets,
+                                      iter_accepted_documents)
     journal = shard_dir / SHARD_RESUME_JOURNAL
     if not journal.is_file():
         raise FileNotFoundError(f"prepare_data journal not found: {journal}; run prepare_data first")
@@ -57,21 +91,38 @@ def split_document_hashes(shard_dir: Path, config) -> tuple[dict[str, np.ndarray
     for record in iter_accepted_documents(journal):
         totals[record.source] = totals.get(record.source, 0) + record.token_count
         ends.setdefault(record.source, array('Q')).append(totals[record.source])
-    targets, _ = compute_source_train_targets(totals, sum(totals.values()), config.train_split_fraction,
-                                              config.target_train_tokens, ends)
+    candidates = settings.get('target_train_tokens_candidates', [settings.get('target_train_tokens', 0)])
+    for target in candidates:
+        targets, split_idx = compute_source_train_targets(totals, sum(totals.values()),
+                                                          settings['train_split_fraction'], target, ends)
+        if split_idx == settings['train_tokens']:
+            settings['target_train_tokens'] = target
+            break
+    else:
+        raise ValueError(f"no recorded split setting reproduces the committed train.npy "
+                         f"({settings['train_tokens']:,} tokens; tried targets {candidates}); "
+                         "journal and arrays are out of sync")
     del ends
     seen: dict[str, int] = {}
     train: dict[str, array] = {}
     val: dict[str, array] = {}
+    val_index = NearDuplicateIndex(threshold=settings['near_dup_jaccard_threshold'],
+                                   num_perm=settings['near_dup_num_perm'],
+                                   shingle_size=settings['near_dup_shingle_size'])
     for record in iter_accepted_documents(journal):
         seen[record.source] = seen.get(record.source, 0) + record.token_count
-        split = train if seen[record.source] <= targets[record.source] else val
+        in_train_split = seen[record.source] <= targets[record.source]
+        split = train if in_train_split else val
         split.setdefault(record.source, array('Q')).append(record.exact_hash)
+        if not in_train_split and record.source in near_dup_sources:
+            if not record.band_keys:
+                raise ValueError('journal has no MinHash band keys; cannot exclude validation near-duplicates')
+            val_index.insert_known(record.exact_hash, record.band_keys)
     info = {'journal': str(journal), 'journal_sha256': sha(journal), 'train_targets': targets,
             'train_documents': {k: len(v) for k, v in train.items()},
             'val_documents': {k: len(v) for k, v in val.items()}}
     as_sorted = lambda split: {k: np.unique(np.frombuffer(v, dtype=np.uint64)) for k, v in split.items()}
-    return as_sorted(train), as_sorted(val), info
+    return as_sorted(train), as_sorted(val), val_index, info
 
 
 def in_split(hashes: dict[str, np.ndarray], source: str, cleaned_text: str) -> bool:
@@ -107,14 +158,14 @@ def source_sample(raw_root: Path, source: str, tokenizer, token_budget: int,
     return docs
 
 
-def wikipedia_leads_and_definitions(raw_root: Path, tokenizer, val_hashes: dict[str, np.ndarray],
-                                    max_shards: int = 0) -> tuple[list[list[int]], list[list[int]]]:
-    """One pass over Wikipedia articles, skipping every article prepare_data placed in val.npy.
+def wikipedia_leads_and_definitions(raw_root: Path, tokenizer, val_hashes: dict[str, np.ndarray], val_index,
+                                    settings: dict, max_shards: int = 0) -> tuple[list[list[int]], list[list[int]]]:
+    """One pass over Wikipedia articles, skipping validation articles and their near-duplicates.
 
     leads: title + text before the first section break, articles > 40k chars.
     definitions: title + first two sentences, articles > 15k chars.
     """
-    from scripts.prepare_data import clean_text
+    from scripts.prepare_data import clean_text, compute_minhash_signature
     shards = raw_shards(raw_root, 'wikipedia_snapshot')
     leads, definitions = [], []
     for path in shards[:max_shards] if max_shards > 0 else shards:
@@ -122,8 +173,12 @@ def wikipedia_leads_and_definitions(raw_root: Path, tokenizer, val_hashes: dict[
             for line in handle:
                 row = json.loads(line)
                 text = row.get('text', '')
-                if len(text) < 15000 or in_split(val_hashes, 'wikipedia_snapshot',
-                                                 clean_text(text, 'wikipedia_snapshot')):
+                if len(text) < 15000:
+                    continue
+                cleaned = clean_text(text, 'wikipedia_snapshot')
+                if in_split(val_hashes, 'wikipedia_snapshot', cleaned) or val_index.collides(
+                        compute_minhash_signature(cleaned, num_perm=settings['near_dup_num_perm'],
+                                                  shingle_size=settings['near_dup_shingle_size'])):
                     continue
                 title = row.get('title', '')
                 first = re.split(r'\n', text, maxsplit=1)[0].strip()
@@ -177,8 +232,8 @@ def main():
     parser.add_argument('--tokens-per-source', type=int, default=4_000_000)
     parser.add_argument('--seed', type=int, default=2026092403)
     parser.add_argument('--max-wiki-shards', type=int, default=0, help='Limit Wikipedia shards scanned (smoke tests only)')
-    parser.add_argument('--shard-dir', type=Path, default=None,
-                        help='prepare_data shard directory with the accepted-document journal (default: config)')
+    parser.add_argument('--processed-dir', type=Path, default=None,
+                        help='prepare_data output with train.npy, its manifest and shards/ (default: config)')
     parser.add_argument('--exclude-tasks', type=Path, nargs='*', default=[],
                         help='Evaluation task JSON files whose number pairs / entity names the magnitude curriculum must avoid')
     args = parser.parse_args()
@@ -186,14 +241,19 @@ def main():
         parser.error('Output exists; choose a new directory')
     config = SpakieConfig()
     tokenizer = SpakieTokenizer(str(args.tokenizer))
-    train_hashes, val_hashes, membership = split_document_hashes(args.shard_dir or Path(config.token_shard_dir), config)
+    processed_dir = args.processed_dir or Path(config.processed_data_dir)
+    settings = recorded_split_settings(processed_dir)
+    train_hashes, val_hashes, val_index, membership = split_document_hashes(
+        processed_dir / 'shards', settings, near_dup_sources=('wikipedia_snapshot',))
+    membership['recorded_settings'] = settings
     args.output.mkdir(parents=True)
     components = {}
     for source in SOURCES:
         docs = source_sample(args.raw_dir, source, tokenizer, args.tokens_per_source, train_hashes)
         components[source] = write_component(args.output, source, docs, natural=True, with_starts=False)
         print(source, components[source]['tokens'], flush=True)
-    leads, definitions = wikipedia_leads_and_definitions(args.raw_dir, tokenizer, val_hashes, args.max_wiki_shards)
+    leads, definitions = wikipedia_leads_and_definitions(args.raw_dir, tokenizer, val_hashes, val_index, settings,
+                                                         args.max_wiki_shards)
     components['wiki_leads'] = write_component(args.output, 'wiki_leads', leads, natural=True, with_starts=False)
     components['wiki_definitions'] = write_component(args.output, 'wiki_definitions', definitions,
                                                      natural=True, with_starts=False)

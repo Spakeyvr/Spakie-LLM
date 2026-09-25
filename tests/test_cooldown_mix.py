@@ -227,45 +227,106 @@ class BuilderSafetyTests(unittest.TestCase):
                              for t in texts))
         self.assertFalse(any('Arlo' in t for t in texts))
 
-    def test_train_membership_matches_merge_shards_on_uneven_sources(self):
-        from scripts.build_cooldown_mix import split_document_hashes
-        from scripts.prepare_data import (AcceptedDocument, SHARD_RESUME_JOURNAL, append_accepted_document,
-                                          merge_shards)
+    def _synthetic_split(self, root, *, train_fraction, train_target):
+        from scripts.prepare_data import AcceptedDocument, SHARD_RESUME_JOURNAL, append_accepted_document, merge_shards
         rng = np.random.default_rng(1)
-        docs = []  # (source, doc_id, length); interleaved, uneven sources and lengths
-        for i in range(60):
-            source = ('a', 'b', 'b', 'c')[i % 4] if i < 40 else 'a'
-            docs.append((source, i + 1, int(rng.integers(3, 40))))
+        docs = [(('a', 'b', 'b', 'c')[i % 4] if i < 40 else 'a', i + 1, int(rng.integers(3, 40))) for i in range(60)]
+        shard_dir = root / 'shards'
+        shard_dir.mkdir()
+        with (shard_dir / SHARD_RESUME_JOURNAL).open('wb') as handle:
+            for source, doc_id, length in docs:
+                append_accepted_document(handle, AcceptedDocument(source, length, length, doc_id, ()))
+        tokens = np.concatenate([np.full(length, doc_id, dtype=np.uint16) for _, doc_id, length in docs])
+        cut = len(tokens) // 3
+        shards = [shard_dir / 'tokens-0.npy', shard_dir / 'tokens-1.npy']
+        np.save(shards[0], tokens[:cut])
+        np.save(shards[1], tokens[cut:])
+        runs, ends, totals, cursor = [], {}, {}, 0
+        for source, _, length in docs:
+            if runs and runs[-1][0] == source:
+                runs[-1] = (source, runs[-1][1], cursor + length)
+            else:
+                runs.append((source, cursor, cursor + length))
+            cursor += length
+            totals[source] = totals.get(source, 0) + length
+            ends.setdefault(source, []).append(totals[source])
+        train_tokens, _ = merge_shards(shards, root / 'train.npy', root / 'val.npy', train_fraction, np.uint16,
+                                       train_tokens_target=train_target, source_runs=runs, source_document_ends=ends)
+        settings = {'train_split_fraction': train_fraction, 'target_train_tokens': train_target,
+                    'train_tokens': train_tokens, 'near_dup_jaccard_threshold': 0.8, 'near_dup_num_perm': 128,
+                    'near_dup_shingle_size': 5}
+        return shard_dir, settings, set(np.unique(np.load(root / 'train.npy')).tolist()), \
+            set(np.unique(np.load(root / 'val.npy')).tolist())
+
+    def test_train_membership_uses_recorded_non_default_split(self):
+        from scripts.build_cooldown_mix import split_document_hashes
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            shard_dir = root / 'shards'
-            shard_dir.mkdir()
-            with (shard_dir / SHARD_RESUME_JOURNAL).open('wb') as handle:
-                for source, doc_id, length in docs:
-                    append_accepted_document(handle, AcceptedDocument(source, length, length, doc_id, ()))
-            tokens = np.concatenate([np.full(length, doc_id, dtype=np.uint16) for _, doc_id, length in docs])
-            cut = len(tokens) // 3
-            shards = [shard_dir / 'tokens-0.npy', shard_dir / 'tokens-1.npy']
-            np.save(shards[0], tokens[:cut])
-            np.save(shards[1], tokens[cut:])
-            runs, ends, totals, cursor = [], {}, {}, 0
-            for source, _, length in docs:
-                if runs and runs[-1][0] == source:
-                    runs[-1] = (source, runs[-1][1], cursor + length)
-                else:
-                    runs.append((source, cursor, cursor + length))
-                cursor += length
-                totals[source] = totals.get(source, 0) + length
-                ends.setdefault(source, []).append(totals[source])
-            cfg = SpakieConfig()
-            cfg.train_split_fraction, cfg.target_train_tokens = 0.8, 0
-            merge_shards(shards, root / 'train.npy', root / 'val.npy', 0.8, np.uint16,
-                         train_tokens_target=0, source_runs=runs, source_document_ends=ends)
-            in_train = set(np.unique(np.load(root / 'train.npy')).tolist())
-            in_val = set(np.unique(np.load(root / 'val.npy')).tolist())
-            train_hashes, val_hashes, _ = split_document_hashes(shard_dir, cfg)
+            # A non-default token target, as the review's reproduction used.
+            shard_dir, settings, in_train, in_val = self._synthetic_split(Path(tmp), train_fraction=0.7, train_target=400)
+            train_hashes, val_hashes, _, _ = split_document_hashes(shard_dir, settings)
+            with self.assertRaisesRegex(ValueError, 'reproduces the committed'):
+                split_document_hashes(shard_dir, {**settings, 'target_train_tokens_candidates': [0, 123],
+                                                  'train_split_fraction': 0.95})
+            # A stale report target is skipped in favour of one that reproduces train.npy.
+            stale = {**settings, 'target_train_tokens_candidates': [999, settings['target_train_tokens']]}
+            split_document_hashes(shard_dir, stale)
+            self.assertEqual(stale['target_train_tokens'], 400)
         selected = {int(h) for values in train_hashes.values() for h in values}
         held_out = {int(h) for values in val_hashes.values() for h in values}
         self.assertEqual(selected, in_train)
         self.assertEqual(held_out, in_val)
         self.assertTrue(in_val)
+
+    def test_validation_near_duplicates_are_detected(self):
+        from scripts.prepare_data import NearDuplicateIndex, compute_minhash_signature
+        base = ' '.join(f'word{i} alpha beta gamma delta' for i in range(300))
+        near = base + ' a different final paragraph with a few new words'
+        other = ' '.join(f'token{i} unrelated text here' for i in range(300))
+        index = NearDuplicateIndex(threshold=0.8, num_perm=128, shingle_size=5)
+        sig = lambda text: compute_minhash_signature(text, num_perm=128, shingle_size=5)
+        index.insert_known(1, index.band_keys(sig(base)))
+        self.assertTrue(index.collides(sig(near)))
+        self.assertFalse(index.collides(sig(other)))
+        self.assertFalse(index.collides(sig(other)))  # read-only: checking never inserts
+
+
+class RecordedSplitTests(unittest.TestCase):
+    def test_merge_records_split_and_builder_prefers_it_over_the_report(self):
+        from scripts.build_cooldown_mix import recorded_split_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shard_dir, settings, _, _ = BuilderSafetyTests()._synthetic_split(root, train_fraction=0.7, train_target=400)
+            manifest = json.loads((root / 'processed_data_manifest.json').read_text())
+            self.assertEqual(manifest['split'], {'train_split_fraction': 0.7, 'train_tokens_target': 400})
+            manifest['preparation'] = {'config': {'train_split_fraction': 0.7, 'near_dup_jaccard_threshold': 0.8,
+                                                  'near_dup_num_perm': 128, 'near_dup_shingle_size': 5}}
+            (root / 'processed_data_manifest.json').write_text(json.dumps(manifest))
+            (root / 'corpus_report.json').write_text(json.dumps({'target_train_tokens': 999}))  # stale dry-run
+            recorded = recorded_split_settings(root)
+        self.assertEqual(recorded['target_train_tokens_candidates'], [400])
+        self.assertTrue(recorded['split_recorded_in_manifest'])
+
+
+class UnlikelihoodNormalizationTests(unittest.TestCase):
+    def test_weights_do_not_depend_on_microbatch_partitioning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mix = CooldownMix.from_path(str(write_mix(Path(tmp))), seq_len=8, seed=3)
+            rng = np.random.default_rng(0)
+            x = rng.integers(0, 50, size=(16, 8))
+            y = rng.integers(0, 50, size=(16, 8))
+            eligible = np.ones(50, dtype=bool)
+            natural = np.array([mix.is_natural(mix.component_for_row(r)) for r in range(16)])
+            n = mix.natural_rows_in_step(0, 16, 1)
+            self.assertEqual(n, mix.natural_rows_in_step(0, 8, 2))
+            _, whole = unlikelihood_inputs(x, y, natural, eligible, 4, natural_rows=n)
+            _, first = unlikelihood_inputs(x[:8], y[:8], natural[:8], eligible, 4, natural_rows=n)
+            _, second = unlikelihood_inputs(x[8:], y[8:], natural[8:], eligible, 4, natural_rows=n)
+            np.testing.assert_allclose(np.concatenate([first, second]), whole)
+            # Per-microbatch normalization (the old behaviour) would weight the halves differently.
+            _, old_first = unlikelihood_inputs(x[:8], y[:8], natural[:8], eligible, 4)
+            _, old_second = unlikelihood_inputs(x[8:], y[8:], natural[8:], eligible, 4)
+            self.assertNotAlmostEqual(float(old_first.max()), float(old_second.max()))
+
+
+if __name__ == '__main__':
+    unittest.main()

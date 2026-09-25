@@ -97,8 +97,14 @@ def publish_processed_data_manifest(
     preparation: dict | None = None,
     raw_inputs: dict | None = None,
     max_token_id: int | None = None,
+    split: dict | None = None,
 ) -> Path:
-    """Publish the completion marker last, after both arrays are durable."""
+    """Publish the completion marker last, after both arrays are durable.
+
+    ``split`` records the parameters merge_shards used to divide sources into
+    train/val (train_split_fraction, train_tokens_target), so consumers can
+    reconstruct document membership without relying on mutable reports.
+    """
     processed_dir = train_path.parent
     if val_path.parent != processed_dir:
         raise ValueError("train and validation arrays must share one directory")
@@ -122,6 +128,8 @@ def publish_processed_data_manifest(
         "raw_inputs": raw_inputs,
         "max_token_id": None if max_token_id is None else int(max_token_id),
     }
+    if split is not None:
+        payload["split"] = split
     final_path = manifest_path(processed_dir)
     fd, temp_name = tempfile.mkstemp(
         prefix=f".{final_path.name}.", suffix=".tmp", dir=processed_dir
