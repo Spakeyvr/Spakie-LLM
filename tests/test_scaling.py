@@ -121,19 +121,6 @@ class ScalingConfigTests(unittest.TestCase):
         self.assertEqual(config.sft_optimizer, "adamw")
         self.assertEqual(config.sft_epochs, 1)
 
-    def test_180m_architecture_ablation_presets(self):
-        baseline = get_preset_config("180m")
-        gqa4 = get_preset_config("180m_gqa4")
-        deep = get_preset_config("180m_deep")
-        self.assertEqual(
-            (baseline.max_seq_len, gqa4.max_seq_len, deep.max_seq_len),
-            (2048, 2048, 2048),
-        )
-        self.assertEqual(gqa4.n_kv_heads, 4)
-        self.assertEqual(gqa4.n_heads % gqa4.n_kv_heads, 0)
-        self.assertEqual((deep.n_layers, deep.d_model), (24, 768))
-        self.assertLess(deep.swiglu_hidden, baseline.swiglu_hidden)
-
     def test_default_presets_have_recommended_architecture_and_parameter_counts(self):
         expected = {
             "92m": {

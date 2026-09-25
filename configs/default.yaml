@@ -1,5 +1,5 @@
 default_preset: "300m"
-supported_presets: ["92m", "180m", "180m_gqa4", "180m_deep", "300m", "360m"]
+supported_presets: ["92m", "180m", "300m", "360m"]
 chat_system_prompt: "Answer clearly and factually. Keep explanations simple, direct, and truthful."
 
 corpus_source_aliases:
@@ -200,42 +200,6 @@ presets:
     pretrain_batch_size: 12
     pretrain_grad_accum_steps: 4
     sft_batch_size: 8
-    sft_grad_accum_steps: 4
-    sft_lr: 1.5e-5
-    sft_epochs: 1
-
-  # Near-matched-shape 4-KV-head ablation. Sixteen query heads are required
-  # because grouped-query attention requires query heads divisible by KV heads.
-  180m_gqa4:
-    n_layers: 16
-    d_model: 896
-    n_heads: 16
-    n_kv_heads: 4
-    d_ff: 3584
-    mlp_type: swiglu
-    swiglu_hidden: 2048
-    activation_checkpointing: false
-    pretrain_batch_size: 24
-    pretrain_grad_accum_steps: 2
-    sft_batch_size: 16
-    sft_grad_accum_steps: 4
-    sft_lr: 1.5e-5
-    sft_epochs: 1
-
-  # Deep/thin, approximately matched-budget architecture ablation. Context
-  # uses the canonical 2K window; batch size is reduced to preserve tokens/step.
-  180m_deep:
-    n_layers: 24
-    d_model: 768
-    n_heads: 12
-    n_kv_heads: 4
-    d_ff: 3072
-    mlp_type: swiglu
-    swiglu_hidden: 1536
-    activation_checkpointing: false
-    pretrain_batch_size: 18
-    pretrain_grad_accum_steps: 2
-    sft_batch_size: 12
     sft_grad_accum_steps: 4
     sft_lr: 1.5e-5
     sft_epochs: 1

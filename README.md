@@ -694,8 +694,6 @@ The repo currently supports these presets:
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
 | `92m` | 12 | 768 | 12 | 4 | SwiGLU hidden 2048 | 16 | 4 | 16 | 4 | Default modern small preset; RoPE + QK norm |
 | `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 12 | 4 | 8 | 4 | ~184M parameters, RoPE + QK norm |
-| `180m_gqa4` | 16 | 896 | 16 | 4 | SwiGLU hidden 2048 | 24 | 2 | 16 | 4 | Short-run 4-KV-head architecture ablation |
-| `180m_deep` | 24 | 768 | 12 | 4 | SwiGLU hidden 1536 | 18 | 2 | 12 | 4 | Short-run deep/thin architecture ablation |
 | `300m` | 24 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 16 | 3 | 4 | 2 | ~315M parameters, RoPE + QK norm; memory-safe chunked-vmap pretraining default |
 | `360m` | 28 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 8 | 6 | 4 | 2 | ~363M parameters; same token batch as 300m, one accumulation lane resident |
 
@@ -733,12 +731,10 @@ python3 scripts/download_pretrain_corpus.py --sources all --resume --english-onl
 python3 scripts/prepare_data.py
 ```
 
-Before a full run, compare the architecture variants at the same token budget:
+Before a full run, compare the presets at the same token budget:
 
 ```bash
 python3 scripts/train.py --preset 180m --backend mlx --target-tokens 300000000
-python3 scripts/train.py --preset 180m_gqa4 --backend mlx --target-tokens 300000000
-python3 scripts/train.py --preset 180m_deep --backend mlx --target-tokens 300000000
 python3 scripts/train.py --preset 300m --backend mlx --target-tokens 300000000
 ```
 
