@@ -250,131 +250,10 @@ def _build_microbatch_step(
     return step
 
 
-def _build_vmap_accum_step(
-    model: SpakieGPTMLX,
-    *,
-    compile_step: bool,
-    ignore_index: int | None = -100,
-    loss_scale: float | None = None,
-):
-    """Return a callable `step(xs, ys) -> (loss, grads)` for stacked microbatches.
-
-    `xs` and `ys` have shape (lanes, batch, seq). With `loss_scale=None` the
-    returned loss is the mean over the lanes in this call (matching a single
-    full-G vmap of `grad_accum` microbatches). When the accumulation is split
-    into several smaller groups, pass `loss_scale=1/grad_accum`: each group then
-    returns `sum(lane_losses) / grad_accum`, so summing the group losses and
-    group gradients across all groups reproduces the exact 1/grad_accum scaling
-    of the full-G vmap (and of the sequential accumulation loop).
-    """
-
-    def loss_fn(model, xs, ys):
-        def one_loss(x, y):
-            _, loss, _ = model(
-                x,
-                y,
-                return_cache=False,
-                ignore_index=ignore_index,
-                # This runs under mx.vmap; the fused CE Metal kernel has no vmap
-                # rule, so force the vmap-safe MLX custom loss instead.
-                allow_fused_ce=False,
-            )
-            return loss
-
-        lane_losses = mx.vmap(one_loss)(xs, ys)
-        if loss_scale is None:
-            return lane_losses.mean()
-        return lane_losses.sum() * loss_scale
-
-    value_and_grad = nn.value_and_grad(model, loss_fn)
-
-    if not compile_step:
-        def step(xs, ys):
-            return value_and_grad(model, xs, ys)
-        return step
-
-    state = [model.state]
-    if getattr(model.config, "dropout", 0.0) > 0.0:
-        state.append(mx.random.state)
-
-    @partial(mx.compile, inputs=state, outputs=state)
-    def step(xs, ys):
-        return value_and_grad(model, xs, ys)
-
-    return step
-
-
 def _accum_grads(acc, new):
     if acc is None:
         return new
     return tree_map(operator.add, acc, new)
-
-
-def _physical_ram_bytes() -> int:
-    """Total physical RAM in bytes (unified memory on Apple Silicon)."""
-    try:
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, AttributeError):
-        import subprocess
-
-        return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]))
-
-
-def _reset_peak_memory() -> None:
-    for fn_name in ("reset_peak_memory", "clear_cache"):
-        fn = getattr(mx, fn_name, None)
-        if fn is not None:
-            fn()
-
-
-def choose_vmap_group_size(
-    model: SpakieGPTMLX,
-    config: SpakieConfig,
-    *,
-    batch_size: int,
-    seq_len: int,
-    grad_accum: int,
-    budget_frac: float,
-) -> int:
-    """Pick the largest vmap group size whose forward/backward peak fits budget.
-
-    vmap keeps every lane's activations resident for the backward, so peak memory
-    grows ~linearly with the number of lanes vmapped together. A full-G vmap of
-    the 300m preset needs ~107 GB, which panics the macOS kernel on a 128 GB
-    machine. This runs one cheap single-lane probe at a small batch, measures the
-    real per-(lane*batch) peak, and returns the largest group in ``1..grad_accum``
-    whose estimated peak stays under ``budget_frac`` of physical RAM.
-
-    A positive ``pretrain_vmap_group_size`` overrides the probe (still clamped to
-    ``grad_accum``).
-    """
-    forced = int(getattr(config, "pretrain_vmap_group_size", 0) or 0)
-    if forced > 0:
-        return max(1, min(forced, grad_accum))
-
-    budget = _physical_ram_bytes() * budget_frac
-    probe_b = min(batch_size, 16)
-    probe_step = _build_vmap_accum_step(
-        model, compile_step=False, ignore_index=None, loss_scale=1.0
-    )
-    xs = mx.zeros((1, probe_b, seq_len), dtype=mx.int32)
-    ys = mx.zeros((1, probe_b, seq_len), dtype=mx.int32)
-    _reset_peak_memory()
-    loss, grads = probe_step(xs, ys)
-    mx.eval(loss, grads)
-    probe_peak = mx.get_peak_memory()
-    del loss, grads, probe_step, xs, ys
-    _reset_peak_memory()
-
-    # Peak is ~ group * batch * per_unit (base term is small and shared across
-    # lanes, so treating it as per-unit slightly overestimates -> conservative).
-    per_unit = probe_peak / max(probe_b, 1)
-    best = 1
-    for group in range(1, grad_accum + 1):
-        estimate = group * batch_size * per_unit
-        if estimate <= budget:
-            best = group
-    return best
 
 
 def _arrays_to_mx(
@@ -673,7 +552,6 @@ def pretrain_mlx(
     eval_microbatch_loss: bool = True,
     eval_loss_final_microbatch: bool = False,
     defer_final_microbatch_eval: bool = False,
-    use_vmap_accum_step: bool = False,
     allow_adamw_fallback: bool = False,
 ) -> float:
     if resume_state:
@@ -735,41 +613,6 @@ def pretrain_mlx(
             )
         print(f"Cooldown mix from step {cooldown_start} ({config.cooldown_mix_manifest}); "
               f"unlikelihood alpha {config.cooldown_ul_alpha}")
-    vmap_accum_step = None
-    vmap_group_size = 0
-    vmap_n_groups = 0
-    vmap_sync_warmup = 0
-    if use_vmap_accum_step:
-        if config.pretrain_grad_accum_steps < 2:
-            raise ValueError("use_vmap_accum_step requires pretrain_grad_accum_steps >= 2")
-        grad_accum = config.pretrain_grad_accum_steps
-        vmap_group_size = choose_vmap_group_size(
-            model,
-            config,
-            batch_size=config.pretrain_batch_size,
-            seq_len=config.max_seq_len,
-            grad_accum=grad_accum,
-            budget_frac=float(getattr(config, "pretrain_vmap_mem_budget_frac", 0.70)),
-        )
-        vmap_n_groups = math.ceil(grad_accum / vmap_group_size)
-        vmap_sync_warmup = int(
-            getattr(config, "pretrain_vmap_sync_warmup_steps", 0) or 0
-        )
-        print(
-            f"vmap accumulation: grad_accum={grad_accum}, group_size={vmap_group_size}, "
-            f"groups/step={vmap_n_groups} (peak ~ group_size lanes resident; "
-            f"a full-G vmap would hold all {grad_accum} lanes and can panic the "
-            f"macOS kernel when it exceeds physical RAM)"
-        )
-        # loss_scale = 1/grad_accum so summing group losses/grads across all
-        # groups reproduces the exact 1/grad_accum scaling of a full-G vmap.
-        vmap_accum_step = _build_vmap_accum_step(
-            model,
-            compile_step=use_compile,
-            ignore_index=None,
-            loss_scale=1.0 / grad_accum,
-        )
-
     ckpt_writer = AsyncCheckpointWriter()
     profiler = MLXProfile(enabled=profile)
     window_steps = 0
@@ -875,100 +718,57 @@ def pretrain_mlx(
             if in_cooldown and not cooldown_announced:
                 pbar.write(f"Entering cooldown mix at step {global_step}")
                 cooldown_announced = True
-            if vmap_accum_step is not None and not use_unlikelihood:
-                xs = []
-                ys = []
-                for _ in range(config.pretrain_grad_accum_steps):
-                    if profiler.enabled:
-                        batch_start = now()
-                        x_np, y_np, _ = next_training_batch()
-                        profiler.add("batch_fetch", now() - batch_start)
-                    else:
-                        x_np, y_np, _ = next_training_batch()
-                    x, y = _arrays_to_mx(x_np, y_np, profiler)
-                    xs.append(x)
-                    ys.append(y)
-                    step_tokens += x.size
-                    consumed_microbatches += 1
-
-                step_start = now() if profiler.enabled else None
-                grad_accum = config.pretrain_grad_accum_steps
-                for gi in range(vmap_n_groups):
-                    lo = gi * vmap_group_size
-                    hi = min(lo + vmap_group_size, grad_accum)
-                    group_loss, group_grads = vmap_accum_step(
-                        mx.stack(xs[lo:hi]), mx.stack(ys[lo:hi])
-                    )
-                    accum_grads = (
-                        group_grads
-                        if accum_grads is None
-                        else _accum_grads(accum_grads, group_grads)
-                    )
-                    accum_loss = accum_loss + group_loss.astype(mx.float32)
-                    # Sync between groups so each group's forward activations are
-                    # freed before the next group's graph is built. Without this
-                    # the groups overlap and peak memory returns to the full-G
-                    # (kernel-panicking) footprint. The final group may async_eval
-                    # to overlap with the optimizer, except during sync warmup.
-                    is_last = gi == vmap_n_groups - 1
-                    if is_last and global_step >= vmap_sync_warmup:
-                        mx.async_eval(accum_grads, accum_loss)
-                    else:
-                        mx.eval(accum_grads, accum_loss)
+            for micro_idx in range(config.pretrain_grad_accum_steps):
                 if profiler.enabled:
-                    profiler.add("forward_backward", now() - step_start)
-            else:
-                for micro_idx in range(config.pretrain_grad_accum_steps):
-                    if profiler.enabled:
-                        batch_start = now()
-                        x_np, y_np, natural_rows = next_training_batch()
-                        profiler.add("batch_fetch", now() - batch_start)
-                    else:
-                        x_np, y_np, natural_rows = next_training_batch()
-                    x, y = _arrays_to_mx(x_np, y_np, profiler)
-                    step_fn = microbatch_step
-                    step_args = (x, y)
-                    if use_unlikelihood:
-                        candidates, weights = unlikelihood_inputs(
-                            x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window,
-                            natural_rows=step_natural_rows,
-                        )
-                        step_fn = unlikelihood_step
-                        step_args = (x, y, mx.array(candidates), mx.array(weights))
+                    batch_start = now()
+                    x_np, y_np, natural_rows = next_training_batch()
+                    profiler.add("batch_fetch", now() - batch_start)
+                else:
+                    x_np, y_np, natural_rows = next_training_batch()
+                x, y = _arrays_to_mx(x_np, y_np, profiler)
+                step_fn = microbatch_step
+                step_args = (x, y)
+                if use_unlikelihood:
+                    candidates, weights = unlikelihood_inputs(
+                        x_np, y_np, natural_rows, unlikelihood_eligible, config.cooldown_ul_window,
+                        natural_rows=step_natural_rows,
+                    )
+                    step_fn = unlikelihood_step
+                    step_args = (x, y, mx.array(candidates), mx.array(weights))
 
-                    # Loss-fn has accum_scale baked in, so grads and loss are pre-scaled.
-                    if profiler.enabled:
-                        step_start = now()
-                        loss, grads = step_fn(*step_args)
-                        if eval_microbatch_loss:
-                            mx.eval(loss, grads)
-                        else:
-                            mx.eval(grads)
-                        profiler.add("forward_backward", now() - step_start)
+                # Loss-fn has accum_scale baked in, so grads and loss are pre-scaled.
+                if profiler.enabled:
+                    step_start = now()
+                    loss, grads = step_fn(*step_args)
+                    if eval_microbatch_loss:
+                        mx.eval(loss, grads)
                     else:
-                        loss, grads = step_fn(*step_args)
-                    accum_grads = _accum_grads(accum_grads, grads)
-                    accum_loss = accum_loss + loss.astype(mx.float32)
-                    # Materialize after each microbatch so MLX frees the per-microbatch
-                    # activation/intermediate graph. async_eval lets Python queue the
-                    # next batch while Metal drains the current graph.
-                    should_eval_microbatch = not (
-                        defer_final_microbatch_eval
+                        mx.eval(grads)
+                    profiler.add("forward_backward", now() - step_start)
+                else:
+                    loss, grads = step_fn(*step_args)
+                accum_grads = _accum_grads(accum_grads, grads)
+                accum_loss = accum_loss + loss.astype(mx.float32)
+                # Materialize after each microbatch so MLX frees the per-microbatch
+                # activation/intermediate graph. async_eval lets Python queue the
+                # next batch while Metal drains the current graph.
+                should_eval_microbatch = not (
+                    defer_final_microbatch_eval
+                    and micro_idx == config.pretrain_grad_accum_steps - 1
+                )
+                if should_eval_microbatch:
+                    include_loss = eval_microbatch_loss or (
+                        eval_loss_final_microbatch
                         and micro_idx == config.pretrain_grad_accum_steps - 1
                     )
-                    if should_eval_microbatch:
-                        include_loss = eval_microbatch_loss or (
-                            eval_loss_final_microbatch
-                            and micro_idx == config.pretrain_grad_accum_steps - 1
-                        )
-                        eval_target = (
-                            (accum_grads, accum_loss)
-                            if include_loss
-                            else accum_grads
-                        )
-                        mx.async_eval(eval_target)
-                    step_tokens += x.size
-                    consumed_microbatches += 1
+                    eval_target = (
+                        (accum_grads, accum_loss)
+                        if include_loss
+                        else accum_grads
+                    )
+                    mx.async_eval(eval_target)
+                step_tokens += x.size
+                consumed_microbatches += 1
 
             if profiler.enabled:
                 opt_start = now()

@@ -113,19 +113,6 @@ class SpakieConfig:
     pretrain_optimizer: str = _D["pretrain_optimizer"]
     pretrain_lr_schedule: str = _D.get("pretrain_lr_schedule", "cosine")
     pretrain_trapezoid_decay_frac: float = _D.get("pretrain_trapezoid_decay_frac", 0.2)
-    pretrain_vmap_accum_step: bool = _D.get("pretrain_vmap_accum_step", False)
-    pretrain_vmap_sync_warmup_steps: int = _D.get("pretrain_vmap_sync_warmup_steps", 0)
-    # Number of microbatches vmapped together per group. vmap keeps every lane's
-    # forward activations resident for the backward, so peak memory scales with
-    # the group size; a full-G vmap of the 300m preset (B64/G3 ~= 107 GB) exceeds
-    # a 128 GB machine and panics the macOS kernel. 0 = auto: at runtime the
-    # loop probes per-lane memory and picks the largest group that fits a safe
-    # fraction of physical RAM. A positive value forces that group size.
-    pretrain_vmap_group_size: int = _D.get("pretrain_vmap_group_size", 0)
-    # Fraction of physical RAM the auto group-size probe is allowed to budget for
-    # the vmap forward/backward peak. Conservative because macOS panics (not
-    # OOM-errors) when wired GPU memory exhausts unified memory.
-    pretrain_vmap_mem_budget_frac: float = _D.get("pretrain_vmap_mem_budget_frac", 0.70)
     # Cooldown data mix ("anneal v7", training/cooldown_mix.py). Empty manifest = off.
     # During the final cooldown_mix_steps updates (or from cooldown_mix_start_step),
     # rows are replaced per the manifest layout, and token-level unlikelihood with
@@ -443,24 +430,7 @@ def get_preset_config(preset_name: str = DEFAULT_PRESET) -> SpakieConfig:
     return config
 
 
-CHECKPOINT_CONFIG_SCHEMA_VERSION = 3
-
-# Fields added after schema 3 whose defaults reproduce the previous behavior exactly.
-# Checkpoints written before they existed load with these values; any other
-# missing field is still rejected.
-BEHAVIOR_NEUTRAL_ADDED_FIELDS: dict[str, object] = {
-    "cooldown_mix_manifest": "",
-    "cooldown_mix_steps": 0,
-    "cooldown_mix_start_step": -1,
-    "cooldown_mix_seed": 0,
-    "cooldown_ul_alpha": 0.0,
-    "cooldown_ul_window": 32,
-    "cooldown_ul_min_token_id": 1000,
-    "cooldown_mix_fingerprint": "",
-    "muon_ns_polish_steps": 0,
-    "muon_split_gate_up": False,
-    "attention_query_block": 0,
-}
+CHECKPOINT_CONFIG_SCHEMA_VERSION = 4
 
 
 def config_to_dict(config: SpakieConfig) -> dict:
@@ -482,8 +452,6 @@ def config_from_dict(payload: dict) -> SpakieConfig:
     if unknown:
         raise ValueError(f"checkpoint config contains unknown fields: {', '.join(unknown)}")
     values = dict(payload)
-    for name, default in BEHAVIOR_NEUTRAL_ADDED_FIELDS.items():
-        values.setdefault(name, default)
     missing = sorted(known_fields - set(values))
     if missing:
         raise ValueError(f"checkpoint config is missing fields: {', '.join(missing)}")

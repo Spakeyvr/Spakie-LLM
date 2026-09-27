@@ -71,9 +71,6 @@ def build_runs(args: argparse.Namespace) -> list[tuple[int, str, list[str]]]:
             ]
             if args.backend == "torch":
                 command.extend(("--device", args.device))
-            else:
-                # Same arithmetic as vmap accumulation with group size 1, but faster.
-                command.append("--no-mlx-vmap-accum-step")
             runs.append((seed, arm, command))
     return runs
 

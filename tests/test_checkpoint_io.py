@@ -28,7 +28,6 @@ from runtime.checkpoint_io import (
     validate_checkpoint_tokenizer,
 )
 from scripts.train import check_resume_optimizer, resume_sampler_mismatches
-from training.muon_core import MUON_OPTIMIZER_SCHEMA_VERSION
 from scripts.run_pipeline import default_pretrain_checkpoint
 from training.pretrain import (
     ResumableBatchSampler,
@@ -335,44 +334,6 @@ class CheckpointIOTests(unittest.TestCase):
             state, "muon", backend="mlx", reset_optimizer=True
         )
         self.assertNotIn("optimizer", state)
-
-    def test_config_predating_muon_polish_and_gate_up_loads_historical_values(self):
-        payload = config_to_dict(self._tiny_config())
-        del payload["muon_ns_polish_steps"]
-        del payload["muon_split_gate_up"]
-
-        restored = config_from_dict(payload)
-
-        self.assertEqual(restored.muon_ns_polish_steps, 0)
-        self.assertFalse(restored.muon_split_gate_up)
-
-    def test_muon_checkpoint_predating_polish_and_gate_up_settings_resumes(self):
-        config = self._tiny_config()
-        config.pretrain_optimizer = "muon"
-        # Resume rebuilds the config from the checkpoint, where missing fields
-        # take their historical values.
-        config.muon_ns_polish_steps = 0
-        saved = {
-            "optimizer_schema_version": MUON_OPTIMIZER_SCHEMA_VERSION,
-            "momentum": config.muon_momentum,
-            "nesterov": config.muon_nesterov,
-            "ns_steps": config.muon_ns_steps,
-            "ns_coefficients": list(config.muon_ns_coefficients),
-            "eps": config.muon_eps,
-            "adjust_lr_fn": config.muon_adjust_lr_fn,
-            "qkv_split": config.muon_qkv_split,
-        }
-        state = {
-            "meta": {"optimizer_kind": "muon", "muon_hyperparameters": saved},
-            "optimizer": {"state": object()},
-            "_requested_config": config,
-        }
-        check_resume_optimizer(state, "muon", backend="mlx", reset_optimizer=False)
-        self.assertIn("optimizer", state)
-
-        config.muon_ns_polish_steps = 2
-        with self.assertRaises(SystemExit):
-            check_resume_optimizer(state, "muon", backend="mlx", reset_optimizer=False)
 
     def test_checkpoint_tokenizer_contract_must_match(self):
         saved = {"sha256": "expected", "vocab_size": 16}

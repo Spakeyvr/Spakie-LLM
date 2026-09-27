@@ -102,7 +102,7 @@ class PretrainRecoveryTests(unittest.TestCase):
                 with patch('training.pretrain_mlx.configure_mlx_optimizer', side_effect=build_optimizer), \
                      patch('training.pretrain_mlx.save_training_checkpoint_mlx', side_effect=checked_save):
                     pretrain_mlx(model, dataset, dataset, sampler, cfg, runtime, resume_state=resume,
-                                 use_compile=True, use_prefetch=True, use_vmap_accum_step=True)
+                                 use_compile=True, use_prefetch=True)
                 suffix = 'interrupt' if interrupt else 'final'
                 return load_training_checkpoint_mlx(str(root/name/f'pretrain_{suffix}.safetensors'))
 

@@ -198,8 +198,6 @@ def _benchmark_steps(
     eval_loss_final_microbatch: bool,
     shapeless_compile: bool,
     compile_accum_step: bool,
-    compile_vmap_accum_step: bool,
-    compile_vmap_grad_accum_step: bool,
     compile_optimizer_step: bool,
     trim_sft_padding: bool,
     trim_sft_after_last_supervised: bool,
@@ -224,29 +222,10 @@ def _benchmark_steps(
     profiler = MLXProfile(enabled=True)
     warmup_profiler = MLXProfile(enabled=False)
     full_step_update_repeats = max(1, int(full_step_update_repeats))
-    if compile_vmap_accum_step and compile_vmap_grad_accum_step:
-        raise ValueError("Choose only one vmap accumulation mode")
-    if sum(
-        int(flag)
-        for flag in (
-            compile_vmap_accum_step,
-            compile_vmap_grad_accum_step,
-        )
-    ) > 1:
-        raise ValueError("Choose only one grouped accumulation mode")
-    if (
-        compile_vmap_accum_step
-        or compile_vmap_grad_accum_step
-    ) and (
-        pack_sft or compile_accum_step or compile_full_step
-    ):
-        raise ValueError("grouped accumulation is only supported without pack/full/pair accumulation")
     variable_batch_tokens = length_bucketed_sft and sft_sampler == "token-budget"
     if variable_batch_tokens and (
         compile_accum_step
         or compile_full_step
-        or compile_vmap_accum_step
-        or compile_vmap_grad_accum_step
     ):
         raise ValueError("token-budget SFT sampler currently supports the normal microbatch loop only")
     if length_bucketed_sft and sft_sampler == "token-budget":
@@ -375,8 +354,6 @@ def _benchmark_steps(
         return value_and_grad(model, x_arg, y_arg, seg_arg, pos_arg, idx_arg)
 
     accum_pair_step = None
-    vmap_accum_step = None
-    vmap_grad_accum_step = None
     if compile_accum_step:
         if grad_accum < 2:
             raise ValueError("--compile-accum-step requires --grad-accum >= 2")
@@ -404,56 +381,6 @@ def _benchmark_steps(
             return loss_sum, grads_sum
 
         accum_pair_step = _pair_step
-
-    if compile_vmap_accum_step:
-        if grad_accum < 2:
-            raise ValueError("--compile-vmap-accum-step requires --grad-accum >= 2")
-
-        def _vmap_accum_loss(model_mod, xs, ys):
-            def _one_loss(x, y):
-                _, loss, _ = model_mod(x, y, return_cache=False, ignore_index=ignore_index)
-                return loss
-
-            return mx.vmap(_one_loss)(xs, ys).mean()
-
-        value_and_grad = nn.value_and_grad(model, _vmap_accum_loss)
-        state = [model.state]
-        if getattr(model.config, "dropout", 0.0) > 0.0:
-            state.append(mx.random.state)
-
-        @partial(mx.compile, inputs=state, outputs=state)
-        def _vmap_step(xs, ys):
-            return value_and_grad(model, xs, ys)
-
-        vmap_accum_step = _vmap_step
-
-    if compile_vmap_grad_accum_step:
-        if grad_accum < 2:
-            raise ValueError("--compile-vmap-grad-accum-step requires --grad-accum >= 2")
-
-        def _one_loss(model_mod, x, y):
-            _, loss, _ = model_mod(x, y, return_cache=False, ignore_index=ignore_index)
-            return loss
-
-        one_value_and_grad = nn.value_and_grad(model, _one_loss)
-
-        def _vmap_grad_accum(model_mod, xs, ys):
-            def _one(x, y):
-                return one_value_and_grad(model_mod, x, y)
-
-            losses, batched_grads = mx.vmap(_one)(xs, ys)
-            grads = tree_map(lambda g: g.mean(axis=0), batched_grads)
-            return losses.mean(), grads
-
-        state = [model.state]
-        if getattr(model.config, "dropout", 0.0) > 0.0:
-            state.append(mx.random.state)
-
-        @partial(mx.compile, inputs=state, outputs=state)
-        def _vmap_grad_step(xs, ys):
-            return _vmap_grad_accum(model, xs, ys)
-
-        vmap_grad_accum_step = _vmap_grad_step
 
     compiled_optimizer_step = None
     if compile_optimizer_step:
@@ -652,23 +579,6 @@ def _benchmark_steps(
         else:
             token_accounting["real"] += int(((x != 0) | (y != ignore_index)).sum())
 
-    def stack_for_vmap(xs: list[mx.array], ys: list[mx.array]) -> tuple[mx.array, mx.array]:
-        max_len = max(x.shape[1] for x in xs)
-        if all(x.shape[1] == max_len for x in xs):
-            return mx.stack(xs), mx.stack(ys)
-        padded_xs = []
-        padded_ys = []
-        target_pad = ignore_index if ignore_index is not None else 0
-        for x, y in zip(xs, ys):
-            pad_len = max_len - x.shape[1]
-            if pad_len <= 0:
-                padded_xs.append(x)
-                padded_ys.append(y)
-                continue
-            padded_xs.append(mx.pad(x, [(0, 0), (0, pad_len)], constant_values=0))
-            padded_ys.append(mx.pad(y, [(0, 0), (0, pad_len)], constant_values=target_pad))
-        return mx.stack(padded_xs), mx.stack(padded_ys)
-
     def prewarm_compiled_sft_shapes() -> None:
         if ignore_index is None or not prewarm_sft_shapes:
             return
@@ -808,40 +718,6 @@ def _benchmark_steps(
             if active_profiler.enabled:
                 step_start = now()
             accum_loss, accum_grads = accum_pair_step(*arrays)
-            if async_microbatch_eval:
-                mx.async_eval(accum_grads, accum_loss)
-            else:
-                mx.eval(accum_grads, accum_loss)
-            if active_profiler.enabled:
-                active_profiler.add("forward_backward", now() - step_start)
-        elif (
-            vmap_accum_step is not None
-            or vmap_grad_accum_step is not None
-        ):
-            xs = []
-            ys = []
-            for _ in range(grad_accum):
-                if active_profiler.enabled:
-                    batch_start = now()
-                    batch_np = next_batch()
-                    active_profiler.add("batch_fetch", now() - batch_start)
-                else:
-                    batch_np = next_batch()
-                prepared_np = prepare_batch(batch_np, active_profiler)
-                account_tokens(batch_np, prepared_np)
-                batch_mx = _arrays_to_mx_batch(prepared_np, active_profiler)
-                if len(batch_mx) != 2:
-                    raise ValueError("grouped accumulation currently supports two-array batches only")
-                xs.append(batch_mx[0])
-                ys.append(batch_mx[1])
-            if active_profiler.enabled:
-                step_start = now()
-            active_vmap_step = (
-                vmap_accum_step
-                or vmap_grad_accum_step
-            )
-            stacked_x, stacked_y = stack_for_vmap(xs, ys)
-            accum_loss, accum_grads = active_vmap_step(stacked_x, stacked_y)
             if async_microbatch_eval:
                 mx.async_eval(accum_grads, accum_loss)
             else:
@@ -1183,17 +1059,6 @@ def main() -> None:
         help="Compile the full two-microbatch gradient accumulation step",
     )
     parser.add_argument(
-        "--compile-vmap-accum-step",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Compile a vmap-based gradient accumulation step (default: pretrain preset config)",
-    )
-    parser.add_argument(
-        "--compile-vmap-grad-accum-step",
-        action="store_true",
-        help="Compile vmap over per-microbatch value_and_grad, then average the gradient tree",
-    )
-    parser.add_argument(
         "--compile-optimizer-step",
         action="store_true",
         help="Compile gradient clipping and optimizer update",
@@ -1384,11 +1249,6 @@ def main() -> None:
     if args.d_ff is not None:
         config.d_ff = args.d_ff
     config.refresh_derived_fields()
-    if args.compile_vmap_accum_step is None:
-        args.compile_vmap_accum_step = (
-            args.task == "pretrain"
-            and bool(getattr(config, "pretrain_vmap_accum_step", False))
-        )
     hparams = _resolve_task_hparams(config, args.task, args)
     if args.grad_clip is not None:
         hparams["grad_clip"] = args.grad_clip
@@ -1483,8 +1343,6 @@ def main() -> None:
     print(f"Async microbatch eval: {args.async_microbatch_eval}")
     print(f"Shapeless compile: {args.shapeless_compile}")
     print(f"Compile accum step: {args.compile_accum_step}")
-    print(f"Compile vmap accum step: {args.compile_vmap_accum_step}")
-    print(f"Compile vmap grad accum step: {args.compile_vmap_grad_accum_step}")
     print(f"Compile optimizer step: {args.compile_optimizer_step}")
     print(f"Compile full step: {args.compile_full_step}")
     print(f"Full-step update repeats: {args.full_step_update_repeats}")
@@ -1547,8 +1405,6 @@ def main() -> None:
             eval_loss_final_microbatch=args.eval_loss_final_microbatch,
             shapeless_compile=args.shapeless_compile,
             compile_accum_step=args.compile_accum_step,
-            compile_vmap_accum_step=args.compile_vmap_accum_step,
-            compile_vmap_grad_accum_step=args.compile_vmap_grad_accum_step,
             compile_optimizer_step=args.compile_optimizer_step,
             trim_sft_padding=args.task == "sft" and args.trim_sft_padding,
             trim_sft_after_last_supervised=(

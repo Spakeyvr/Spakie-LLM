@@ -55,7 +55,6 @@ class MuonPilotCommandTests(unittest.TestCase):
             self.assertEqual(_flag(command, "--seed"), "42")
             self.assertEqual(_flag(command, "--max-steps"), str(steps))
             self.assertEqual(_flag(command, "--optimizer"), "muon")
-            self.assertIn("--no-mlx-vmap-accum-step", command)
         self.assertEqual(len({_flag(command, "--output-dir") for _, _, command in runs}), 4)
 
     def test_arguments_must_keep_a_baseline_and_valid_polish(self):

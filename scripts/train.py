@@ -100,11 +100,9 @@ def check_resume_optimizer(resume_state, requested: str, *, backend: str, reset_
             "split_gate_up": requested_config.muon_split_gate_up,
             "optimizer_schema_version": MUON_OPTIMIZER_SCHEMA_VERSION,
         } if requested_config is not None else saved_hparams
-        # Checkpoints written before these settings existed used the neutral values.
-        neutral = {"ns_polish_steps": 0, "split_gate_up": False}
         mismatches = [
             key for key, value in expected.items()
-            if saved_hparams.get(key, neutral.get(key)) != value
+            if saved_hparams.get(key) != value
         ]
         if not mismatches:
             return
@@ -214,13 +212,6 @@ def apply_pretrain_cli_overrides(config, args) -> None:
         config.refresh_derived_fields()
     if args.pretrain_warmup_steps > 0:
         config.pretrain_warmup_steps = args.pretrain_warmup_steps
-    if args.mlx_vmap_accum_step is None:
-        args.mlx_vmap_accum_step = bool(getattr(config, "pretrain_vmap_accum_step", False))
-    if args.mlx_vmap_accum_step and config.pretrain_grad_accum_steps < 2:
-        print("vmap accumulation requires pretrain_grad_accum_steps >= 2; using the standard accumulation path.")
-        args.mlx_vmap_accum_step = False
-    if args.mlx_vmap_sync_warmup_steps >= 0:
-        config.pretrain_vmap_sync_warmup_steps = args.mlx_vmap_sync_warmup_steps
     if args.output_dir:
         config.checkpoint_dir = args.output_dir
     if args.eval_interval > 0:
@@ -529,7 +520,7 @@ def run_mlx_pretrain(args, config):
     print_optimizer_banner(config.pretrain_optimizer, stage="Pretraining")
     print(
         f"Compile: {args.mlx_compile} | Prefetch: {args.mlx_prefetch} | "
-        f"Profile: {args.mlx_profile} | VMap accum: {args.mlx_vmap_accum_step}"
+        f"Profile: {args.mlx_profile} | Attention query block: {config.attention_query_block}"
     )
     print(
         "Microbatch eval: "
@@ -607,7 +598,6 @@ def run_mlx_pretrain(args, config):
         eval_microbatch_loss=args.mlx_eval_microbatch_loss,
         eval_loss_final_microbatch=args.mlx_eval_loss_final_microbatch,
         defer_final_microbatch_eval=args.mlx_defer_final_microbatch_eval,
-        use_vmap_accum_step=args.mlx_vmap_accum_step,
         allow_adamw_fallback=config.allow_adamw_fallback,
     )
 
@@ -855,20 +845,6 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Skip microbatch async_eval on the final microbatch before optimizer sync",
-    )
-    parser.add_argument(
-        "--mlx-vmap-accum-step",
-        dest="mlx_vmap_accum_step",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Vectorize pretrain gradient accumulation into one MLX value_and_grad call (default: preset config)",
-    )
-    parser.add_argument(
-        "--mlx-vmap-sync-warmup-steps",
-        dest="mlx_vmap_sync_warmup_steps",
-        type=int,
-        default=-1,
-        help="Synchronously drain the first N MLX vmap accumulation steps before switching to async (-1 = preset config)",
     )
     parser.add_argument(
         "--mlx-wired-gb",

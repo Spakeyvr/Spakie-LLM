@@ -165,26 +165,22 @@ class ScalingConfigTests(unittest.TestCase):
                     spec["parameters"],
                 )
 
-    def test_300m_keeps_the_token_batch_with_sequential_accumulation(self):
+    def test_300m_token_batch(self):
         config = get_preset_config("300m")
         self.assertEqual(config.pretrain_tokens_per_step(), 98_304)
         self.assertEqual(config.pretrain_batch_size, 16)
         self.assertEqual(config.pretrain_grad_accum_steps, 3)
-        self.assertFalse(config.pretrain_vmap_accum_step)
 
-    def test_360m_keeps_the_token_batch_with_sequential_accumulation(self):
+    def test_360m_token_batch(self):
         config = get_preset_config('360m')
         self.assertEqual(config.pretrain_tokens_per_step(), 98_304)
         self.assertEqual(config.pretrain_batch_size, 8)
         self.assertEqual(config.pretrain_grad_accum_steps, 6)
-        self.assertFalse(config.pretrain_vmap_accum_step)
 
     def test_blocked_attention_presets(self):
         for preset in ("92m", "180m", "300m", "360m"):
             with self.subTest(preset=preset):
-                config = get_preset_config(preset)
-                self.assertEqual(config.attention_query_block, 512)
-                self.assertFalse(config.pretrain_vmap_accum_step)
+                self.assertEqual(get_preset_config(preset).attention_query_block, 512)
 
     def test_rope_rotation_preserves_norm_and_position_zero(self):
         values = torch.arange(2 * 3 * 2 * 8, dtype=torch.float32).reshape(2, 3, 2, 8)

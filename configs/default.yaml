@@ -64,8 +64,6 @@ defaults:
   pretrain_checkpoint_interval: 0
   pretrain_patience: 5
   pretrain_optimizer: muon
-  pretrain_vmap_accum_step: false
-  pretrain_vmap_sync_warmup_steps: 0
   # Learning-rate schedule. "trapezoid" (default) is warmup -> constant-at-peak
   # -> linear-decay (tail controlled by pretrain_trapezoid_decay_frac); on a
   # controlled synthetic next-token task at 92m (60 steps, 3 seeds) it drove
@@ -241,11 +239,8 @@ presets:
     position_encoding: rope
     rope_theta: 100000.0
     activation_checkpointing: false
-    # Blocked causal attention with plain sequential accumulation. The previous
-    # default (vmap, probe-chosen group of 1, dense attention) peaked at 105 GB
-    # and ran at ~1,200 tok/s under memory pressure on the 128 GB M5 Max; this
-    # path peaks at 75.8 GB and ran at 7,000-9,000 tok/s (2026-09-27 benchmark).
-    # vmap with blocked attention was no faster and peaked at 86 GB.
+    # Blocked causal attention: peaks at 75.8 GB at B16 x 2048 on the 128 GB M5
+    # Max and ran at 7,000-9,000 tok/s (2026-09-27 benchmark).
     attention_query_block: 512
     pretrain_batch_size: 16
     pretrain_grad_accum_steps: 3
@@ -268,9 +263,7 @@ presets:
     # Blocked causal attention: +17-20% MLX training throughput and ~11 GB less
     # peak memory at B8 x 2048 on the M5 Max (2026-09-27 benchmark).
     attention_query_block: 512
-    # Same 98,304 tokens/update as 300m, with smaller resident batches. Plain
-    # sequential accumulation: vmap with one lane per group was 10-14% slower
-    # and used 5 GB more for identical arithmetic.
+    # Same 98,304 tokens/update as 300m, with smaller resident batches.
     pretrain_batch_size: 8
     pretrain_grad_accum_steps: 6
     sft_batch_size: 4

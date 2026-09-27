@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from configs.default import BEHAVIOR_NEUTRAL_ADDED_FIELDS, SpakieConfig, config_from_dict
+from configs.default import SpakieConfig, config_from_dict
 from training.cooldown_mix import (
     CooldownMix,
     cooldown_start_step,
@@ -104,19 +104,20 @@ class CooldownMixTests(unittest.TestCase):
         np.testing.assert_array_equal(weights[0, 3] > 0, [False, False, True])  # 7 ineligible, 5 target, 6 counts
         self.assertTrue((cands >= 0).all())
 
-    def test_start_step_and_config_backfill(self):
+    def test_start_step_and_config_round_trip(self):
         cfg = SpakieConfig()
         self.assertIsNone(cooldown_start_step(cfg))
         cfg.cooldown_mix_manifest, cfg.cooldown_mix_steps, cfg.pretrain_max_steps = 'm.json', 100, 1000
         self.assertEqual(cooldown_start_step(cfg), 900)
         cfg.cooldown_mix_start_step = 10
         self.assertEqual(cooldown_start_step(cfg), 10)
-        old = asdict(SpakieConfig())
-        for name in BEHAVIOR_NEUTRAL_ADDED_FIELDS:
-            del old[name]
-        restored = config_from_dict(old)
-        self.assertEqual(restored.cooldown_mix_manifest, '')
-        self.assertEqual(restored.cooldown_ul_alpha, 0.0)
+        restored = config_from_dict(asdict(cfg))
+        self.assertEqual(restored.cooldown_mix_manifest, 'm.json')
+        self.assertEqual(restored.cooldown_mix_start_step, 10)
+        incomplete = asdict(SpakieConfig())
+        del incomplete['cooldown_mix_manifest']
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            config_from_dict(incomplete)
         with self.assertRaisesRegex(ValueError, 'unknown'):
             config_from_dict({**asdict(SpakieConfig()), 'bogus': 1})
 

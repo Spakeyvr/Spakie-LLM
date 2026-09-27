@@ -159,9 +159,6 @@ Common MLX runtime flags:
 --mlx-profile
 ```
 
-MLX pretraining also supports `--mlx-vmap-accum-step /
---no-mlx-vmap-accum-step`.
-
 ## Data Sources
 
 You can add local `.md`, `.txt`, and `.jsonl` files under `data/raw/`, or use the built-in download and scrape scripts:
@@ -409,10 +406,6 @@ lowered final validation loss by 0.009, led at all 20 evaluations from step
 100, and reached the baseline's final loss with about 1.5% fewer tokens, at the
 same throughput. The gate/up split alone did not differ from the baseline, so
 it stays off.
-
-Checkpoints written before these settings existed resume with both off, because
-resume uses the checkpoint's saved configuration. To move such a run to the
-polish schedule, pass `--muon-ns-polish-steps 2 --reset-optimizer`.
 
 The Muon pilot compares these settings against the current recipe. It runs a
 paired 2×2 factorial (`baseline`, `paper`, `polish`, `split`): every arm of a
@@ -741,31 +734,18 @@ Shared model defaults:
 - scaled dot-product attention, with grouped-query attention where configured
 - activation checkpointing disabled by default for all current presets
 
-MLX training on every preset computes causal attention
-in query blocks of 512 tokens (`attention_query_block`). Each block attends to
+MLX training on every preset computes causal attention in query blocks of 512
+tokens (`attention_query_block`, overridable with `--attention-query-block`;
+0 disables it). Each block attends to
 keys up to its own end. MLX 0.31 fuses the attention forward pass but not its
 backward, which otherwise builds the full 2,048 × 2,048 score matrix; blocking
 skips the masked upper half. The result matches dense attention up to bf16
 rounding. On the M5 Max it raised training throughput by 15–23% and cut peak
 memory by 7–11 GB on `92m`, `180m`, and `360m`. Evaluation, generation, and
 packed SFT batches with segment masks always use dense attention.
-
-All presets accumulate gradients sequentially. Vectorized (vmap) accumulation
-remains available through `--mlx-vmap-accum-step` but is slower on this
-hardware. At `360m`, one microbatch per vmap group was 10–14% slower and used
-5 GB more for identical arithmetic. At `300m`, the previous vmap default with
-dense attention peaked at 105 GB on a 128 GB machine and ran at about 1,200
-tok/s under memory pressure. Sequential accumulation with blocked attention
-peaks at 76 GB and ran at 7,000–9,000 tok/s.
-
-Resumed runs and SFT keep the settings saved in their checkpoint, so runs
-started before these defaults changed keep dense attention (and, for `300m`
-and `360m`, vmap accumulation). Both are pure speed settings with identical
-arithmetic, so switching them mid-run is safe:
-
-```bash
-python3 scripts/train.py --preset 360m --resume --attention-query-block 512 --no-mlx-vmap-accum-step
-```
+At `300m`, blocked attention also keeps the B16 × 2,048 microbatch at a 76 GB
+peak (7,000–9,000 tok/s); dense attention pushes it to memory pressure on a
+128 GB machine.
 
 ## Balanced Pretraining Corpus
 
