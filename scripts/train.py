@@ -204,6 +204,8 @@ def apply_pretrain_cli_overrides(config, args) -> None:
         config.loss_layout = args.loss_layout
     if args.qk_norm is not None:
         config.qk_norm = args.qk_norm
+    if args.attention_query_block >= 0:
+        config.attention_query_block = args.attention_query_block
     if args.pretrain_batch_size > 0:
         config.pretrain_batch_size = args.pretrain_batch_size
     if args.pretrain_grad_accum > 0:
@@ -745,6 +747,12 @@ def main():
         type=float,
         default=-1.0,
         help="Fraction of training at the end used for linear decay (trapezoid schedule)",
+    )
+    parser.add_argument(
+        "--attention-query-block",
+        type=int,
+        default=-1,
+        help="MLX training attention query block size; 0 disables, -1 keeps the preset or checkpoint value",
     )
     parser.add_argument(
         "--loss-layout",

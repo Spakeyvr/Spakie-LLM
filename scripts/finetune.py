@@ -55,6 +55,8 @@ def apply_optimizer_args(config, args) -> None:
 def apply_sft_cli_overrides(config, args) -> None:
     """Apply only values the user explicitly selected on this invocation."""
     apply_optimizer_args(config, args)
+    if args.attention_query_block >= 0:
+        config.attention_query_block = args.attention_query_block
     if args.epochs > 0:
         config.sft_epochs = args.epochs
     if args.sft_batch_size > 0:
@@ -635,6 +637,12 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Apply Muon Newton-Schulz to the fused SwiGLU gate and up projections independently (default: preset config)",
+    )
+    parser.add_argument(
+        "--attention-query-block",
+        type=int,
+        default=-1,
+        help="MLX training attention query block size; 0 disables, -1 keeps the preset or checkpoint value",
     )
     parser.add_argument(
         "--grouped-muon",

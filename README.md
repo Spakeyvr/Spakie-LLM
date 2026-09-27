@@ -754,6 +754,15 @@ masks always use dense attention. The `360m` preset also accumulates gradients
 sequentially: vectorizing one microbatch per group was 10–14% slower and used
 5 GB more for identical arithmetic.
 
+Resumed runs and SFT keep the settings saved in their checkpoint, so runs
+started before these defaults changed keep dense attention (and, for `360m`,
+vmap accumulation). Both are pure speed settings with identical arithmetic, so
+switching them mid-run is safe:
+
+```bash
+python3 scripts/train.py --preset 360m --resume --attention-query-block 512 --no-mlx-vmap-accum-step
+```
+
 ## Balanced Pretraining Corpus
 
 The default corpus target is 10B training tokens (about 10.53B processed with
