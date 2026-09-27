@@ -14,8 +14,9 @@ from training.muon_core import (
     MuonSettings,
     adjusted_muon_lr,
     is_muon_parameter_name,
-    muon_projection_split_count,
+    muon_ns_step_coefficients,
     muon_settings_from_config,
+    muon_update_split_count,
     normalize_optimizer_kind,
 )
 
@@ -26,16 +27,17 @@ def muon_newton_schulz_torch(
     ns_steps: int = 5,
     ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
     eps: float = 1e-7,
+    ns_polish_steps: int = 0,
 ) -> torch.Tensor:
     if update.ndim != 2:
         raise ValueError("Muon Newton-Schulz expects a 2D tensor")
-    a, b, c = ns_coefficients
+    schedule = muon_ns_step_coefficients(ns_steps, ns_coefficients, ns_polish_steps)
     x = update.float()
     transposed = x.shape[0] > x.shape[1]
     if transposed:
         x = x.T
     x = x / (x.norm() + eps)
-    for _ in range(ns_steps):
+    for a, b, c in schedule:
         xx_t = x @ x.T
         x = a * x + (b * xx_t + c * (xx_t @ xx_t)) @ x
     if transposed:
@@ -129,6 +131,7 @@ class MuonAdamW:
                         ns_steps=self.settings.ns_steps,
                         ns_coefficients=self.settings.ns_coefficients,
                         eps=self.settings.eps,
+                        ns_polish_steps=self.settings.ns_polish_steps,
                     )
                     chunk_lr = adjusted_muon_lr(self.lr, tuple(chunk.shape), self.settings.adjust_lr_fn)
                     chunks.append((start, orthogonal, chunk_lr))
@@ -147,7 +150,7 @@ class MuonAdamW:
             self.state.setdefault(param, {})["momentum_buffer"] = next_momentum
 
     def _update_chunks(self, name: str, update: torch.Tensor):
-        split_count = muon_projection_split_count(name) if self.settings.qkv_split else 1
+        split_count = muon_update_split_count(name, self.settings)
         if split_count > 1 and update.shape[0] % split_count == 0:
             chunk_size = update.shape[0] // split_count
             for start in range(0, update.shape[0], chunk_size):

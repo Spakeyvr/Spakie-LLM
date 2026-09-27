@@ -55,6 +55,8 @@ def apply_optimizer_args(config, args) -> None:
         "muon_momentum": args.muon_momentum,
         "muon_nesterov": args.muon_nesterov,
         "muon_qkv_split": args.muon_qkv_split,
+        "muon_ns_polish_steps": args.muon_ns_polish_steps,
+        "muon_split_gate_up": args.muon_split_gate_up,
         "grouped_muon": args.grouped_muon,
         "contiguous_linear_inputs": args.contiguous_linear_inputs,
     }
@@ -94,11 +96,15 @@ def check_resume_optimizer(resume_state, requested: str, *, backend: str, reset_
             "eps": requested_config.muon_eps,
             "adjust_lr_fn": requested_config.muon_adjust_lr_fn,
             "qkv_split": requested_config.muon_qkv_split,
+            "ns_polish_steps": requested_config.muon_ns_polish_steps,
+            "split_gate_up": requested_config.muon_split_gate_up,
             "optimizer_schema_version": MUON_OPTIMIZER_SCHEMA_VERSION,
         } if requested_config is not None else saved_hparams
+        # Checkpoints written before these settings existed used the neutral values.
+        neutral = {"ns_polish_steps": 0, "split_gate_up": False}
         mismatches = [
             key for key, value in expected.items()
-            if saved_hparams.get(key) != value
+            if saved_hparams.get(key, neutral.get(key)) != value
         ]
         if not mismatches:
             return
@@ -253,7 +259,11 @@ def verify_muon_for_full_mlx_pretrain(args, config) -> None:
 
     print("Running required Muon MLX/PyTorch parity check before full MLX pretraining...")
     try:
-        run_muon_parity_check(include_bf16=True, ns_steps=config.muon_ns_steps)
+        run_muon_parity_check(
+            include_bf16=True,
+            ns_steps=config.muon_ns_steps,
+            ns_polish_steps=config.muon_ns_polish_steps,
+        )
     except RuntimeError as exc:
         if "MLX/Metal validation required" in str(exc):
             print("MLX/Metal validation required", file=sys.stderr)
@@ -764,6 +774,19 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently (default: preset config)",
+    )
+    parser.add_argument(
+        "--muon-ns-polish-steps",
+        type=int,
+        default=None,
+        help="Final Newton-Schulz iterations using the DeepSeek-V4 polish coefficients (default: preset config)",
+    )
+    parser.add_argument(
+        "--muon-split-gate-up",
+        dest="muon_split_gate_up",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply Muon Newton-Schulz to the fused SwiGLU gate and up projections independently (default: preset config)",
     )
     parser.add_argument(
         "--grouped-muon",

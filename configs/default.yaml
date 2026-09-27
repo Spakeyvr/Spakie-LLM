@@ -87,13 +87,24 @@ defaults:
   allow_adamw_fallback: false
   muon_momentum: 0.95
   muon_nesterov: true
-  # DeepSeek-V4 trains with 10 NS iterations; their two-stage coefficient
-  # schedule is not supported here, so the tuned single triple is reused.
+  # DeepSeek-V4 trains with 10 NS iterations in two stages: 8 with the quintic
+  # below, then 2 "polish" iterations with (2, -1.5, 0.5) that pin singular
+  # values at 1. muon_ns_polish_steps is how many of the muon_ns_steps use the
+  # polish coefficients; 0 keeps the quintic for every iteration (the
+  # historical recipe). The 360m Muon pilot (seed 42, ~103M tokens) qualified
+  # the paper schedule: final val loss -0.009 vs quintic-only, ahead at 20/20
+  # evals, ~1.5% fewer tokens to the same loss, identical throughput.
   muon_ns_steps: 10
   muon_ns_coefficients: [3.4445, -4.7750, 2.0315]
+  muon_ns_polish_steps: 2
   muon_eps: 1.0e-7
   muon_adjust_lr_fn: match_rms_adamw
   muon_qkv_split: true
+  # Orthogonalize the fused SwiGLU gate and up projections as two independent
+  # matrices, as DeepSeek-V4 does per logically independent weight. Off: in
+  # the 360m Muon pilot the split alone was indistinguishable from the joint
+  # orthogonalization (final val loss +0.001, ahead at only 5/20 evals).
+  muon_split_gate_up: false
   muon_verified: false
 
   # Generation

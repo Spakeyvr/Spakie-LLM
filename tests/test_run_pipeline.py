@@ -16,6 +16,9 @@ _OPTIMIZER_FLAGS = {
     "--no-muon-nesterov",
     "--muon-qkv-split",
     "--no-muon-qkv-split",
+    "--muon-ns-polish-steps",
+    "--muon-split-gate-up",
+    "--no-muon-split-gate-up",
 }
 
 
@@ -56,6 +59,9 @@ class PipelineOptimizerForwardingTests(unittest.TestCase):
             "0.0",
             "--no-muon-nesterov",
             "--no-muon-qkv-split",
+            "--muon-ns-polish-steps",
+            "2",
+            "--muon-split-gate-up",
         )
 
         for command in (
@@ -71,6 +77,8 @@ class PipelineOptimizerForwardingTests(unittest.TestCase):
             self.assertEqual(command[command.index("--muon-momentum") + 1], "0.0")
             self.assertIn("--no-muon-nesterov", command)
             self.assertIn("--no-muon-qkv-split", command)
+            self.assertEqual(command[command.index("--muon-ns-polish-steps") + 1], "2")
+            self.assertIn("--muon-split-gate-up", command)
 
     def test_explicit_adamw_override_does_not_invent_muon_flags(self):
         args = parse_args("--optimizer", "adamw")

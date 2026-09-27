@@ -16,9 +16,15 @@ from runtime.backends import RuntimeSettings
 from training.muon_core import (
     MUON_BF16_MAX_ABS,
     MUON_BF16_MAX_REL,
+    MUON_NS_COEFFICIENTS,
+    MUON_NS_POLISH_COEFFICIENTS,
     MuonPrecomputeError,
+    MuonSettings,
     is_muon_parameter_name,
+    muon_ns_step_coefficients,
     muon_projection_split_count,
+    muon_settings_from_config,
+    muon_update_split_count,
     should_adamw_fallback,
 )
 from training.optimizers import MuonAdamW, configure_torch_optimizer, muon_newton_schulz_torch
@@ -45,6 +51,51 @@ class MuonCoreTests(unittest.TestCase):
         self.assertTrue(is_muon_parameter_name("blocks.0.mlp.down.weight", 2))
         self.assertEqual(muon_projection_split_count("blocks.0.attn.qkv.weight"), 3)
         self.assertEqual(muon_projection_split_count("blocks.0.attn.kv_proj.weight"), 2)
+
+    def test_ns_schedule_places_polish_iterations_last(self):
+        self.assertEqual(muon_ns_step_coefficients(10), (MUON_NS_COEFFICIENTS,) * 10)
+        schedule = muon_ns_step_coefficients(10, MUON_NS_COEFFICIENTS, 2)
+        self.assertEqual(schedule[:8], (MUON_NS_COEFFICIENTS,) * 8)
+        self.assertEqual(schedule[8:], (MUON_NS_POLISH_COEFFICIENTS,) * 2)
+
+    def test_ns_schedule_rejects_out_of_range_polish(self):
+        for polish in (-1, 11):
+            with self.assertRaises(ValueError):
+                muon_ns_step_coefficients(10, MUON_NS_COEFFICIENTS, polish)
+        with self.assertRaises(ValueError):
+            SpakieConfig(muon_ns_steps=5, muon_ns_polish_steps=6)
+        config = SpakieConfig()
+        config.muon_ns_polish_steps = config.muon_ns_steps + 1
+        with self.assertRaises(ValueError):
+            muon_settings_from_config(config)
+
+    def test_polish_iterations_pin_singular_values_at_one(self):
+        # Heavy-tailed spectrum (1000:1), like real momentum matrices.
+        generator = torch.Generator().manual_seed(0)
+        u, _ = torch.linalg.qr(torch.randn(64, 64, generator=generator, dtype=torch.float64))
+        v, _ = torch.linalg.qr(torch.randn(192, 64, generator=generator, dtype=torch.float64))
+        update = ((u * torch.logspace(0, -3, 64, dtype=torch.float64)) @ v.T).float()
+
+        quintic = torch.linalg.svdvals(muon_newton_schulz_torch(update, ns_steps=10).double())
+        paper = torch.linalg.svdvals(
+            muon_newton_schulz_torch(update, ns_steps=10, ns_polish_steps=2).double()
+        )
+
+        self.assertGreater(float((quintic - 1).abs().max()), 0.1)
+        self.assertLess(float((paper - 1).abs().max()), 1e-2)
+
+    def test_gate_up_split_follows_its_own_setting(self):
+        gate_up = "blocks.0.mlp.gate_up.weight"
+        qkv = "blocks.0.attn.qkv.weight"
+        self.assertEqual(muon_projection_split_count(gate_up), 2)
+        self.assertEqual(muon_update_split_count(gate_up, MuonSettings()), 1)
+        self.assertEqual(muon_update_split_count(gate_up, MuonSettings(split_gate_up=True)), 2)
+        self.assertEqual(
+            muon_update_split_count(gate_up, MuonSettings(qkv_split=False, split_gate_up=True)), 2
+        )
+        self.assertEqual(muon_update_split_count(qkv, MuonSettings(split_gate_up=True)), 3)
+        self.assertEqual(muon_update_split_count(qkv, MuonSettings(qkv_split=False)), 1)
+        self.assertEqual(muon_update_split_count("blocks.0.mlp.down.weight", MuonSettings(split_gate_up=True)), 1)
 
     def test_runtime_fallback_is_only_allowed_before_mutation(self):
         optimizer = type("Optimizer", (), {"optimizer_kind": "muon"})()
@@ -196,6 +247,17 @@ class TorchMuonOptimizerTests(unittest.TestCase):
         )
         self.assertEqual([start for start, _ in chunks], [0, 6])
         self.assertEqual([tuple(chunk.shape) for _, chunk in chunks], [(6, 8), (6, 8)])
+
+    def test_fused_gate_up_is_split_only_when_enabled(self):
+        runtime = RuntimeSettings(device=torch.device("cpu"), precision="fp32")
+        for split, expected in ((False, [(0, (64, 32))]), (True, [(0, (32, 32)), (32, (32, 32))])):
+            config = self._config()
+            config.muon_split_gate_up = split
+            optimizer = configure_torch_optimizer(
+                SpakieGPT(config), config, runtime, kind="muon", lr=1e-3, weight_decay=0.1
+            )
+            chunks = list(optimizer._update_chunks("blocks.0.mlp.gate_up.weight", torch.zeros(64, 32)))
+            self.assertEqual([(start, tuple(chunk.shape)) for start, chunk in chunks], expected)
 
 
 if __name__ == "__main__":

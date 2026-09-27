@@ -41,6 +41,8 @@ def apply_optimizer_args(config, args) -> None:
         "muon_momentum": args.muon_momentum,
         "muon_nesterov": args.muon_nesterov,
         "muon_qkv_split": args.muon_qkv_split,
+        "muon_ns_polish_steps": args.muon_ns_polish_steps,
+        "muon_split_gate_up": args.muon_split_gate_up,
         "grouped_muon": args.grouped_muon,
     }
     for field_name, value in overrides.items():
@@ -620,6 +622,19 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Apply Muon Newton-Schulz to fused Q/K/V chunks independently (default: preset config)",
+    )
+    parser.add_argument(
+        "--muon-ns-polish-steps",
+        type=int,
+        default=None,
+        help="Final Newton-Schulz iterations using the DeepSeek-V4 polish coefficients (default: preset config)",
+    )
+    parser.add_argument(
+        "--muon-split-gate-up",
+        dest="muon_split_gate_up",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply Muon Newton-Schulz to the fused SwiGLU gate and up projections independently (default: preset config)",
     )
     parser.add_argument(
         "--grouped-muon",

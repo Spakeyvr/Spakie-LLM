@@ -510,6 +510,8 @@ def _build_checkpoint_payload(
             "eps": config.muon_eps,
             "adjust_lr_fn": config.muon_adjust_lr_fn,
             "qkv_split": config.muon_qkv_split,
+            "ns_polish_steps": config.muon_ns_polish_steps,
+            "split_gate_up": config.muon_split_gate_up,
         },
         "muon_verified": config.muon_verified,
         "config_schema_version": CHECKPOINT_CONFIG_SCHEMA_VERSION,

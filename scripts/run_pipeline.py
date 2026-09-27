@@ -109,6 +109,10 @@ def train_command(args: argparse.Namespace) -> list[str]:
     append_boolean_override(
         command, "--muon-qkv-split", "--no-muon-qkv-split", args.muon_qkv_split
     )
+    append_if_not_none(command, "--muon-ns-polish-steps", args.muon_ns_polish_steps)
+    append_boolean_override(
+        command, "--muon-split-gate-up", "--no-muon-split-gate-up", args.muon_split_gate_up
+    )
     if args.allow_adamw_fallback:
         command.append("--allow-adamw-fallback")
     if args.reset_optimizer:
@@ -166,6 +170,10 @@ def sft_command(args: argparse.Namespace) -> list[str]:
     )
     append_boolean_override(
         command, "--muon-qkv-split", "--no-muon-qkv-split", args.muon_qkv_split
+    )
+    append_if_not_none(command, "--muon-ns-polish-steps", args.muon_ns_polish_steps)
+    append_boolean_override(
+        command, "--muon-split-gate-up", "--no-muon-split-gate-up", args.muon_split_gate_up
     )
     if args.allow_adamw_fallback:
         command.append("--allow-adamw-fallback")
@@ -337,6 +345,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--muon-qkv-split", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument("--muon-ns-polish-steps", type=int, default=None)
+    parser.add_argument(
+        "--muon-split-gate-up", action=argparse.BooleanOptionalAction, default=None
     )
     parser.add_argument("--mlx-compile", action=argparse.BooleanOptionalAction, default=True, help="Use MLX compile")
     parser.add_argument("--mlx-prefetch", action=argparse.BooleanOptionalAction, default=True, help="Use MLX prefetch")

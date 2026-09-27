@@ -396,7 +396,41 @@ python3 scripts/train.py --optimizer adamw --allow-adamw-fallback
 python3 scripts/verify_muon.py
 ```
 
-Muon options include `--muon-adjust-lr-fn {match_rms_adamw,original,none}`, `--muon-ns-steps`, `--muon-momentum`, `--muon-nesterov / --no-muon-nesterov`, and `--muon-qkv-split / --no-muon-qkv-split`.
+Muon options include `--muon-adjust-lr-fn {match_rms_adamw,original,none}`, `--muon-ns-steps`, `--muon-momentum`, `--muon-nesterov / --no-muon-nesterov`, `--muon-qkv-split / --no-muon-qkv-split`, `--muon-ns-polish-steps`, and `--muon-split-gate-up / --no-muon-split-gate-up`.
+
+Two settings follow the DeepSeek-V4 Muon recipe. `--muon-ns-polish-steps`
+(default 2) runs the last iterations of the ten Newton–Schulz steps with the
+`(2, -1.5, 0.5)` polish coefficients. The quintic alone leaves singular values
+spread across roughly 0.7–1.1; the polish iterations settle them at 1 for the
+same number of matrix multiplies. `--muon-split-gate-up` (default off)
+orthogonalizes the fused SwiGLU gate and up projections as two independent
+matrices instead of one.
+
+In the 360m pilot (seed 42, about 103M tokens per arm), the polish schedule
+lowered final validation loss by 0.009, led at all 20 evaluations from step
+100, and reached the baseline's final loss with about 1.5% fewer tokens, at the
+same throughput. The gate/up split alone did not differ from the baseline, so
+it stays off.
+
+Checkpoints written before these settings existed resume with both off, because
+resume uses the checkpoint's saved configuration. To move such a run to the
+polish schedule, pass `--muon-ns-polish-steps 2 --reset-optimizer`.
+
+The Muon pilot compares these settings against the current recipe. It runs a
+paired 2×2 factorial (`baseline`, `paper`, `polish`, `split`): every arm of a
+seed shares initialization, data order, schedule, and validation batches.
+Runs finish on an evaluation step, completed arms are skipped on re-run, and
+interrupted arms resume. The summary reports each arm's final validation-loss
+change against the same seed's baseline, the mean change over the last quarter
+of evaluations, and token efficiency: the baseline's step count divided by the
+step at which the arm first reaches the baseline's final loss.
+
+```bash
+python3 scripts/run_muon_pilot.py                     # preview the 360m matrix
+python3 scripts/run_muon_pilot.py --execute
+python3 scripts/run_muon_pilot.py --summarize --summary-json evaluations/muon_pilot/summary.json
+python3 scripts/run_muon_pilot.py --arms baseline paper --seeds 42 7 --execute
+```
 
 Before committing to a long pretraining run, preview the fair 100M-token
 cosine-vs-trapezoid sweep across three learning rates, then execute it:

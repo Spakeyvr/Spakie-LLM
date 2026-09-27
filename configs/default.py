@@ -162,9 +162,11 @@ class SpakieConfig:
     muon_nesterov: bool = _D["muon_nesterov"]
     muon_ns_steps: int = _D["muon_ns_steps"]
     muon_ns_coefficients: tuple[float, float, float] = tuple(_D["muon_ns_coefficients"])
+    muon_ns_polish_steps: int = _D.get("muon_ns_polish_steps", 0)
     muon_eps: float = _D["muon_eps"]
     muon_adjust_lr_fn: str = _D["muon_adjust_lr_fn"]
     muon_qkv_split: bool = _D["muon_qkv_split"]
+    muon_split_gate_up: bool = _D.get("muon_split_gate_up", False)
     muon_verified: bool = _D["muon_verified"]
 
     # Generation
@@ -302,6 +304,8 @@ class SpakieConfig:
             raise ValueError("muon_route must be 'all', 'mlp', 'attn', or 'none'")
         if self.swiglu_hidden < 0:
             raise ValueError("swiglu_hidden must be >= 0")
+        if not 0 <= self.muon_ns_polish_steps <= self.muon_ns_steps:
+            raise ValueError("muon_ns_polish_steps must be between 0 and muon_ns_steps")
         if not 0 <= self.minimum_source_completion_ratio <= 1:
             raise ValueError("minimum_source_completion_ratio must be between 0 and 1")
         if not 0 <= self.maximum_source_mix_deviation <= 1:
@@ -450,6 +454,8 @@ BEHAVIOR_NEUTRAL_ADDED_FIELDS: dict[str, object] = {
     "cooldown_ul_window": 32,
     "cooldown_ul_min_token_id": 1000,
     "cooldown_mix_fingerprint": "",
+    "muon_ns_polish_steps": 0,
+    "muon_split_gate_up": False,
 }
 
 

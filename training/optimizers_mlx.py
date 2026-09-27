@@ -12,8 +12,9 @@ from training.muon_core import (
     MuonSettings,
     adjusted_muon_lr,
     is_muon_parameter_name,
-    muon_projection_split_count,
+    muon_ns_step_coefficients,
     muon_settings_from_config,
+    muon_update_split_count,
     normalize_optimizer_kind,
 )
 
@@ -74,16 +75,17 @@ def muon_newton_schulz_mlx(
     ns_steps: int = 5,
     ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
     eps: float = 1e-7,
+    ns_polish_steps: int = 0,
 ) -> mx.array:
     if len(update.shape) != 2:
         raise ValueError("Muon Newton-Schulz expects a 2D array")
-    a, b, c = ns_coefficients
+    schedule = muon_ns_step_coefficients(ns_steps, ns_coefficients, ns_polish_steps)
     x = update.astype(mx.float32)
     transposed = x.shape[0] > x.shape[1]
     if transposed:
         x = x.T
     x = x / (mx.sqrt((x * x).sum()) + eps)
-    for _ in range(ns_steps):
+    for a, b, c in schedule:
         xx_t = x @ x.T
         poly = mx.addmm(b * xx_t, xx_t, xx_t, alpha=c, beta=1.0)
         x = mx.addmm(a * x, poly, x, alpha=1.0, beta=1.0)
@@ -98,17 +100,18 @@ def _muon_newton_schulz_stacked_mlx(
     ns_steps: int,
     ns_coefficients: tuple[float, float, float],
     eps: float,
+    ns_polish_steps: int = 0,
 ) -> mx.array:
     if len(update.shape) != 3:
         raise ValueError("stacked Muon Newton-Schulz expects a 3D array")
-    a, b, c = ns_coefficients
+    schedule = muon_ns_step_coefficients(ns_steps, ns_coefficients, ns_polish_steps)
     x = update.astype(mx.float32)
     transposed = x.shape[1] > x.shape[2]
     if transposed:
         x = x.transpose(0, 2, 1)
     norm = mx.sqrt((x * x).sum(axis=(1, 2), keepdims=True)) + eps
     x = x / norm
-    for _ in range(ns_steps):
+    for a, b, c in schedule:
         xx_t = x @ x.transpose(0, 2, 1)
         poly = mx.addmm(b * xx_t, xx_t, xx_t, alpha=c, beta=1.0)
         x = mx.addmm(a * x, poly, x, alpha=1.0, beta=1.0)
@@ -222,6 +225,7 @@ class MuonAdamWMLX:
             ns_steps = self.settings.ns_steps
             ns_coefficients = self.settings.ns_coefficients
             eps = self.settings.eps
+            ns_polish_steps = self.settings.ns_polish_steps
 
             @mx.compile
             def _compiled_muon_ns(update: mx.array) -> mx.array:
@@ -230,6 +234,7 @@ class MuonAdamWMLX:
                     ns_steps=ns_steps,
                     ns_coefficients=ns_coefficients,
                     eps=eps,
+                    ns_polish_steps=ns_polish_steps,
                 )
 
             self._compiled_muon_ns = _compiled_muon_ns
@@ -375,7 +380,7 @@ class MuonAdamWMLX:
                 next_param = next_param * (1.0 - self.learning_rate * self.weight_decay)
             bases[name] = next_param
 
-            split_count = muon_projection_split_count(name) if self.settings.qkv_split else 1
+            split_count = muon_update_split_count(name, self.settings)
             if split_count > 1 and update.shape[0] % split_count == 0:
                 for chunk_idx, chunk in enumerate(mx.split(update, split_count, axis=0)):
                     lr = adjusted_muon_lr(
@@ -400,7 +405,7 @@ class MuonAdamWMLX:
                 if chunk_idx is None:
                     updates[name] = bases[name] - update_piece
                 else:
-                    piece_count = muon_projection_split_count(name)
+                    piece_count = muon_update_split_count(name, self.settings)
                     pieces = split_updates.setdefault(name, [None] * piece_count)
                     pieces[chunk_idx] = update_piece
 
@@ -412,7 +417,7 @@ class MuonAdamWMLX:
         return updates, next_muon_state
 
     def _orthogonal_update(self, name: str, update: mx.array, dtype) -> mx.array:
-        split_count = muon_projection_split_count(name) if self.settings.qkv_split else 1
+        split_count = muon_update_split_count(name, self.settings)
         if split_count > 1 and update.shape[0] % split_count == 0:
             pieces = []
             for chunk in mx.split(update, split_count, axis=0):
@@ -435,6 +440,7 @@ class MuonAdamWMLX:
             ns_steps=self.settings.ns_steps,
             ns_coefficients=self.settings.ns_coefficients,
             eps=self.settings.eps,
+            ns_polish_steps=self.settings.ns_polish_steps,
         )
 
     def _newton_schulz_stacked(self, update: mx.array) -> mx.array:
@@ -445,6 +451,7 @@ class MuonAdamWMLX:
                 ns_steps = self.settings.ns_steps
                 ns_coefficients = self.settings.ns_coefficients
                 eps = self.settings.eps
+                ns_polish_steps = self.settings.ns_polish_steps
 
                 @mx.compile
                 def _compiled_stacked_muon_ns(stacked_update: mx.array) -> mx.array:
@@ -453,6 +460,7 @@ class MuonAdamWMLX:
                         ns_steps=ns_steps,
                         ns_coefficients=ns_coefficients,
                         eps=eps,
+                        ns_polish_steps=ns_polish_steps,
                     )
 
                 compiled = _compiled_stacked_muon_ns
@@ -463,6 +471,7 @@ class MuonAdamWMLX:
             ns_steps=self.settings.ns_steps,
             ns_coefficients=self.settings.ns_coefficients,
             eps=self.settings.eps,
+            ns_polish_steps=self.settings.ns_polish_steps,
         )
 
     def state_trees(self) -> dict:

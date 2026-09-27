@@ -73,6 +73,7 @@ def _torch_reference(
     *,
     dtype: str,
     ns_steps: int,
+    ns_polish_steps: int,
     device: torch.device,
 ) -> np.ndarray:
     tensor = torch.from_numpy(matrix.astype(np.float32, copy=False)).to(device)
@@ -83,11 +84,12 @@ def _torch_reference(
         ns_steps=ns_steps,
         ns_coefficients=MUON_NS_COEFFICIENTS,
         eps=1e-7,
+        ns_polish_steps=ns_polish_steps,
     )
     return result.float().cpu().numpy()
 
 
-def _mlx_result(matrix: np.ndarray, *, dtype: str, ns_steps: int) -> np.ndarray:
+def _mlx_result(matrix: np.ndarray, *, dtype: str, ns_steps: int, ns_polish_steps: int) -> np.ndarray:
     # MLX can abort the interpreter during import when no Metal device is
     # available. Run the MLX side in a child process so this command can fail
     # with the required validation message instead of crashing the caller.
@@ -105,6 +107,7 @@ input_path = sys.argv[2]
 output_path = sys.argv[3]
 dtype = sys.argv[4]
 ns_steps = int(sys.argv[5])
+ns_polish_steps = int(sys.argv[6])
 sys.path.insert(0, repo)
 
 import mlx.core as mx
@@ -122,12 +125,13 @@ result = muon_newton_schulz_mlx(
     ns_steps=ns_steps,
     ns_coefficients=MUON_NS_COEFFICIENTS,
     eps=1e-7,
+    ns_polish_steps=ns_polish_steps,
 )
 mx.eval(result)
 np.save(output_path, np.asarray(result.astype(mx.float32)))
 """
         completed = subprocess.run(
-            [sys.executable, "-c", worker, str(ROOT), input_path, output_path, dtype, str(ns_steps)],
+            [sys.executable, "-c", worker, str(ROOT), input_path, output_path, dtype, str(ns_steps), str(ns_polish_steps)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -138,20 +142,25 @@ np.save(output_path, np.asarray(result.astype(mx.float32)))
         return np.load(output_path)
 
 
-def _default_ns_steps() -> int:
+def _default_ns_schedule() -> tuple[int, int]:
     from configs.default import SpakieConfig
 
-    return int(SpakieConfig().muon_ns_steps)
+    config = SpakieConfig()
+    return int(config.muon_ns_steps), int(config.muon_ns_polish_steps)
 
 
 def run_muon_parity_check(
     *,
     include_bf16: bool = True,
     ns_steps: int | None = None,
+    ns_polish_steps: int | None = None,
     torch_reference_device: str = "auto",
 ) -> dict[str, dict[str, float]]:
+    default_steps, default_polish = _default_ns_schedule()
     if ns_steps is None:
-        ns_steps = _default_ns_steps()
+        ns_steps = default_steps
+    if ns_polish_steps is None:
+        ns_polish_steps = default_polish
     results: dict[str, dict[str, float]] = {}
     torch_device = _resolve_torch_reference_device(torch_reference_device)
     dtypes = ("fp32", "bf16") if include_bf16 else ("fp32",)
@@ -160,8 +169,10 @@ def run_muon_parity_check(
         max_rel_threshold = MUON_BF16_MAX_REL if dtype == "bf16" else MUON_FP32_MAX_REL
         for index, case in enumerate(CASES):
             matrix = _make_matrix(case.shape, seed=20260501 + index)
-            torch_out = _torch_reference(matrix, dtype=dtype, ns_steps=ns_steps, device=torch_device)
-            mlx_out = _mlx_result(matrix, dtype=dtype, ns_steps=ns_steps)
+            torch_out = _torch_reference(
+                matrix, dtype=dtype, ns_steps=ns_steps, ns_polish_steps=ns_polish_steps, device=torch_device
+            )
+            mlx_out = _mlx_result(matrix, dtype=dtype, ns_steps=ns_steps, ns_polish_steps=ns_polish_steps)
             if torch_out.shape != mlx_out.shape:
                 raise AssertionError(f"{dtype}:{case.name} shape mismatch: {torch_out.shape} != {mlx_out.shape}")
             if not np.isfinite(torch_out).all() or not np.isfinite(mlx_out).all():
@@ -175,7 +186,7 @@ def run_muon_parity_check(
             }
             if max_abs > max_abs_threshold or max_rel > max_rel_threshold:
                 raise AssertionError(
-                    f"{dtype}:{case.name} failed Muon parity (ns_steps={ns_steps}): "
+                    f"{dtype}:{case.name} failed Muon parity (ns_steps={ns_steps}, polish={ns_polish_steps}): "
                     f"max_abs={max_abs:.6g} (limit {max_abs_threshold:.6g}), "
                     f"max_rel={max_rel:.6g} (limit {max_rel_threshold:.6g})"
                 )
@@ -192,6 +203,12 @@ def main() -> None:
         help="Newton-Schulz iteration count (default: muon_ns_steps from configs/default.yaml)",
     )
     parser.add_argument(
+        "--ns-polish-steps",
+        type=int,
+        default=None,
+        help="Final iterations using the polish coefficients (default: muon_ns_polish_steps from configs/default.yaml)",
+    )
+    parser.add_argument(
         "--torch-reference-device",
         choices=("auto", "mps", "cpu"),
         default="auto",
@@ -203,6 +220,7 @@ def main() -> None:
         results = run_muon_parity_check(
             include_bf16=not args.no_bf16,
             ns_steps=args.ns_steps,
+            ns_polish_steps=args.ns_polish_steps,
             torch_reference_device=args.torch_reference_device,
         )
     except RuntimeError as exc:

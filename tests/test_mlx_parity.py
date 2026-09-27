@@ -682,6 +682,96 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         for name, value in tree_flatten(model.parameters()):
             np.testing.assert_array_equal(np.array(value), before[name], err_msg=name)
 
+    def _muon_step_deltas_mlx(self, config, torch_model, grads_np, *, grouped: bool):
+        import mlx.core as mx
+        from mlx.utils import tree_flatten, tree_unflatten
+
+        from model.transformer_mlx import SpakieGPTMLX
+        from training.optimizers_mlx import configure_mlx_optimizer
+
+        config.grouped_muon = grouped
+        model = SpakieGPTMLX(config)
+        self._copy_torch_weights_into_mlx(torch_model, model)
+        before = {name: np.array(value) for name, value in tree_flatten(model.parameters())}
+        optimizer = configure_mlx_optimizer(
+            model, config, kind="muon", learning_rate=1e-3, weight_decay=0.1
+        )
+        grads = tree_unflatten([(name, mx.array(value)) for name, value in grads_np.items()])
+        optimizer.update(model, grads)
+        mx.eval(model.parameters())
+        return {
+            name: np.array(value) - before[name]
+            for name, value in tree_flatten(model.parameters())
+        }
+
+    def test_muon_step_matches_torch_with_paper_schedule_and_gate_up_split(self):
+        from training.optimizers import configure_torch_optimizer
+        from runtime.backends import RuntimeSettings
+
+        for polish, split in ((0, False), (2, True)):
+            with self.subTest(polish=polish, split=split):
+                config = self._tiny_config()
+                config.muon_ns_polish_steps = polish
+                config.muon_split_gate_up = split
+                torch.manual_seed(0)
+                torch_model = SpakieGPT(config)
+                rng = np.random.default_rng(1)
+                grads_np = {
+                    name: rng.standard_normal(tuple(param.shape)).astype(np.float32)
+                    for name, param in torch_model.named_parameters()
+                }
+                mlx_deltas = self._muon_step_deltas_mlx(config, torch_model, grads_np, grouped=False)
+                grouped_deltas = self._muon_step_deltas_mlx(config, torch_model, grads_np, grouped=True)
+
+                optimizer = configure_torch_optimizer(
+                    torch_model,
+                    config,
+                    RuntimeSettings(device=torch.device("cpu"), precision="fp32"),
+                    kind="muon",
+                    lr=1e-3,
+                    weight_decay=0.1,
+                )
+                before = {name: p.detach().clone() for name, p in torch_model.named_parameters()}
+                for name, param in torch_model.named_parameters():
+                    param.grad = torch.from_numpy(grads_np[name])
+                optimizer.step()
+
+                for name, param in torch_model.named_parameters():
+                    torch_delta = (param.detach() - before[name]).numpy()
+                    scale = max(float(np.abs(torch_delta).max()), 1e-12)
+                    for label, deltas in (("mlx", mlx_deltas), ("mlx-grouped", grouped_deltas)):
+                        err = float(np.abs(deltas[name] - torch_delta).max()) / scale
+                        self.assertLess(err, 2e-2, f"{label}:{name}")
+
+    def test_split_gate_up_changes_only_the_mlp_input_projection(self):
+        from training.optimizers import configure_torch_optimizer
+        from runtime.backends import RuntimeSettings
+
+        deltas = {}
+        for split in (False, True):
+            config = self._tiny_config()
+            config.muon_split_gate_up = split
+            torch.manual_seed(0)
+            model = SpakieGPT(config)
+            before = {name: p.detach().clone() for name, p in model.named_parameters()}
+            optimizer = configure_torch_optimizer(
+                model,
+                config,
+                RuntimeSettings(device=torch.device("cpu"), precision="fp32"),
+                kind="muon",
+                lr=1e-3,
+                weight_decay=0.1,
+            )
+            generator = torch.Generator().manual_seed(1)
+            for param in model.parameters():
+                param.grad = torch.randn(param.shape, generator=generator)
+            optimizer.step()
+            deltas[split] = {name: p.detach() - before[name] for name, p in model.named_parameters()}
+
+        for name in deltas[False]:
+            same = torch.equal(deltas[False][name], deltas[True][name])
+            self.assertEqual(same, not name.endswith("mlp.gate_up.weight"), name)
+
     def test_mlx_bfloat16_optimizer_keeps_fp32_master_updates(self):
         import mlx.core as mx
         from mlx.utils import tree_flatten, tree_map
