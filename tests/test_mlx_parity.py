@@ -682,6 +682,67 @@ class TorchMLXForwardParityTests(unittest.TestCase):
         for name, value in tree_flatten(model.parameters()):
             np.testing.assert_array_equal(np.array(value), before[name], err_msg=name)
 
+    def test_query_blocked_attention_matches_dense_loss_and_gradients(self):
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten
+
+        import model.transformer_mlx as transformer_mlx
+        from model.transformer_mlx import SpakieGPTMLX
+
+        def loss_and_grads(block: int):
+            config = self._tiny_config()
+            config.attention_query_block = block
+            mx.random.seed(0)
+            model = SpakieGPTMLX(config)
+            model.train()
+            x = mx.array(np.arange(32).reshape(2, 16) % config.vocab_size)
+            y = mx.array((np.arange(32).reshape(2, 16) * 7 + 3) % config.vocab_size)
+            loss_fn = lambda m: m(x, y, ignore_index=None)[1]
+            loss, grads = nn.value_and_grad(model, loss_fn)(model)
+            mx.eval(loss, grads)
+            return float(loss.item()), dict(tree_flatten(grads))
+
+        dense_loss, dense_grads = loss_and_grads(0)
+        blocked_calls = []
+        original = transformer_mlx._query_blocked_causal_attention
+
+        def counting(*args, **kwargs):
+            blocked_calls.append(kwargs["block"])
+            return original(*args, **kwargs)
+
+        with mock.patch.object(transformer_mlx, "_query_blocked_causal_attention", counting):
+            # 16 tokens in blocks of 6 leaves a ragged final block of 4.
+            blocked_loss, blocked_grads = loss_and_grads(6)
+
+        self.assertEqual(blocked_calls, [6, 6])  # one call per layer
+        self.assertAlmostEqual(blocked_loss, dense_loss, places=5)
+        for name, grad in dense_grads.items():
+            np.testing.assert_allclose(
+                np.array(blocked_grads[name]), np.array(grad), rtol=1e-4, atol=1e-6, err_msg=name
+            )
+
+    def test_query_blocked_attention_is_training_only(self):
+        import mlx.core as mx
+
+        import model.transformer_mlx as transformer_mlx
+        from model.transformer_mlx import SpakieGPTMLX
+
+        config = self._tiny_config()
+        config.attention_query_block = 4
+        model = SpakieGPTMLX(config)
+        model.eval()
+        x = mx.array(np.arange(12).reshape(1, 12) % config.vocab_size)
+        with mock.patch.object(
+            transformer_mlx,
+            "_query_blocked_causal_attention",
+            side_effect=AssertionError("blocked attention used outside training"),
+        ):
+            logits, _, cache = model(x, return_cache=True)
+            mx.eval(logits)
+            step, _, _ = model(x[:, :1], cache=cache, cache_offset=12)
+            mx.eval(step)
+
     def _muon_step_deltas_mlx(self, config, torch_model, grads_np, *, grouped: bool):
         import mlx.core as mx
         from mlx.utils import tree_flatten, tree_unflatten

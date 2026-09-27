@@ -43,6 +43,12 @@ defaults:
   # tied lm-head cross-entropy; larger chunks may help on hardware with tight
   # memory budgets; benchmark before changing.
   loss_chunk_size: 0
+  # MLX training only: split causal attention into query blocks of this many
+  # tokens, each attending to keys [0, block end). MLX 0.31 has a fused SDPA
+  # forward but no fused backward, so the backward materializes the full T x T
+  # score matrix; blocking skips its masked upper triangle. Same math up to
+  # bf16 rounding. 0 disables it; inference and evaluation always use dense SDPA.
+  attention_query_block: 0
 
   # Pretraining
   pretrain_batch_size: 32
@@ -186,6 +192,9 @@ presets:
     position_encoding: rope
     rope_theta: 100000.0
     activation_checkpointing: false
+    # Blocked causal attention: +15-23% MLX training throughput and ~7 GB less
+    # peak memory at B16 x 2048 on the M5 Max (2026-09-27 benchmark).
+    attention_query_block: 512
     pretrain_batch_size: 16
     pretrain_grad_accum_steps: 4
     pretrain_lr: 6.0e-4
@@ -208,6 +217,9 @@ presets:
     position_encoding: rope
     rope_theta: 100000.0
     activation_checkpointing: false
+    # Blocked causal attention: +18-20% MLX training throughput and ~10 GB less
+    # peak memory at B12 x 2048 on the M5 Max (2026-09-27 benchmark).
+    attention_query_block: 512
     pretrain_batch_size: 12
     pretrain_grad_accum_steps: 4
     sft_batch_size: 8
@@ -252,12 +264,14 @@ presets:
     position_encoding: rope
     rope_theta: 100000.0
     activation_checkpointing: false
-    # Same 98,304 tokens/update as 300m, with smaller resident batches.
+    # Blocked causal attention: +17-20% MLX training throughput and ~11 GB less
+    # peak memory at B8 x 2048 on the M5 Max (2026-09-27 benchmark).
+    attention_query_block: 512
+    # Same 98,304 tokens/update as 300m, with smaller resident batches. Plain
+    # sequential accumulation: vmap with one lane per group was 10-14% slower
+    # and used 5 GB more for identical arithmetic.
     pretrain_batch_size: 8
     pretrain_grad_accum_steps: 6
-    pretrain_vmap_accum_step: true
-    pretrain_vmap_sync_warmup_steps: 10
-    pretrain_vmap_group_size: 1
     sft_batch_size: 4
     sft_grad_accum_steps: 2
     sft_grad_clip: 1.0

@@ -95,6 +95,7 @@ class SpakieConfig:
     # tokens during training, avoiding the (B*T, vocab_size) materialization.
     # 0 disables chunking. Only used in the MLX backend's training path.
     loss_chunk_size: int = _D.get("loss_chunk_size", 0)
+    attention_query_block: int = _D.get("attention_query_block", 0)
 
     # Pretraining
     pretrain_batch_size: int = _D["pretrain_batch_size"]
@@ -304,6 +305,8 @@ class SpakieConfig:
             raise ValueError("muon_route must be 'all', 'mlp', 'attn', or 'none'")
         if self.swiglu_hidden < 0:
             raise ValueError("swiglu_hidden must be >= 0")
+        if self.attention_query_block < 0:
+            raise ValueError("attention_query_block must be >= 0")
         if not 0 <= self.muon_ns_polish_steps <= self.muon_ns_steps:
             raise ValueError("muon_ns_polish_steps must be between 0 and muon_ns_steps")
         if not 0 <= self.minimum_source_completion_ratio <= 1:
@@ -456,6 +459,7 @@ BEHAVIOR_NEUTRAL_ADDED_FIELDS: dict[str, object] = {
     "cooldown_mix_fingerprint": "",
     "muon_ns_polish_steps": 0,
     "muon_split_gate_up": False,
+    "attention_query_block": 0,
 }
 
 

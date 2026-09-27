@@ -99,8 +99,8 @@ python3 scripts/train.py --preset 300m --backend torch --device auto --precision
 
 For approximately 360M parameters, select `--preset 360m`. It has 362,869,248
 parameters with the canonical vocabulary, 2,048-token context, microbatch 8,
-and six accumulation steps (98,304 tokens per update). MLX keeps one
-accumulation lane resident. The starting recipe retains Muon with ten
+and six accumulation steps (98,304 tokens per update), accumulated
+sequentially. The starting recipe retains Muon with ten
 Newton–Schulz steps, a `6e-4` peak learning rate, and the trapezoid schedule.
 This is a conservative starting point; short pilots do not establish the best
 full-run schedule or eventual capabilities.
@@ -726,10 +726,10 @@ The repo currently supports these presets:
 
 | Preset | Layers | `d_model` | Q heads | KV heads | MLP | Pretrain batch | Grad accum | SFT batch | SFT grad accum | Notes |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
-| `92m` | 12 | 768 | 12 | 4 | SwiGLU hidden 2048 | 16 | 4 | 16 | 4 | Default modern small preset; RoPE + QK norm |
-| `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 12 | 4 | 8 | 4 | ~184M parameters, RoPE + QK norm |
+| `92m` | 12 | 768 | 12 | 4 | SwiGLU hidden 2048 | 16 | 4 | 16 | 4 | Default modern small preset; RoPE + QK norm; blocked attention |
+| `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 12 | 4 | 8 | 4 | ~184M parameters, RoPE + QK norm; blocked attention |
 | `300m` | 24 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 16 | 3 | 4 | 2 | ~315M parameters, RoPE + QK norm; memory-safe chunked-vmap pretraining default |
-| `360m` | 28 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 8 | 6 | 4 | 2 | ~363M parameters; same token batch as 300m, one accumulation lane resident |
+| `360m` | 28 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 8 | 6 | 4 | 2 | ~363M parameters; same token batch as 300m, sequential accumulation; blocked attention |
 
 Shared model defaults:
 
@@ -742,6 +742,17 @@ Shared model defaults:
 - SwiGLU MLPs
 - scaled dot-product attention, with grouped-query attention where configured
 - activation checkpointing disabled by default for all current presets
+
+MLX training on the `92m`, `180m`, and `360m` presets computes causal attention
+in query blocks of 512 tokens (`attention_query_block`). Each block attends to
+keys up to its own end. MLX 0.31 fuses the attention forward pass but not its
+backward, which otherwise builds the full 2,048 × 2,048 score matrix; blocking
+skips the masked upper half. The result matches dense attention up to bf16
+rounding. On the M5 Max it raised training throughput by 15–23% and cut peak
+memory by 7–11 GB. Evaluation, generation, and packed SFT batches with segment
+masks always use dense attention. The `360m` preset also accumulates gradients
+sequentially: vectorizing one microbatch per group was 10–14% slower and used
+5 GB more for identical arithmetic.
 
 ## Balanced Pretraining Corpus
 

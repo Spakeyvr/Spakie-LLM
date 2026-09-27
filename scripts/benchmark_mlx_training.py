@@ -1413,6 +1413,11 @@ def main() -> None:
 
     from model.transformer_mlx import SpakieGPTMLX
 
+    if args.shapeless_compile and config.attention_query_block:
+        # The query-block loop is unrolled for the traced sequence length, so a
+        # shapeless graph would reuse it for batches of other lengths.
+        print("Shapeless compile: disabling attention_query_block")
+        config.attention_query_block = 0
     model = SpakieGPTMLX(config)
     if runtime.dtype != mx.float32:
         model.set_dtype(runtime.dtype)

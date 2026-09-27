@@ -89,6 +89,37 @@ def _lower_right_causal_mask(query_length: int, key_length: int) -> mx.array:
     return mx.arange(key_length)[None, :] <= (mx.arange(query_length)[:, None] + offset)
 
 
+def _query_blocked_causal_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    *,
+    scale: float,
+    block: int,
+) -> mx.array:
+    """Causal SDPA computed one query block at a time.
+
+    Each block of queries attends only to keys up to the block's end, and MLX's
+    lower-right aligned causal mask makes every block exact. The fused forward is
+    unchanged, but the unfused backward now skips the masked upper triangle
+    instead of materializing the full T x T score matrix.
+    """
+    T = q.shape[2]
+    return mx.concatenate(
+        [
+            mx.fast.scaled_dot_product_attention(
+                q[:, :, start:start + block],
+                k[:, :, :start + block],
+                v[:, :, :start + block],
+                scale=scale,
+                mask="causal",
+            )
+            for start in range(0, T, block)
+        ],
+        axis=2,
+    )
+
+
 def _attention_with_dropout(
     q: mx.array,
     k: mx.array,
@@ -173,6 +204,7 @@ class CausalSelfAttentionMLX(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.attention_backend = config.attention_backend
+        self.attention_query_block = config.attention_query_block
         if config.qk_norm:
             self.q_norm = nn.RMSNorm(self.head_dim)
             self.k_norm = nn.RMSNorm(self.head_dim)
@@ -311,6 +343,14 @@ class CausalSelfAttentionMLX(nn.Module):
                     causal=attention_mask is None,
                     attn_bias=attention_mask,
                     backend="auto",
+                )
+            elif (
+                self.training
+                and attention_mask is None
+                and 0 < self.attention_query_block < T
+            ):
+                y = _query_blocked_causal_attention(
+                    q, k, v, scale=self.scale, block=self.attention_query_block
                 )
             else:
                 y = mx.fast.scaled_dot_product_attention(
