@@ -32,6 +32,9 @@ ARMS: dict[str, tuple[bool, bool]] = {
     "split": (False, True),
 }
 INTERRUPT_CHECKPOINTS = ("pretrain_interrupt.safetensors", "pretrain_interrupt.pt")
+# Written into each run directory at launch: the exact train.py arguments, so a
+# directory is only reused, resumed, or compared when the request still matches.
+RUN_COMMAND_FILENAME = "pilot_command.json"
 
 
 def pilot_steps(args: argparse.Namespace) -> tuple[int, int]:
@@ -79,11 +82,35 @@ def _resolve(path: Path) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
-def run_state(directory: Path) -> str:
-    """'empty', 'complete', 'running', 'resumable', or 'occupied' for a run directory."""
+def _train_args(command: list[str]) -> list[str]:
+    """The train.py arguments, without the interpreter path."""
+    return command[1:]
+
+
+def write_run_command(directory: Path, command: list[str]) -> None:
+    directory = _resolve(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / RUN_COMMAND_FILENAME).write_text(json.dumps(_train_args(command)) + "\n", encoding="utf-8")
+
+
+def run_state(directory: Path, command: list[str]) -> str:
+    """Classify a run directory against the command this invocation would run.
+
+    'empty', 'complete', 'running', or 'resumable' for a directory launched with
+    the same train.py arguments; 'mismatch' when it was launched with different
+    ones; 'occupied' when it holds anything else.
+    """
     directory = _resolve(directory)
     if not directory.exists() or not any(directory.iterdir()):
         return "empty"
+    try:
+        saved = json.loads((directory / RUN_COMMAND_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "occupied"
+    if saved != _train_args(command):
+        return "mismatch"
+    if [path.name for path in directory.iterdir()] == [RUN_COMMAND_FILENAME]:
+        return "empty"  # recorded, but train.py never started writing
     status_path = directory / STATUS_FILENAME
     if status_path.exists():
         try:
@@ -132,21 +159,32 @@ def steps_to_reach(curve: dict[int, float], target: float) -> float | None:
     return None
 
 
+COMPARABLE_STATES = {"complete", "running", "resumable"}
+
+
 def summarize(args: argparse.Namespace) -> dict:
     steps, _ = pilot_steps(args)
+    commands = {(seed, arm): command for seed, arm, command in build_runs(args)}
     rows = []
     for seed in args.seeds:
-        baseline = read_eval_curve(run_dir(args, seed, "baseline"), args.eval_interval)
+        def curve_for(arm: str) -> tuple[str, dict[int, float]]:
+            directory = run_dir(args, seed, arm)
+            state = run_state(directory, commands[seed, arm])
+            # Runs launched with other settings are never compared.
+            curve = read_eval_curve(directory, args.eval_interval) if state in COMPARABLE_STATES else {}
+            return state, curve
+
+        _, baseline = curve_for("baseline")
         baseline_final = baseline.get(steps)
         tail_steps = [s for s in baseline if s > steps * 0.75]
         for arm in args.arms:
             directory = run_dir(args, seed, arm)
-            curve = read_eval_curve(directory, args.eval_interval)
+            state, curve = curve_for(arm)
             final = curve.get(steps)
             row = {
                 "seed": seed,
                 "arm": arm,
-                "state": run_state(directory),
+                "state": state,
                 "evals": len(curve),
                 "final_val_loss": final,
                 "delta_final": None,
@@ -154,7 +192,7 @@ def summarize(args: argparse.Namespace) -> dict:
                 "token_efficiency": None,
             }
             status_path = _resolve(directory) / STATUS_FILENAME
-            if status_path.exists():
+            if state in COMPARABLE_STATES and status_path.exists():
                 row["tok_per_sec"] = json.loads(status_path.read_text(encoding="utf-8")).get("tok_per_sec")
             if final is not None and baseline_final is not None:
                 row["delta_final"] = final - baseline_final
@@ -235,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
 
     runs = build_runs(args)
     steps, tokens = pilot_steps(args)
-    states = {(seed, arm): run_state(run_dir(args, seed, arm)) for seed, arm, _ in runs}
+    states = {(seed, arm): run_state(run_dir(args, seed, arm), command) for seed, arm, command in runs}
     print(f"Muon pilot: {len(runs)} runs x {steps:,} steps ({tokens:,} tokens each)")
     for seed, arm, command in runs:
         print(f"[{states[seed, arm]}] {shlex.join(command)}")
@@ -246,11 +284,12 @@ def main(argv: list[str] | None = None) -> int:
     occupied = [
         str(run_dir(args, seed, arm))
         for (seed, arm), state in states.items()
-        if state in {"occupied", "running"}
+        if state in {"occupied", "running", "mismatch"}
     ]
     if occupied:
-        print("Refusing to touch running or non-empty run directories without a resume checkpoint: "
-              + ", ".join(occupied), file=sys.stderr)
+        print("Refusing to touch run directories that are running, were launched with different "
+              "settings, or hold unrelated files: " + ", ".join(occupied), file=sys.stderr)
+        print("Choose a new --output-root for different settings.", file=sys.stderr)
         return 2
 
     try:
@@ -261,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if state == "resumable":
                 command = command + ["--resume"]
+            else:
+                write_run_command(run_dir(args, seed, arm), command)
             print(f"\n[{index}/{len(runs)}] {shlex.join(command)}", flush=True)
             subprocess.run(command, cwd=ROOT, check=True)
     except KeyboardInterrupt:

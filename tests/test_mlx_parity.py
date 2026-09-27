@@ -722,6 +722,18 @@ class TorchMLXForwardParityTests(unittest.TestCase):
                 np.array(blocked_grads[name]), np.array(grad), rtol=1e-4, atol=1e-6, err_msg=name
             )
 
+    def test_loss_convergence_sweep_builds_every_ns_step_count(self):
+        from scripts._loss_convergence import setup_model_and_opt
+
+        for ns_steps in (1, 2, 3, 5):
+            with self.subTest(ns_steps=ns_steps):
+                _, optimizer, _ = setup_model_and_opt(
+                    "92m", 0, lr=1e-3, wd=0.0, optimizer_kind="muon", ns_steps=ns_steps,
+                    perhead=False, warmup=1, max_steps=2,
+                )
+                self.assertEqual(optimizer.settings.ns_steps, ns_steps)
+                self.assertEqual(optimizer.settings.ns_polish_steps, 0)
+
     def test_query_blocked_attention_is_training_only(self):
         import mlx.core as mx
 

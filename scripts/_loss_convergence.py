@@ -55,6 +55,9 @@ def setup_model_and_opt(preset, seed, *, lr, wd, optimizer_kind, ns_steps, perhe
     config = get_preset_config(preset)
     config.pretrain_optimizer = optimizer_kind
     config.muon_ns_steps = ns_steps
+    # The sweep compares quintic-only iteration counts (down to 1), so the
+    # polish stage is off for every variant.
+    config.muon_ns_polish_steps = 0
     config.pretrain_lr = lr
     config.pretrain_weight_decay = wd
     config.pretrain_warmup_steps = warmup
