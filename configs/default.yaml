@@ -241,13 +241,14 @@ presets:
     position_encoding: rope
     rope_theta: 100000.0
     activation_checkpointing: false
+    # Blocked causal attention with plain sequential accumulation. The previous
+    # default (vmap, probe-chosen group of 1, dense attention) peaked at 105 GB
+    # and ran at ~1,200 tok/s under memory pressure on the 128 GB M5 Max; this
+    # path peaks at 75.8 GB and ran at 7,000-9,000 tok/s (2026-09-27 benchmark).
+    # vmap with blocked attention was no faster and peaked at 86 GB.
+    attention_query_block: 512
     pretrain_batch_size: 16
     pretrain_grad_accum_steps: 3
-    # Use memory-safe chunked vmap accumulation. Group size 0 runs the MLX
-    # memory probe and selects the largest safe group automatically.
-    pretrain_vmap_accum_step: true
-    pretrain_vmap_sync_warmup_steps: 10
-    pretrain_vmap_group_size: 0
     sft_batch_size: 4
     sft_grad_accum_steps: 2
     sft_grad_clip: 1.0

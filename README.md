@@ -109,9 +109,7 @@ Before a fresh long run, rebuild any lossy raw code, train the tokenizer from
 the corrected source-balanced corpus, and prepare arrays with the current
 provenance and quality gates. Keep these assets separate from old checkpoints.
 Then use `--smoke --max-steps 12` with the intended preset and isolated output
-directory to check memory and throughput on the actual machine. For MLX, run
-past `pretrain_vmap_sync_warmup_steps` (10 by default) so the smoke also exercises
-asynchronous accumulation; five steps miss that path. Test Ctrl+C and resume
+directory to check memory and throughput on the actual machine. Test Ctrl+C and resume
 separately, and check the reported peak memory rather than assuming the requested
 MLX memory limit is a hard process-memory cap.
 Estimate the full token budget from that measured throughput before launching.
@@ -728,7 +726,7 @@ The repo currently supports these presets:
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
 | `92m` | 12 | 768 | 12 | 4 | SwiGLU hidden 2048 | 16 | 4 | 16 | 4 | Default modern small preset; RoPE + QK norm; blocked attention |
 | `180m` | 24 | 768 | 12 | 4 | SwiGLU hidden 2304 | 12 | 4 | 8 | 4 | ~184M parameters, RoPE + QK norm; blocked attention |
-| `300m` | 24 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 16 | 3 | 4 | 2 | ~315M parameters, RoPE + QK norm; memory-safe chunked-vmap pretraining default |
+| `300m` | 24 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 16 | 3 | 4 | 2 | ~315M parameters, RoPE + QK norm; sequential accumulation; blocked attention |
 | `360m` | 28 | 1024 | 16 | 4 | SwiGLU hidden 3072 | 8 | 6 | 4 | 2 | ~363M parameters; same token batch as 300m, sequential accumulation; blocked attention |
 
 Shared model defaults:
@@ -743,21 +741,27 @@ Shared model defaults:
 - scaled dot-product attention, with grouped-query attention where configured
 - activation checkpointing disabled by default for all current presets
 
-MLX training on the `92m`, `180m`, and `360m` presets computes causal attention
+MLX training on every preset computes causal attention
 in query blocks of 512 tokens (`attention_query_block`). Each block attends to
 keys up to its own end. MLX 0.31 fuses the attention forward pass but not its
 backward, which otherwise builds the full 2,048 × 2,048 score matrix; blocking
 skips the masked upper half. The result matches dense attention up to bf16
 rounding. On the M5 Max it raised training throughput by 15–23% and cut peak
-memory by 7–11 GB. Evaluation, generation, and packed SFT batches with segment
-masks always use dense attention. The `360m` preset also accumulates gradients
-sequentially: vectorizing one microbatch per group was 10–14% slower and used
-5 GB more for identical arithmetic.
+memory by 7–11 GB on `92m`, `180m`, and `360m`. Evaluation, generation, and
+packed SFT batches with segment masks always use dense attention.
+
+All presets accumulate gradients sequentially. Vectorized (vmap) accumulation
+remains available through `--mlx-vmap-accum-step` but is slower on this
+hardware. At `360m`, one microbatch per vmap group was 10–14% slower and used
+5 GB more for identical arithmetic. At `300m`, the previous vmap default with
+dense attention peaked at 105 GB on a 128 GB machine and ran at about 1,200
+tok/s under memory pressure. Sequential accumulation with blocked attention
+peaks at 76 GB and ran at 7,000–9,000 tok/s.
 
 Resumed runs and SFT keep the settings saved in their checkpoint, so runs
-started before these defaults changed keep dense attention (and, for `360m`,
-vmap accumulation). Both are pure speed settings with identical arithmetic, so
-switching them mid-run is safe:
+started before these defaults changed keep dense attention (and, for `300m`
+and `360m`, vmap accumulation). Both are pure speed settings with identical
+arithmetic, so switching them mid-run is safe:
 
 ```bash
 python3 scripts/train.py --preset 360m --resume --attention-query-block 512 --no-mlx-vmap-accum-step

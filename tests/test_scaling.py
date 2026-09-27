@@ -165,11 +165,12 @@ class ScalingConfigTests(unittest.TestCase):
                     spec["parameters"],
                 )
 
-    def test_300m_keeps_memory_safe_vmap_accumulation_enabled(self):
+    def test_300m_keeps_the_token_batch_with_sequential_accumulation(self):
         config = get_preset_config("300m")
-        self.assertTrue(config.pretrain_vmap_accum_step)
-        self.assertEqual(config.pretrain_vmap_sync_warmup_steps, 10)
-        self.assertEqual(config.pretrain_vmap_group_size, 0)
+        self.assertEqual(config.pretrain_tokens_per_step(), 98_304)
+        self.assertEqual(config.pretrain_batch_size, 16)
+        self.assertEqual(config.pretrain_grad_accum_steps, 3)
+        self.assertFalse(config.pretrain_vmap_accum_step)
 
     def test_360m_keeps_the_token_batch_with_sequential_accumulation(self):
         config = get_preset_config('360m')
@@ -179,10 +180,11 @@ class ScalingConfigTests(unittest.TestCase):
         self.assertFalse(config.pretrain_vmap_accum_step)
 
     def test_blocked_attention_presets(self):
-        expected = {"92m": 512, "180m": 512, "300m": 0, "360m": 512}
-        for preset, block in expected.items():
+        for preset in ("92m", "180m", "300m", "360m"):
             with self.subTest(preset=preset):
-                self.assertEqual(get_preset_config(preset).attention_query_block, block)
+                config = get_preset_config(preset)
+                self.assertEqual(config.attention_query_block, 512)
+                self.assertFalse(config.pretrain_vmap_accum_step)
 
     def test_rope_rotation_preserves_norm_and_position_zero(self):
         values = torch.arange(2 * 3 * 2 * 8, dtype=torch.float32).reshape(2, 3, 2, 8)
