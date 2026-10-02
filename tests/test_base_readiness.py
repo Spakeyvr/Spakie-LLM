@@ -35,6 +35,17 @@ class BaseReadinessTests(unittest.TestCase):
             answer = f" The badge code for {name} is {row['answer']}.\n"
             self.assertLess(len(tok.encode(answer)), row['max_new_tokens'], answer)
 
+    def test_grounding_assertion_about_another_person_is_wrong_at_any_ending(self):
+        row = next(r for r in cases() if r['category'] == 'grounding')
+        for budget in (False, True, None):
+            for text in (' The badge code for Bela is 431', 'The badge code for Bela is 902. The badge',
+                         'Bela is 43', 'the badge code for bela is 431.'):
+                result = grounding_diagnostic(text, row, generation_budget_reached=budget)
+                self.assertIs(result['first_assertion_correct'], False, (budget, text))
+            # A subject the prompt never names is still undecidable when the budget ran out.
+            self.assertEqual(grounding_diagnostic('It is 431', row, generation_budget_reached=budget)
+                             ['first_assertion_correct'], None if budget is not False else False)
+
     def test_grounding_budget_exhaustion_and_unknown_endings_are_not_certified(self):
         row = next(r for r in cases() if r['category'] == 'grounding')
         for budget in (True, None):

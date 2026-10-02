@@ -107,7 +107,9 @@ def grounding_diagnostic(text, row, *, generation_budget_reached=None):
     is exposed for review and never certified as correct. Frozen primary scores
     remain unchanged so old experiment gates cannot silently become easier.
     Unknown or exhausted generation budgets cannot certify an unterminated
-    number. ``None`` means the observed ending is insufficient to decide.
+    number. ``None`` means the observed ending is insufficient to decide. A
+    first assertion about a different person named in the prompt ("The badge
+    code for Bela is 448") is wrong however the response would have ended.
     """
     if row.get('category') != 'grounding':
         raise ValueError('Expected a grounding case')
@@ -133,7 +135,11 @@ def grounding_diagnostic(text, row, *, generation_budget_reached=None):
             correct = None
     else:
         correct, remainder = False, text.strip()
-        if generation_budget_reached is not False:
+        others = {other.lower() for other in re.findall(r'The badge code for (\w+) is', row['prompt'])}
+        others.discard(target[1].lower())
+        subject = re.match(r'^\s*(?:The badge code for )?(\w+) is ' + NUMERIC_LITERAL, text, re.I)
+        about_other_person = subject is not None and subject[1].lower() in others
+        if generation_budget_reached is not False and not about_other_person:
             correct = None
     return {'first_assertion_correct': correct,
             'unassessed_remainder': remainder,
@@ -155,7 +161,7 @@ def evaluate_model(model, tokenizer_path, output, *, split='dev', stopped=lambda
         'tokenizer_sha256': sha(tokenizer_path), 'records': [], 'metrics': {},
         'scope': 'Small diagnostic suite. Grammar is length-normalized sentence likelihood; '
                  'format instructions are BASE completions, not a chat/SFT readiness claim.'}
-    result['grounding_diagnostic_version'] = 2
+    result['grounding_diagnostic_version'] = 3
     def nll(text):
         ids = tok.encode(text)
         _, loss, _ = model(mx.array([ids[:-1]]), mx.array([ids[1:]]), ignore_index=None)
