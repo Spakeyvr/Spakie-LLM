@@ -125,10 +125,12 @@ class BaseLearningProbeTests(unittest.TestCase):
     def test_capital_city_descriptor_accepts_only_the_immediate_correct_city(self):
         from scripts._base_probe_cases import score_completion
         row={'category':'facts','prompt':'The capital of Switzerland is','expected_regex':r'Bern\b'}
-        for text in ['Bern.', 'the city of Bern.', 'the capital city of Bern.']:
+        for text in ['Bern.', 'the city of Bern.', 'the capital city of Bern.',
+                     'in the city of Bern, which is located', 'in Bern.']:
             self.assertTrue(score_completion(text,row),text)
         for text in ['the city of Geneva. Bern is another city.', 'Not Bern.',
-                     'the capital city of the country. Later: Bern.']:
+                     'the capital city of the country. Later: Bern.',
+                     'in the city of Geneva. Bern.', 'in the south. Bern.']:
             self.assertFalse(score_completion(text,row),text)
 
     def test_legacy_base_detection_requires_corpus_contract_and_rejects_sft(self):

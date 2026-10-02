@@ -1,6 +1,9 @@
+from pathlib import Path
 import unittest
 
 from scripts.eval_base_readiness import cases, score_answer, grounding_diagnostic
+
+TOKENIZER = Path(__file__).resolve().parents[1] / 'tokenizer' / 'spakie.model'
 
 
 class BaseReadinessTests(unittest.TestCase):
@@ -22,6 +25,15 @@ class BaseReadinessTests(unittest.TestCase):
         self.assertTrue(result['first_assertion_correct'])
         self.assertFalse(result['whole_response_supported'])
         self.assertEqual(result['unassessed_remainder'], 'Actually it is 902.')
+
+    @unittest.skipUnless(TOKENIZER.exists(), 'trained tokenizer not present in this checkout')
+    def test_grounding_budget_fits_a_sentence_form_answer(self):
+        from tokenizer.train_tokenizer import SpakieTokenizer
+        tok = SpakieTokenizer(str(TOKENIZER))
+        for row in (r for r in cases() if r['category'] == 'grounding'):
+            name = row['prompt'].rsplit('badge code for ', 1)[1].split('?')[0]
+            answer = f" The badge code for {name} is {row['answer']}.\n"
+            self.assertLess(len(tok.encode(answer)), row['max_new_tokens'], answer)
 
     def test_grounding_budget_exhaustion_and_unknown_endings_are_not_certified(self):
         row = next(r for r in cases() if r['category'] == 'grounding')
@@ -50,7 +62,9 @@ class BaseReadinessTests(unittest.TestCase):
         self.assertFalse(score_answer('Madridista', fact))
         capital={**fact,'category':'facts','prompt':'The capital of Spain is'}
         self.assertTrue(score_answer('the city of Madrid.',capital))
+        self.assertTrue(score_answer(' in the city of Madrid, which is',capital))
         self.assertFalse(score_answer('the city of Barcelona. Madrid.',capital))
+        self.assertFalse(score_answer('in the city of Barcelona. Madrid.',capital))
         exact = {'answer': 'TARIN', 'scoring': 'exact'}
         self.assertTrue(score_answer(' TARIN\n', exact))
         for text in ('TARIN.', 'TARIN\nMore', 'tarin'):

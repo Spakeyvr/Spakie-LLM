@@ -3,7 +3,7 @@
 import re
 from decimal import Decimal
 
-SCORING_VERSION = 5
+SCORING_VERSION = 6
 NUMERIC_LITERAL = r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
 HAMLET_ANSWER = r'(?:(?:the )?English playwright(?: and poet)?,? )?(?:William )?Shakespeare\b'
 
@@ -112,9 +112,13 @@ def score_numeric_answer(text, answer):
 
 
 def score_fact_completion(text, pattern, prompt=''):
-    """Accept a capital's immediate city descriptor without searching later text."""
+    """Accept a capital's immediate city descriptor without searching later text.
+
+    "is in the city of Stockholm" places the capital in the right city, so a
+    leading locative "in" is accepted along with the descriptor.
+    """
     if prompt.lower().startswith('the capital of '):
-        pattern = r'(?:(?:the )?(?:capital )?city(?: of)?\s+)?' + pattern
+        pattern = r'(?:in\s+)?(?:(?:the )?(?:capital )?city(?: of)?\s+)?' + pattern
     return score(text, pattern)
 
 

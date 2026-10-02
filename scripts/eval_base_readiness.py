@@ -49,7 +49,10 @@ def cases(split='dev'):
         code = str(431 + 17 * i + 200 * test)
         rows.append(dict(category='grounding', prompt=f'The badge code for {name} is {code}. '
                          f'The badge code for Bela is 902.\nQuestion: What is the badge code for {name}?\nAnswer:',
-                         answer=code, scoring='number', max_new_tokens=12))
+                         # Room for a sentence-form answer plus its terminator; 12 tokens
+                         # cut "The badge code for Tarin is 431" off at the number, so the
+                         # first-assertion diagnostic could never reach a verdict.
+                         answer=code, scoring='number', max_new_tokens=20))
         rows.append(dict(category='format_instruction',
                          prompt=f'Write only the word {name.upper()}. Do not add anything else.\nAnswer:',
                          answer=name.upper(), scoring='exact', max_new_tokens=12))
