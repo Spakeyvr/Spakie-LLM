@@ -566,16 +566,29 @@ between unrelated checkpoints. Use matched controls before attributing changes
 to a recipe. The default time budget is 120 seconds, checked between cases;
 Ctrl+C saves partial results and exits with code 130.
 
-Readiness output preserves the original numeric-prefix scores and additionally
-reports `grounding_diagnostic` for each grounding answer. This narrow parser
-recognizes a correct first assertion such as “The badge code for Tarin is 431”;
-it exposes trailing text for review rather than certifying later claims.
-`whole_response_supported` requires no trailing text and a known generation stop
-before the token limit. An unterminated number at an unknown or exhausted output
-budget has an undetermined (`null`) first-assertion result. These supplemental fields
-do not replace frozen experiment gates. `generation_budget_reached` flags answers
-that used the entire output allowance; inspect these for truncation before
-concluding that the model lacks the tested ability.
+Every BASE probe (readiness, learning, reasoning, and rescoring) scores answers
+the same way (`SCORING_VERSION` 7 in `scripts/_base_probe_cases.py`):
+
+- **Pass/fail judges the first claim, whatever its phrasing.** The first clause
+  runs to the first newline, `;`, or sentence-ending `.`, `!`, or `?` (decimal
+  points excluded). A numeric answer is the first number in it, or the first
+  number after `=` in an equation, so “43”, “The total is 43.” and
+  “31 + 12 = 43” all pass. Negated (“not 43”), alternative (“43 or 44”), and
+  other-person (“The badge code for Bela is 431”) claims fail. A fact answer is
+  whichever of the accepted answer and its listed rivals the clause names
+  first, so “Barcelona, not Madrid” and “Madrid or Barcelona” fail. A number or
+  clause that reaches the end of a generation that hit its token limit is
+  `undecided` and does not pass. Each record keeps the `claim` status.
+- **Sequence and code continuations** (`A, B, C, D,` → `E`) still require the
+  next item first, and format instructions remain exact.
+- **A likelihood score ranks the correct answer against rivals** by total
+  log-probability, without generation. Facts and patterns use listed rivals.
+  Numeric rows use the answer ±1, ±2 and ±10, plus every number in the prompt,
+  so copying an in-context example or another person's code counts as a rival.
+  Readiness reports `likelihood` accuracy and mean margin per category.
+
+`generation_budget_reached` flags answers that used the entire output
+allowance; inspect these before concluding that the model lacks the ability.
 
 Verified synthetic BASE curricula can be prepared independently of any local
 experiment folder:
@@ -687,8 +700,9 @@ retains the requested fraction of a probe update. It verifies the exact parent
 hash and model/tokenizer contracts and refuses already blended donors.
 The fraction is an experimental choice, not a recommended default.
 `scripts/rescore_base_probe.py --records RECORDS_JSONL --output NEW_JSON`
-re-scores preserved completions without training or generation and reports
-changed decisions and the scoring version.
+re-scores preserved completions under the current scoring version without
+training or generation, and reports changed decisions. Records without a
+known generation stop treat a trailing bare number as `undecided`.
 
 Run the basic QA evaluator:
 

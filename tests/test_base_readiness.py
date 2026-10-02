@@ -1,30 +1,26 @@
 from pathlib import Path
 import unittest
 
-from scripts.eval_base_readiness import cases, score_answer, grounding_diagnostic
+from scripts._base_probe_cases import claim, likelihood_choices
+from scripts.eval_base_readiness import cases, score_answer
 
 TOKENIZER = Path(__file__).resolve().parents[1] / 'tokenizer' / 'spakie.model'
 
 
+def first(category, split='dev'):
+    return next(r for r in cases(split) if r['category'] == category)
+
+
 class BaseReadinessTests(unittest.TestCase):
-    def test_grounding_diagnostic_separates_answer_from_format_and_trailing_claims(self):
-        row = next(r for r in cases() if r['category'] == 'grounding')
-        for text in ('431', 'The badge code for Tarin is 431.', 'Tarin is 431',
-                     'The badge code is 431.'):
-            result = grounding_diagnostic(text, row, generation_budget_reached=False)
-            self.assertTrue(result['whole_response_supported'], text)
-        self.assertFalse(score_answer('The badge code for Tarin is 431.', row))
-        for text in ('The badge code for Bela is 431.', 'Tarin is 4310.',
-                     'Tarin is 43', 'Tarin is 431.5.', 'Tarin is -431.',
-                     'Tarin is 431e2.', 'Tarin is 431 or 902.',
-                     'Tarin is not 431.', 'Tarin is 902. The answer is 431.',
-                     'Tarin is 431 is not the answer.'):
-            self.assertFalse(grounding_diagnostic(text, row, generation_budget_reached=False)
-                             ['first_assertion_correct'], text)
-        result = grounding_diagnostic('Tarin is 431. Actually it is 902.', row)
-        self.assertTrue(result['first_assertion_correct'])
-        self.assertFalse(result['whole_response_supported'])
-        self.assertEqual(result['unassessed_remainder'], 'Actually it is 902.')
+    def test_grounding_judges_the_first_claim_and_its_subject(self):
+        row = first('grounding')  # Tarin is 431, Bela is 902
+        for text in (' 431', ' The badge code for Tarin is 431.', ' Tarin is 431', ' The badge code is 431.',
+                     ' Tarin is 431. Actually it is 902.'):
+            self.assertTrue(score_answer(text, row, budget_reached=False), text)
+        for text in (' The badge code for Bela is 431.', ' Tarin is 4310.', ' Tarin is 43', ' Tarin is 431.5.',
+                     ' Tarin is -431.', ' Tarin is 431e2.', ' Tarin is 431 or 902.', ' Tarin is not 431.',
+                     ' Tarin is 902. The answer is 431.', ' Tarin is 431 is not the answer.'):
+            self.assertFalse(score_answer(text, row, budget_reached=False), text)
 
     @unittest.skipUnless(TOKENIZER.exists(), 'trained tokenizer not present in this checkout')
     def test_grounding_budget_fits_a_sentence_form_answer(self):
@@ -35,51 +31,46 @@ class BaseReadinessTests(unittest.TestCase):
             answer = f" The badge code for {name} is {row['answer']}.\n"
             self.assertLess(len(tok.encode(answer)), row['max_new_tokens'], answer)
 
-    def test_grounding_assertion_about_another_person_is_wrong_at_any_ending(self):
-        row = next(r for r in cases() if r['category'] == 'grounding')
-        for budget in (False, True, None):
-            for text in (' The badge code for Bela is 431', 'The badge code for Bela is 902. The badge',
-                         'Bela is 43', 'the badge code for bela is 431.'):
-                result = grounding_diagnostic(text, row, generation_budget_reached=budget)
-                self.assertIs(result['first_assertion_correct'], False, (budget, text))
-            # A subject the prompt never names is still undecidable when the budget ran out.
-            self.assertEqual(grounding_diagnostic('It is 431', row, generation_budget_reached=budget)
-                             ['first_assertion_correct'], None if budget is not False else False)
-
-    def test_grounding_budget_exhaustion_and_unknown_endings_are_not_certified(self):
-        row = next(r for r in cases() if r['category'] == 'grounding')
+    def test_cut_off_answers_are_never_certified(self):
+        row = first('grounding')
         for budget in (True, None):
-            for text in ('431', '43', 'The badge code for Tarin is 431'):
-                result = grounding_diagnostic(text, row, generation_budget_reached=budget)
-                self.assertIsNone(result['first_assertion_correct'])
-                self.assertFalse(result['whole_response_supported'])
-            result = grounding_diagnostic('431\nQuestion: More', row,
-                                          generation_budget_reached=budget)
-            self.assertTrue(result['first_assertion_correct'])
-            self.assertFalse(result['whole_response_supported'])
-        self.assertFalse(grounding_diagnostic('43', row, generation_budget_reached=False)
-                         ['first_assertion_correct'])
+            for text in (' 431', ' 43', ' The badge code for Tarin is 431'):
+                self.assertEqual(claim(text, row, budget_reached=budget)['status'], 'undecided', text)
+                self.assertFalse(score_answer(text, row, budget_reached=budget), text)
+            self.assertTrue(score_answer(' 431\nQuestion: More', row, budget_reached=budget))
 
-    def test_scores_reject_embedded_answers_wrong_numbers_and_extra_format_text(self):
-        numeric = {'answer': '43', 'scoring': 'number'}
-        for text in ('430', '43.5', '43.5x', '43e2', '43,000', 'Wrong. 43', '-43'):
-            self.assertFalse(score_answer(text, numeric), text)
-        self.assertTrue(score_answer(' 43.0 beads.', numeric))
-        self.assertTrue(score_answer(' 43.\nNext question.', numeric))
-        self.assertTrue(score_answer(' 1,000.', {'answer':'1000','scoring':'number'}))
-        fact = {'answer': 'Madrid', 'scoring': 'prefix'}
-        self.assertTrue(score_answer(' Madrid.', fact))
-        self.assertFalse(score_answer('Barcelona, not Madrid.', fact))
-        self.assertFalse(score_answer('Madridista', fact))
-        capital={**fact,'category':'facts','prompt':'The capital of Spain is'}
-        self.assertTrue(score_answer('the city of Madrid.',capital))
-        self.assertTrue(score_answer(' in the city of Madrid, which is',capital))
-        self.assertFalse(score_answer('the city of Barcelona. Madrid.',capital))
-        self.assertFalse(score_answer('in the city of Barcelona. Madrid.',capital))
-        exact = {'answer': 'TARIN', 'scoring': 'exact'}
-        self.assertTrue(score_answer(' TARIN\n', exact))
-        for text in ('TARIN.', 'TARIN\nMore', 'tarin'):
-            self.assertFalse(score_answer(text, exact))
+    def test_arithmetic_and_facts_accept_any_phrasing_of_a_correct_first_claim(self):
+        equation, words = first('equation'), first('word_problem')  # 31 + 12 = 43
+        for row in (equation, words):
+            for text in (' 43', ' 43.0 beads.', ' 43.\nNext question.', ' The total is 43.', ' 31 + 12 = 43.'):
+                self.assertTrue(score_answer(text, row, budget_reached=False), (row['category'], text))
+            for text in (' 430', ' 43.5', ' 43,000', ' Wrong. 43', ' -43', ' 17\n31 + 12 = 43', ' 11. 43'):
+                self.assertFalse(score_answer(text, row, budget_reached=False), (row['category'], text))
+        capital = first('facts')  # Spain: Madrid; rivals Barcelona, Seville, Valencia
+        for text in (' Madrid.', ' the city of Madrid.', ' in the city of Madrid, which is', ' Madrid, Spain'):
+            self.assertTrue(score_answer(text, capital, budget_reached=False), text)
+        for text in (' Barcelona, not Madrid.', ' Barcelona and Madrid.', ' Madrid or Barcelona.', ' Madridista',
+                     ' the city of Barcelona. Madrid.', ' in the south of the country'):
+            self.assertFalse(score_answer(text, capital, budget_reached=False), text)
+
+    def test_format_instructions_stay_exact(self):
+        row = first('format_instruction')
+        self.assertEqual(row['scoring'], 'exact')
+        self.assertTrue(score_answer(' TARIN\n', row))
+        for text in ('TARIN.', 'TARIN\nMore', 'tarin', 'The word TARIN'):
+            self.assertFalse(score_answer(text, row))
+
+    def test_every_scored_row_has_likelihood_choices_except_format(self):
+        for split in ('dev', 'test'):
+            for row in cases(split):
+                if 'answer' not in row or row.get('scoring') == 'exact':
+                    continue
+                choices = likelihood_choices(row)
+                self.assertEqual(choices[0], row['answer'])
+                self.assertEqual(len(choices), len(set(choices)))
+                self.assertGreaterEqual(len(choices), 4, row['prompt'])
+        grounding = first('grounding')
+        self.assertIn('902', likelihood_choices(grounding))  # the other person's code is a rival
 
     def test_splits_are_disjoint_and_arithmetic_oracles_are_correct(self):
         dev, test = cases('dev'), cases('test')

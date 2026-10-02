@@ -70,7 +70,8 @@ def snap_to_document_start(offset, starts):
 def generation_task_fields(row):
     """Keep task metadata from colliding with authoritative evaluation fields."""
     reserved = {'kind', 'phase', 'output', 'output_ids', 'passed', 'temperature',
-                'seed', 'repeat_4gram_fraction', 'task_metadata'}
+                'seed', 'repeat_4gram_fraction', 'task_metadata', 'generation_budget_reached',
+                'likelihood_choices', 'likelihood_logprobs', 'likelihood_correct', 'likelihood_margin'}
     fields = {key:value for key,value in row.items() if key not in reserved}
     metadata = {key:value for key,value in row.items() if key in reserved}
     if metadata:
@@ -238,6 +239,7 @@ def run(args):
         from training.pretrain_mlx import _build_microbatch_step
         from inference.generate_mlx import generate
         from scripts._base_probe_cases import suite,repetition,score_completion
+        from scripts._base_probe_likelihood import likelihood_record
 
         checkpoint=args.assets/'checkpoints/92m/pretrain_interrupt.safetensors'
         checkpoint_sha=digest(checkpoint)
@@ -394,8 +396,11 @@ def run(args):
                     output=generate(model,tokenizer,tokenizer.encode(row['prompt']),max_new_tokens=row['max_new_tokens'],
                         temperature=temperature,top_k=50 if temperature else 0,top_p=.9 if temperature else 1.,repetition_penalty=1.)
                     text=tokenizer.decode(output)
-                    passed=score_completion(text,row) if 'expected_regex' in row else None
+                    budget=len(output)>=row['max_new_tokens']
+                    passed=score_completion(text,row,budget_reached=budget) if 'expected_regex' in row else None
+                    scored=likelihood_record(model,tokenizer,row) if passed is not None and temperature==0. else None
                     emit('generation',phase=label,**generation_task_fields(row),output=text,output_ids=output,passed=passed,
+                         generation_budget_reached=budget,**(scored or {}),
                          temperature=temperature,seed=seed,repeat_4gram_fraction=repetition(output))
                     if passed is not None:
                         values=scores.setdefault(row['category'],{'passed':0,'total':0})

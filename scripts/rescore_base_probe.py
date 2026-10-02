@@ -17,7 +17,10 @@ def rescore(records):
     for row in records:
         if row.get('kind') != 'generation' or 'expected_regex' not in row:
             continue
-        passed = score_completion(row['output'], row)
+        budget = row.get('generation_budget_reached')
+        if budget is None and 'output_ids' in row and 'max_new_tokens' in row:
+            budget = len(row['output_ids']) >= row['max_new_tokens']
+        passed = score_completion(row['output'], row, budget_reached=budget)
         phase = row.get('phase', 'evaluation')
         metric = groups.setdefault(phase, {}).setdefault(row['category'],
                     {'passed':0, 'original_passed':0, 'total':0})
@@ -29,7 +32,7 @@ def rescore(records):
                             'original_passed':row.get('passed'), 'passed':passed,
                             'prompt':row['prompt'], 'output':row['output']})
     return {'scoring_version':SCORING_VERSION, 'metrics':groups, 'changed_records':changes,
-            'correction':'Numeric answers allow sentence-final periods and grouped thousands while rejecting different values and digit prefixes. Facts accept immediate capital-city and English playwright/poet descriptors. Original generation bytes remain unchanged.'}
+            'correction':'First-claim scoring: the first clause of each completion is judged whatever its phrasing. Numeric answers are the first number (after = in an equation); negated, alternative, other-person and cut-off claims fail. Facts are the first of the answer and its listed rivals. Sequence and code continuations still require the answer first. Original generation bytes remain unchanged.'}
 
 
 def main():

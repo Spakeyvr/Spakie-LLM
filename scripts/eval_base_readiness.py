@@ -3,6 +3,11 @@
 These small diagnostics expose failure modes; they are not public benchmark
 scores. Development and test facts, operands, names, and grammar pairs differ.
 No chat template or assistant loss mask is used.
+
+Answer rows get two scores: pass/fail on the first claim of a greedy completion,
+whatever its phrasing (see scripts/_base_probe_cases.py), and a likelihood rank
+of the correct answer against plausible rivals. Format instructions are scored
+exactly; grammar compares sentence likelihoods.
 """
 from __future__ import annotations
 
@@ -24,16 +29,28 @@ def cases(split='dev'):
         raise ValueError('Unknown split')
     test = split == 'test'
     rows = []
-    facts = ([('Spain', 'Madrid'), ('Portugal', 'Lisbon'), ('Norway', 'Oslo'),
-              ('Sweden', 'Stockholm'), ('Finland', 'Helsinki'), ('Greece', 'Athens'),
-              ('Austria', 'Vienna'), ('Poland', 'Warsaw')]
+    # Rivals are the country's other well-known cities and nearby capitals: the
+    # answers a confused model plausibly gives instead.
+    facts = ([('Spain', 'Madrid', ['Barcelona', 'Seville', 'Valencia']),
+              ('Portugal', 'Lisbon', ['Porto', 'Madrid', 'Coimbra']),
+              ('Norway', 'Oslo', ['Bergen', 'Stockholm', 'Trondheim']),
+              ('Sweden', 'Stockholm', ['Gothenburg', 'Oslo', 'Malmö']),
+              ('Finland', 'Helsinki', ['Tampere', 'Turku', 'Stockholm']),
+              ('Greece', 'Athens', ['Thessaloniki', 'Sparta', 'Rome']),
+              ('Austria', 'Vienna', ['Salzburg', 'Graz', 'Berlin']),
+              ('Poland', 'Warsaw', ['Krakow', 'Gdansk', 'Prague'])]
              if not test else
-             [('Canada', 'Ottawa'), ('Egypt', 'Cairo'), ('Kenya', 'Nairobi'),
-              ('Ireland', 'Dublin'), ('Denmark', 'Copenhagen'), ('Hungary', 'Budapest'),
-              ('Thailand', 'Bangkok'), ('Argentina', 'Buenos Aires')])
-    for country, capital in facts:
+             [('Canada', 'Ottawa', ['Toronto', 'Montreal', 'Vancouver']),
+              ('Egypt', 'Cairo', ['Alexandria', 'Giza', 'Luxor']),
+              ('Kenya', 'Nairobi', ['Mombasa', 'Kisumu', 'Addis Ababa']),
+              ('Ireland', 'Dublin', ['Cork', 'Belfast', 'Galway']),
+              ('Denmark', 'Copenhagen', ['Aarhus', 'Odense', 'Oslo']),
+              ('Hungary', 'Budapest', ['Debrecen', 'Vienna', 'Prague']),
+              ('Thailand', 'Bangkok', ['Chiang Mai', 'Phuket', 'Hanoi']),
+              ('Argentina', 'Buenos Aires', ['Córdoba', 'Rosario', 'Santiago'])])
+    for country, capital, rivals in facts:
         rows.append(dict(category='facts', prompt=f'The capital of {country} is', answer=capital,
-                         scoring='prefix', max_new_tokens=16))
+                         rivals=rivals, max_new_tokens=16))
     # Both surface forms use the same operands to expose format transfer.
     for i in range(8):
         a, b = (31 + i * 7 + 100 * test), (12 + i * 3 + 20 * test)
@@ -42,17 +59,15 @@ def cases(split='dev'):
                       f'A box contains {a} red beads and {b} blue beads. '
                       'The total number of beads in the box is')
             rows.append(dict(category=style, prompt=prompt, answer=str(a+b),
-                             scoring='number', max_new_tokens=16, operands=[a,b]))
+                             max_new_tokens=16, operands=[a,b]))
     names = ['Tarin','Luro','Nemi','Pavo','Risa','Velo','Zuna','Kori'] if not test else [
              'Davo','Fera','Humi','Jora','Meko','Savi','Tulo','Weri']
     for i, name in enumerate(names):
         code = str(431 + 17 * i + 200 * test)
         rows.append(dict(category='grounding', prompt=f'The badge code for {name} is {code}. '
                          f'The badge code for Bela is 902.\nQuestion: What is the badge code for {name}?\nAnswer:',
-                         # Room for a sentence-form answer plus its terminator; 12 tokens
-                         # cut "The badge code for Tarin is 431" off at the number, so the
-                         # first-assertion diagnostic could never reach a verdict.
-                         answer=code, scoring='number', max_new_tokens=20))
+                         # Room for a sentence-form answer plus its terminator.
+                         answer=code, max_new_tokens=20))
         rows.append(dict(category='format_instruction',
                          prompt=f'Write only the word {name.upper()}. Do not add anything else.\nAnswer:',
                          answer=name.upper(), scoring='exact', max_new_tokens=12))
@@ -85,83 +100,31 @@ def cases(split='dev'):
     return rows
 
 
-def score_answer(text, row):
-    value = text.strip()
-    if row['scoring'] == 'exact':
-        return value == row['answer']
-    if row['scoring'] == 'number':
-        # No credit for a correct number found later, a prefix of another
-        # number, or a different decimal value.
-        from scripts._base_probe_cases import score_numeric_answer
-        return score_numeric_answer(value, row['answer'])
-    if row.get('category') == 'facts':
-        from scripts._base_probe_cases import score_fact_completion
-        return score_fact_completion(value,re.escape(row['answer'])+r'\b',row.get('prompt',''))
-    return re.match(re.escape(row['answer']) + r'\b', value, re.I) is not None
-
-
-def grounding_diagnostic(text, row, *, generation_budget_reached=None):
-    """Score an explicit first assertion separately from numeric-prefix compliance.
-
-    This is deliberately a narrow parser, not a semantic judge. Trailing text
-    is exposed for review and never certified as correct. Frozen primary scores
-    remain unchanged so old experiment gates cannot silently become easier.
-    Unknown or exhausted generation budgets cannot certify an unterminated
-    number. ``None`` means the observed ending is insufficient to decide. A
-    first assertion about a different person named in the prompt ("The badge
-    code for Bela is 448") is wrong however the response would have ended.
-    """
-    if row.get('category') != 'grounding':
-        raise ValueError('Expected a grounding case')
-    target = re.search(r'Question: What is the badge code for ([^?]+)\?', row['prompt'])
-    if target is None:
-        raise ValueError('Unsupported grounding prompt')
-    from scripts._base_probe_cases import NUMERIC_LITERAL, score_numeric_answer
-    name = re.escape(target[1])
-    prefix = rf'(?:(?:The badge code for )?{name} is |(?:The )?badge code is )?'
-    match = re.match(r'^\s*' + prefix + '(' + NUMERIC_LITERAL + r')(?!\w|[.,]\d)',
-                     text, re.I)
-    if match:
-        raw_tail = text[match.end():]
-        tail = raw_tail.strip()
-        # A sentence boundary is required after the assertion. "431 or 902"
-        # and "431 is not the answer" are not positive standalone assertions.
-        boundary = '\n' in raw_tail[:len(raw_tail)-len(raw_tail.lstrip())] or tail.startswith(('.', '!', '?'))
-        finished = generation_budget_reached is False
-        boundary = boundary or (not tail and finished)
-        correct = boundary and score_numeric_answer(match[1], row['answer'])
-        remainder = tail.lstrip('.!?').strip() if boundary else tail
-        if not tail and not finished:
-            correct = None
-    else:
-        correct, remainder = False, text.strip()
-        others = {other.lower() for other in re.findall(r'The badge code for (\w+) is', row['prompt'])}
-        others.discard(target[1].lower())
-        subject = re.match(r'^\s*(?:The badge code for )?(\w+) is ' + NUMERIC_LITERAL, text, re.I)
-        about_other_person = subject is not None and subject[1].lower() in others
-        if generation_budget_reached is not False and not about_other_person:
-            correct = None
-    return {'first_assertion_correct': correct,
-            'unassessed_remainder': remainder,
-            'whole_response_supported': bool(correct and not remainder
-                                             and generation_budget_reached is False)}
+def score_answer(text, row, *, budget_reached=None):
+    """Pass/fail for an answer row: exact for format instructions, else the first claim."""
+    if row.get('scoring') == 'exact':
+        return text.strip() == row['answer']
+    from scripts._base_probe_cases import score_completion
+    return score_completion(text, row, budget_reached=budget_reached)
 
 
 def evaluate_model(model, tokenizer_path, output, *, split='dev', stopped=lambda: False):
     import mlx.core as mx
     from inference.generate_mlx import generate
     from tokenizer.train_tokenizer import SpakieTokenizer
-    from scripts._base_probe_cases import repetition, SCORING_VERSION
+    from scripts._base_probe_cases import claim, repetition, SCORING_VERSION
+    from scripts._base_probe_likelihood import likelihood_record
     from scripts.probe_pretrain_recipe import sha, write_json
     tok = SpakieTokenizer(str(tokenizer_path))
     tasks = cases(split)
-    counts = defaultdict(lambda: [0,0])
+    counts = defaultdict(lambda: {'correct': 0, 'total': 0})
+    likelihood = defaultdict(lambda: {'correct': 0, 'total': 0, 'margin_sum': 0.})
     result = {'split': split, 'scoring_version': SCORING_VERSION, 'task_sha256': hashlib.sha256(
         json.dumps(tasks, sort_keys=True).encode()).hexdigest(),
         'tokenizer_sha256': sha(tokenizer_path), 'records': [], 'metrics': {},
-        'scope': 'Small diagnostic suite. Grammar is length-normalized sentence likelihood; '
-                 'format instructions are BASE completions, not a chat/SFT readiness claim.'}
-    result['grounding_diagnostic_version'] = 3
+        'scope': 'Small diagnostic suite. Answer rows: first-claim pass/fail plus likelihood rank '
+                 'against rivals. Grammar is length-normalized sentence likelihood; format '
+                 'instructions are BASE completions, not a chat/SFT readiness claim.'}
     def nll(text):
         ids = tok.encode(text)
         _, loss, _ = model(mx.array([ids[:-1]]), mx.array([ids[1:]]), ignore_index=None)
@@ -183,16 +146,25 @@ def evaluate_model(model, tokenizer_path, output, *, split='dev', stopped=lambda
                 record.update(generated_tokens=len(ids),
                               generation_budget_reached=len(ids) >= row['max_new_tokens'])
                 if 'answer' in row:
-                    record['passed'] = score_answer(record['completion'], row)
-                if row['category'] == 'grounding':
-                    record['grounding_diagnostic'] = grounding_diagnostic(
-                        record['completion'], row,
-                        generation_budget_reached=record['generation_budget_reached'])
+                    budget = record['generation_budget_reached']
+                    if row.get('scoring') != 'exact':
+                        record['claim'] = claim(record['completion'], row, budget_reached=budget)
+                    record['passed'] = score_answer(record['completion'], row, budget_reached=budget)
+                    scored = likelihood_record(model, tok, row) if row.get('scoring') != 'exact' else None
+                    if scored:
+                        record.update(scored)
+                        stats = likelihood[row['category']]
+                        stats['correct'] += int(scored['likelihood_correct'])
+                        stats['total'] += 1
+                        stats['margin_sum'] += scored['likelihood_margin']
             if 'passed' in record:
-                counts[row['category']][0] += int(record['passed'])
-                counts[row['category']][1] += 1
+                counts[row['category']]['correct'] += int(record['passed'])
+                counts[row['category']]['total'] += 1
             result['records'].append(record)
-            result['metrics'] = {k: {'correct': v[0], 'total': v[1]} for k,v in counts.items()}
+            result['metrics'] = {k: dict(v) for k, v in counts.items()}
+            for k, v in likelihood.items():
+                result['metrics'][k]['likelihood'] = {'correct': v['correct'], 'total': v['total'],
+                                                      'mean_margin': v['margin_sum'] / v['total']}
             result['status'] = 'running'
             write_json(output, result)
         result['status'] = 'complete' if len(result['records']) == len(tasks) else 'interrupted'

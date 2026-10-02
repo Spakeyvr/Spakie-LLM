@@ -144,13 +144,15 @@ class BaseLearningProbeTests(unittest.TestCase):
         self.assertFalse(is_base_checkpoint({'config':{'vocab_size':100}}, 'pretrain_interrupt.safetensors'))
         self.assertTrue(is_base_checkpoint({'stage':'pretrain'}, 'base_probe.safetensors'))
 
-    def test_legacy_numeric_oracles_accept_sentence_periods_but_not_wrong_decimals(self):
+    def test_regex_numeric_oracles_accept_sentence_periods_but_not_wrong_decimals(self):
         from scripts._base_probe_cases import score_completion
         row = {'category':'arithmetic_words','expected_regex':r'76(?:\.0+)?(?![\d.])'}
         for text in ('76.', '76.\nAnother problem.', '76', '76.00 apples'):
-            self.assertTrue(score_completion(text,row),text)
+            self.assertTrue(score_completion(text,row,budget_reached=False),text)
         for text in ('760.', '76.5', '76.5x', '76e2', '-76.', 'Wrong. 76.'):
-            self.assertFalse(score_completion(text,row),text)
+            self.assertFalse(score_completion(text,row,budget_reached=False),text)
+        # A bare number that ends a cut-off generation may continue ("760").
+        self.assertFalse(score_completion('76',row,budget_reached=True))
 
     def test_rescoring_preserves_original_results_and_separates_phases(self):
         from scripts.rescore_base_probe import rescore

@@ -33,15 +33,6 @@ def choices_for(task):
     raise ValueError(f"Answer for {task['id']} is not among its listed entities or values")
 
 
-def continuation_ids(tokenizer, prompt, choice):
-    """Token ids of ' choice' after prompt, requiring the prompt tokenization to be a stable prefix."""
-    prompt_ids = tokenizer.encode(prompt)
-    full = tokenizer.encode(prompt + ' ' + choice)
-    if full[:len(prompt_ids)] != prompt_ids or len(full) <= len(prompt_ids):
-        raise ValueError(f'Unstable tokenization boundary for choice {choice!r}')
-    return prompt_ids, full[len(prompt_ids):]
-
-
 def summarize(records):
     """Aggregate per-category accuracy, both-variant pairs, margins and chosen-position counts."""
     groups = defaultdict(lambda: {'correct': 0, 'total': 0, 'chance': 0., 'margin_sum': 0.,
@@ -69,18 +60,9 @@ def summarize(records):
 
 
 def score_task(model, tokenizer, task):
-    import mlx.core as mx
-    import numpy as np
+    from scripts._base_probe_likelihood import choice_logprobs
     choices = choices_for(task)
-    logprobs = []
-    for choice in choices:
-        prompt_ids, target = continuation_ids(tokenizer, task['prompt'], choice)
-        ids = prompt_ids + target
-        logits, _, _ = model(mx.array([ids[:-1]]))
-        rows = np.array(logits[0, len(prompt_ids) - 1:].astype(mx.float32))
-        rows = rows - rows.max(axis=-1, keepdims=True)
-        log_norm = np.log(np.exp(rows).sum(axis=-1))
-        logprobs.append(float(sum(rows[i, t] - log_norm[i] for i, t in enumerate(target))))
+    logprobs = choice_logprobs(model, tokenizer, task['prompt'], choices, separator=' ')
     answer = choices.index(task['answer'])
     chosen = int(max(range(len(choices)), key=logprobs.__getitem__))
     rival = max(lp for i, lp in enumerate(logprobs) if i != answer)

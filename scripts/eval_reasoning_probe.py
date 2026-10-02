@@ -96,6 +96,7 @@ def main():
     import mlx.core as mx
     from scripts.probe_base_learning import digest
     from scripts._base_probe_cases import SCORING_VERSION, score_completion, is_base_checkpoint
+    from scripts._base_probe_likelihood import likelihood_record
     from scripts.build_reasoning_curriculum import REASONING_SCORING_VERSION, score_reasoned_completion, addition_claim_diagnostics
     from runtime.checkpoint_io import (load_mlx_checkpoint_config, load_mlx_checkpoint_meta,
         load_mlx_model_weights_strict, validate_checkpoint_tokenizer)
@@ -145,9 +146,10 @@ def main():
             ids = generate(model, tokenizer, tokenizer.encode(row['prompt']), max_new_tokens=row['max_new_tokens'],
                            temperature=0., top_k=0, top_p=1., repetition_penalty=1.)
             text = tokenizer.decode(ids)
-            record = {**row, 'output':text}
+            budget = len(ids) >= row['max_new_tokens']
+            record = {**row, 'output':text, 'generation_budget_reached':budget}
             if 'expected_equations' in row:
-                scores = score_reasoned_completion(text, row)
+                scores = score_reasoned_completion(text, row, budget_reached=budget)
                 passed = scores['answer_correct']
                 record.update(scores)
                 claims = addition_claim_diagnostics(text)
@@ -159,7 +161,12 @@ def main():
                 metric = result['metrics'].setdefault(row['category']+'_valid_steps', {'passed':0,'total':0})
                 metric['passed'] += int(scores['steps_correct']); metric['total'] += 1
             else:
-                passed = score_completion(text,row)
+                passed = score_completion(text, row, budget_reached=budget)
+                scored = likelihood_record(model, tokenizer, row)
+                if scored:
+                    record.update(scored)
+                    stats = result['metrics'].setdefault(row['category']+'_likelihood', {'passed':0,'total':0})
+                    stats['passed'] += int(scored['likelihood_correct']); stats['total'] += 1
             record['passed'] = passed
             metric = result['metrics'].setdefault(row['category'], {'passed':0,'total':0})
             metric['passed'] += int(passed); metric['total'] += 1

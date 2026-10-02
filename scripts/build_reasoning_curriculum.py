@@ -28,14 +28,20 @@ TRAIN_NAMES = ('Alice', 'Bob', 'Carmen', 'David', 'Elena', 'Farah', 'George',
 DEV_NAMES = ('Adri', 'Bex', 'Cavo', 'Deni', 'Esha', 'Favi', 'Garo', 'Hila')
 TEST_NAMES = ('Ivo', 'Jexa', 'Kavu', 'Lemi', 'Mora', 'Navo', 'Osha', 'Peli')
 ATTRIBUTES = ('locker number', 'ticket number', 'room number', 'access code')
-REASONING_SCORING_VERSION = 5
+REASONING_SCORING_VERSION = 6
 
 
-def score_reasoned_completion(text, row):
-    """Score the explicit final answer and all three place-value calculations."""
-    from scripts._base_probe_cases import NUMERIC_LITERAL, score_numeric_answer
+def score_reasoned_completion(text, row, *, budget_reached=False):
+    """Score the explicit final answer and all three place-value calculations.
+
+    The final answer is the first claim after "Answer:", judged like every BASE
+    numeric probe (see scripts/_base_probe_cases.numeric_claim).
+    """
+    from scripts._base_probe_cases import NUMERIC_LITERAL, numeric_claim
     match = re.search(r'\bAnswer:\s*', text, re.I)
-    answer_correct = bool(match and score_numeric_answer(text[match.end():], row['answer']))
+    answer_claim = numeric_claim(text[match.end():], budget_reached=budget_reached) if match else None
+    answer_correct = bool(answer_claim and answer_claim['status'] == 'claimed'
+                          and Decimal(answer_claim['value']) == Decimal(str(row['answer'])))
     prefix = text[:match.start()] if match else text
     # Parse full signed numbers: a wrong decimal or negative value must not
     # masquerade as a correct integer intermediate result.

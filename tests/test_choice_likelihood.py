@@ -1,6 +1,7 @@
 import unittest
 
-from scripts.eval_choice_likelihood import choices_for, continuation_ids, summarize
+from scripts._base_probe_likelihood import continuation_ids
+from scripts.eval_choice_likelihood import choices_for, summarize
 
 
 class FakeTokenizer:
