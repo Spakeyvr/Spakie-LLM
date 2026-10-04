@@ -40,6 +40,33 @@ class NumericClaimTests(unittest.TestCase):
             self.assertEqual(claim(text, self.row, budget_reached=True)['status'], 'claimed', text)
         self.assertEqual(claim(' 85', self.row, budget_reached=None)['status'], 'undecided')
 
+    def test_correct_first_claim_before_wrong_equation_counts(self):
+        for text, value in (('The answer is 85 because 38 + 47 = 84.', '85'),
+                            ('85, since 38 + 47 = 84.', '85'),
+                            ('85.0 because 38 + 47 = 84.', '85.0')):
+            with self.subTest(text=text):
+                self.assertEqual(claim(text, self.row, budget_reached=False),
+                                 {'status': 'claimed', 'value': value, 'correct': True})
+
+    def test_wrong_first_claim_before_correct_equation_fails(self):
+        for text, value in (('The answer is 84 because 38 + 47 = 85.', '84'),
+                            ('84, since 38 + 47 = 85.', '84'),
+                            ('84.0 because 38 + 47 = 85.', '84.0')):
+            with self.subTest(text=text):
+                self.assertEqual(claim(text, self.row, budget_reached=False),
+                                 {'status': 'claimed', 'value': value, 'correct': False})
+
+    def test_pure_equations_claim_the_first_right_hand_side(self):
+        for text, value, correct in (
+                ('38 + 47 = 85.', '85', True),
+                ('38 + 47 = 84.', '84', False),
+                ('(38 + 47) = 85.', '85', True),
+                ('38.0 + 47.0 = 85.', '85', True),
+                ('38 + 47 = 84 = 85.', '84', False)):
+            with self.subTest(text=text):
+                self.assertEqual(claim(text, self.row, budget_reached=False),
+                                 {'status': 'claimed', 'value': value, 'correct': correct})
+
     def test_grouped_thousands_and_values(self):
         self.assertEqual(numeric_claim('It is 1,000.', budget_reached=False),
                          {'status': 'claimed', 'value': '1000'})

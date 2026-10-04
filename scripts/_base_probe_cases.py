@@ -3,7 +3,7 @@
 import re
 from decimal import Decimal
 
-SCORING_VERSION = 7
+SCORING_VERSION = 8
 NUMERIC_LITERAL = r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
 HAMLET_ANSWER = r'(?:(?:the )?English playwright(?: and poet)?,? )?(?:William )?Shakespeare\b'
 
@@ -166,11 +166,21 @@ def numeric_claim(text, *, budget_reached=None, entities=(), subject=None):
     Status is 'claimed', 'no_claim', 'hedged' (negated or offered with an
     alternative), 'other_subject' (asserted about another named person), or
     'undecided' (the generation stopped where the number might continue).
-    In an equation clause, the claim is the first number after '='.
+    A numeric equation's operands are skipped in favor of its first right-hand
+    side, but a standalone number before a later equation remains the claim.
     """
     clause = first_clause(text)
-    start = clause.index('=') + 1 if '=' in clause else 0
-    match = _NUMBER.search(clause, start)
+    start = 0
+    match = _NUMBER.search(clause)
+    if match is not None and '=' in clause:
+        equals = clause.index('=')
+        # Skip operands only when the first number belongs to the equation's
+        # left-hand side; prose between it and '=' preserves the earlier claim.
+        if match.start() < equals and re.fullmatch(
+                r'[\s()+*/%^×÷−-]*',
+                re.sub(NUMERIC_LITERAL, '', clause[match.start():equals])):
+            start = equals + 1
+            match = _NUMBER.search(clause, start)
     if match is None:
         status = 'undecided' if _cut_off(text, clause, budget_reached) else 'no_claim'
         return {'status': status, 'value': None}

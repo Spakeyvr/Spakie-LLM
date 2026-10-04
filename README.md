@@ -567,13 +567,15 @@ to a recipe. The default time budget is 120 seconds, checked between cases;
 Ctrl+C saves partial results and exits with code 130.
 
 Every BASE probe (readiness, learning, reasoning, and rescoring) scores answers
-the same way (`SCORING_VERSION` 7 in `scripts/_base_probe_cases.py`):
+the same way (`SCORING_VERSION` 8 in `scripts/_base_probe_cases.py`):
 
 - **Pass/fail judges the first claim, whatever its phrasing.** The first clause
   runs to the first newline, `;`, or sentence-ending `.`, `!`, or `?` (decimal
   points excluded). A numeric answer is the first number in it, or the first
   number after `=` in an equation, so “43”, “The total is 43.” and
-  “31 + 12 = 43” all pass. Negated (“not 43”), alternative (“43 or 44”), and
+  “31 + 12 = 43” all pass. A standalone numeric claim before a later equation
+  keeps priority: “The total is 43 because 31 + 12 = 42.” passes based on 43.
+  Negated (“not 43”), alternative (“43 or 44”), and
   other-person (“The badge code for Bela is 431”) claims fail. A fact answer is
   whichever of the accepted answer and its listed rivals the clause names
   first, so “Barcelona, not Madrid” and “Madrid or Barcelona” fail. A number or
